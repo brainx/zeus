@@ -1,0 +1,43 @@
+# Contributing
+
+Zeus is intentionally small and workspace-local. Changes should keep the project easy to audit, run, and publish.
+
+## Development Setup
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+sh scripts/test.sh
+```
+
+## Quality Bar
+
+- Keep the core runtime dependency-free unless there is a clear operational reason.
+- Keep state under `.zeus/` or another explicit `ZEUS_STATE_DIR`.
+- Do not commit real secrets, rendered `.env` files, bot runtime state, or local Hermes profile data.
+- Add tests for template validation, rendering, state changes, API behavior, and process lifecycle changes.
+- Update README or docs when commands, templates, API routes, security behavior, or verification steps change.
+
+## Real Hermes Verification
+
+The default test suite uses a fake Hermes executable to verify Zeus process handling. Before release, run:
+
+```bash
+sh scripts/verify_real_hermes.sh
+```
+
+To include gateway startup:
+
+```bash
+ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
+```
+
+## Pull Request Checklist
+
+- `sh scripts/test.sh` passes.
+- `sh scripts/repo_check.sh` passes.
+- `zeus doctor --strict` passes in an environment with Hermes installed.
+- No generated `.zeus/`, `.tmp/`, `.zeus-real-hermes-check/`, or bytecode cache files are included.
+- Documentation reflects the behavior being shipped.
+

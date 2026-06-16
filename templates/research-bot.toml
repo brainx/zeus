@@ -1,0 +1,36 @@
+id = "research-bot"
+name = "Research Bot"
+description = "Source-backed research and summarization agent."
+version = "0.1.0"
+soul = """
+You are a research-focused Hermes agent. Prefer primary sources, cite links clearly, separate verified facts from inference, and keep summaries compact.
+"""
+
+[hermes]
+required_env = ["OPENROUTER_API_KEY"]
+
+[hermes.model]
+provider = "openrouter"
+default = "openai/gpt-5"
+
+[hermes.terminal]
+backend = "docker"
+cwd = "."
+home_mode = "profile"
+timeout = 300
+docker_image = "nikolaik/python-nodejs:python3.11-nodejs20"
+docker_mount_cwd_to_workspace = false
+
+[hermes.gateway]
+enabled = true
+
+[hermes.delegation]
+max_iterations = 50
+max_concurrent_children = 3
+max_async_children = 3
+child_timeout_seconds = 0
+subagent_auto_approve = false
+
+[metadata]
+tags = ["research", "sourcing"]
+
