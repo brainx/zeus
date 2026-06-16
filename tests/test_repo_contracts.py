@@ -124,6 +124,9 @@ class RepoContractTests(unittest.TestCase):
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
 
         self.assertIn("[Credits](CREDITS.md)", readme)
+        self.assertIn("Zeus is an orchestration layer", readme)
+        self.assertNotIn("[BrainX](https://github.com/brainx)-maintained orchestration layer", readme)
+        self.assertIn("Zeus is maintained by [BrainX](https://github.com/brainx).", readme)
         self.assertIn("https://github.com/brainx", readme)
         self.assertIn("https://github.com/brainx", credits)
         self.assertIn("https://github.com/brainx", architecture)

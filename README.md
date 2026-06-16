@@ -2,7 +2,7 @@
 
 Many Hermes bots, one local supervisor.
 
-Zeus is a [BrainX](https://github.com/brainx)-maintained orchestration layer for running many Hermes Agent bots from reusable templates. It renders each bot as an isolated Hermes profile under `.zeus/`, starts and stops gateway processes, tracks PID ownership, and exposes a small loopback CLI/API for operators.
+Zeus is an orchestration layer for running many Hermes Agent bots from reusable templates. It renders each bot as an isolated Hermes profile under `.zeus/`, starts and stops gateway processes, tracks PID ownership, and exposes a small loopback CLI/API for operators.
 
 ## Why Zeus
 
@@ -58,6 +58,8 @@ ZEUS_API_KEY=change-me sh scripts/start.sh
 - [Contributing](CONTRIBUTING.md)
 - [Credits](CREDITS.md)
 - [Security policy](SECURITY.md)
+
+Zeus is maintained by [BrainX](https://github.com/brainx). See [Credits](CREDITS.md) for project ownership.
 
 ## Requirements
 
