@@ -95,6 +95,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("bot doctor", script)
         self.assertIn("max_async_children", script)
         self.assertIn("ZEUS_VERIFY_START_GATEWAY", script)
+        self.assertIn("ZEUS_VERIFY_API_KEY", script)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")

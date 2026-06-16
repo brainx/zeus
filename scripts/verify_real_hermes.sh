@@ -28,7 +28,7 @@ trap cleanup EXIT INT TERM
 
 rm -rf -- "$state_dir"
 
-ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" python3 -B -m zeus.cli doctor --strict --json
+ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" ZEUS_API_KEY="${ZEUS_VERIFY_API_KEY:-real-hermes-local-check}" python3 -B -m zeus.cli doctor --strict --json
 ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" python3 -B -m zeus.cli bot create "$bot_id" --template "$template_id"
 ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" python3 -B -m zeus.cli bot doctor "$bot_id"
 
