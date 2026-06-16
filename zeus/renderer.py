@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +71,7 @@ class ProfileRenderer:
             encoding="utf-8",
         )
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return BotRecord(
             bot_id=request.bot_id,
             template_id=template.id,
@@ -84,7 +84,7 @@ class ProfileRenderer:
     def _env_for(self, template: HermesTemplate, provided: dict[str, str]) -> str:
         lines: list[str] = []
         for name in template.hermes.required_env:
-            if name in provided and provided[name]:
+            if provided.get(name):
                 lines.append(f"{name}={provided[name]}")
             else:
                 lines.append(f"# {name}=")

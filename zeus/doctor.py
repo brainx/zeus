@@ -108,12 +108,20 @@ def _check_runtime_paths(settings: Settings) -> DoctorCheck:
 
 
 def _check_scripts() -> DoctorCheck:
-    missing = [path for path in [Path("scripts/start.sh"), Path("scripts/stop.sh")] if not path.exists()]
+    missing = [
+        path for path in [Path("scripts/start.sh"), Path("scripts/stop.sh")] if not path.exists()
+    ]
     if missing:
         return DoctorCheck("scripts", "fail", "Missing script(s): " + ", ".join(map(str, missing)))
-    non_exec = [path for path in [Path("scripts/start.sh"), Path("scripts/stop.sh")] if not path.stat().st_mode & 0o111]
+    non_exec = [
+        path
+        for path in [Path("scripts/start.sh"), Path("scripts/stop.sh")]
+        if not path.stat().st_mode & 0o111
+    ]
     if non_exec:
-        return DoctorCheck("scripts", "warn", "Script(s) are not executable: " + ", ".join(map(str, non_exec)))
+        return DoctorCheck(
+            "scripts", "warn", "Script(s) are not executable: " + ", ".join(map(str, non_exec))
+        )
     return DoctorCheck("scripts", "pass", "start/stop scripts are present and executable")
 
 
@@ -121,7 +129,11 @@ def _check_api_bind(settings: Settings) -> DoctorCheck:
     if settings.host not in {"127.0.0.1", "localhost", "::1"}:
         return DoctorCheck("api_bind", "warn", f"API host {settings.host!r} is not loopback-only")
     if not (3000 <= settings.port <= 5000):
-        return DoctorCheck("api_bind", "warn", f"API port {settings.port} is outside the documented 3000-5000 range")
+        return DoctorCheck(
+            "api_bind",
+            "warn",
+            f"API port {settings.port} is outside the documented 3000-5000 range",
+        )
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.2)
@@ -130,7 +142,9 @@ def _check_api_bind(settings: Settings) -> DoctorCheck:
             return DoctorCheck("api_bind", "warn", f"Port {settings.port} is already in use")
     except OSError:
         return DoctorCheck("api_bind", "warn", "Could not probe localhost port availability")
-    return DoctorCheck("api_bind", "pass", f"API bind {settings.host}:{settings.port} is loopback and available")
+    return DoctorCheck(
+        "api_bind", "pass", f"API bind {settings.host}:{settings.port} is loopback and available"
+    )
 
 
 def _check_api_auth(settings: Settings) -> DoctorCheck:
@@ -171,14 +185,23 @@ def _check_bots(settings: Settings) -> list[DoctorCheck]:
                 )
             )
         else:
-            checks.append(DoctorCheck(f"bot:{bot.bot_id}", "pass", "Rendered profile files are present"))
+            checks.append(
+                DoctorCheck(f"bot:{bot.bot_id}", "pass", "Rendered profile files are present")
+            )
     return checks
 
 
 def report_to_text(report: DoctorReport) -> str:
     lines = []
     for check in report.checks:
-        marker = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}.get(check.status, check.status.upper())
+        if check.status == "pass":
+            marker = "OK"
+        elif check.status == "warn":
+            marker = "WARN"
+        elif check.status == "fail":
+            marker = "FAIL"
+        else:
+            marker = check.status.upper()
         lines.append(f"{marker}\t{check.name}\t{check.message}")
     return "\n".join(lines) + ("\n" if lines else "")
 

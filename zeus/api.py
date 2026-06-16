@@ -10,14 +10,14 @@ from urllib.parse import urlparse
 
 from zeus.config import Settings
 from zeus.doctor import run_doctor
-from zeus.models import BotCreateRequest, TemplateError, validate_id
+from zeus.models import BotCreateRequest, HermesTemplate, TemplateError, validate_id
 from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
 from zeus.templates import TemplateStore
 
 
-def make_handler(settings: Settings):
+def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
     settings.ensure_dirs()
     store = StateStore(settings.database_path)
     store.init()
@@ -83,6 +83,14 @@ def make_handler(settings: Settings):
                         HTTPStatus.OK,
                         Supervisor(store, settings.hermes_bin, settings.hermes_root)
                         .stop(bot_id)
+                        .to_dict(),
+                    )
+                elif path.startswith("/bots/") and path.endswith("/restart"):
+                    bot_id = self._bot_id_from_path(path, "restart")
+                    self._json(
+                        HTTPStatus.OK,
+                        Supervisor(store, settings.hermes_bin, settings.hermes_root)
+                        .restart(bot_id)
                         .to_dict(),
                     )
                 else:
@@ -156,7 +164,7 @@ class _ResponseSent(Exception):
     pass
 
 
-def template_to_dict(template) -> dict[str, Any]:
+def template_to_dict(template: HermesTemplate) -> dict[str, Any]:
     return {
         "id": template.id,
         "name": template.name,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 SECRET_LINE_RE = re.compile(r"(?P<name>[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))=(?P<value>[^\s]+)")
 
 

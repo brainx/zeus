@@ -37,10 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("bot_id")
     create.add_argument("--template", required=True, dest="template_id")
     create.add_argument("--name", dest="display_name")
-    create.add_argument("--env", action="append", default=[], help="NAME=VALUE for rendered profile .env")
+    create.add_argument(
+        "--env", action="append", default=[], help="NAME=VALUE for rendered profile .env"
+    )
 
     bot_sub.add_parser("list")
-    for action in ["start", "stop", "status", "logs", "doctor"]:
+    for action in ["start", "stop", "restart", "status", "logs", "doctor"]:
         command = bot_sub.add_parser(action)
         command.add_argument("bot_id")
 
@@ -109,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.resource == "bot" and args.action == "stop":
         print(json.dumps(supervisor.stop(args.bot_id).to_dict(), sort_keys=True))
+        return 0
+    if args.resource == "bot" and args.action == "restart":
+        print(json.dumps(supervisor.restart(args.bot_id).to_dict(), sort_keys=True))
         return 0
     if args.resource == "bot" and args.action == "status":
         print(json.dumps(supervisor.status(args.bot_id).to_dict(), sort_keys=True))

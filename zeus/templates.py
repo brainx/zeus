@@ -28,4 +28,3 @@ class TemplateStore:
             if template.id == template_id:
                 return template
         raise KeyError(f"unknown template: {template_id}")
-

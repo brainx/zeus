@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Mapping
-
+from typing import Any
 
 ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
@@ -35,10 +35,10 @@ def _mapping(value: Any, name: str) -> Mapping[str, Any]:
 def _string(value: Any, name: str, *, min_length: int = 1, max_length: int = 20_000) -> str:
     if not isinstance(value, str):
         raise TemplateError(f"{name} must be a string")
-    value = value.strip()
-    if len(value) < min_length or len(value) > max_length:
+    text = value.strip()
+    if len(text) < min_length or len(text) > max_length:
         raise TemplateError(f"{name} length must be between {min_length} and {max_length}")
-    return value
+    return text
 
 
 def _int(value: Any, name: str, *, default: int, minimum: int, maximum: int | None = None) -> int:
@@ -87,9 +87,13 @@ def _reject_inline_secrets(value: Any, key: str = "") -> None:
     elif isinstance(value, list):
         for child_value in value:
             _reject_inline_secrets(child_value, key)
-    elif isinstance(value, str) and SECRET_NAME_RE.search(key):
-        if value and not ENV_PLACEHOLDER_RE.match(value):
-            raise TemplateError(f"secret-like field {key} must use ${{ENV_VAR}}")
+    elif (
+        isinstance(value, str)
+        and SECRET_NAME_RE.search(key)
+        and value
+        and not ENV_PLACEHOLDER_RE.match(value)
+    ):
+        raise TemplateError(f"secret-like field {key} must use ${{ENV_VAR}}")
 
 
 @dataclass(frozen=True)
@@ -100,7 +104,7 @@ class HermesModelConfig:
     api_mode: str | None = None
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "HermesModelConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> HermesModelConfig:
         api_mode = data.get("api_mode") or None
         if api_mode is not None:
             api_mode = _string(api_mode, "hermes.model.api_mode")
@@ -132,7 +136,7 @@ class HermesTerminalConfig:
     docker_mount_cwd_to_workspace: bool = False
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "HermesTerminalConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> HermesTerminalConfig:
         backend = _string(data.get("backend", "docker"), "hermes.terminal.backend")
         if backend not in {"local", "docker", "ssh", "modal", "daytona", "singularity"}:
             raise TemplateError(f"unsupported terminal backend: {backend}")
@@ -173,7 +177,7 @@ class HermesGatewayConfig:
     enabled: bool = True
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "HermesGatewayConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> HermesGatewayConfig:
         return cls(enabled=_bool(data.get("enabled"), "hermes.gateway.enabled", default=True))
 
     def to_config(self) -> dict[str, Any]:
@@ -189,7 +193,7 @@ class HermesDelegationConfig:
     subagent_auto_approve: bool = False
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "HermesDelegationConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> HermesDelegationConfig:
         timeout = _int(
             data.get("child_timeout_seconds"),
             "hermes.delegation.child_timeout_seconds",
@@ -248,13 +252,15 @@ class HermesConfig:
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "HermesConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> HermesConfig:
         return cls(
             model=HermesModelConfig.from_dict(_mapping(data.get("model"), "hermes.model")),
             terminal=HermesTerminalConfig.from_dict(
                 _mapping(data.get("terminal", {}), "hermes.terminal")
             ),
-            gateway=HermesGatewayConfig.from_dict(_mapping(data.get("gateway", {}), "hermes.gateway")),
+            gateway=HermesGatewayConfig.from_dict(
+                _mapping(data.get("gateway", {}), "hermes.gateway")
+            ),
             delegation=HermesDelegationConfig.from_dict(
                 _mapping(data.get("delegation", {}), "hermes.delegation")
             ),
@@ -291,7 +297,7 @@ class HermesTemplate:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "HermesTemplate":
+    def from_dict(cls, data: Mapping[str, Any]) -> HermesTemplate:
         _reject_inline_secrets(data)
         template_id = validate_id(_string(data.get("id"), "id"))
         version = _string(data.get("version"), "version")
@@ -334,8 +340,8 @@ class BotRecord:
     profile_path: str
     status: BotStatus = BotStatus.stopped
     pid: int | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
         return {

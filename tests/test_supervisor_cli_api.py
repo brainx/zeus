@@ -79,6 +79,78 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual(BotStatus.stopped, status.status)
             self.assertIn("gateway shutdown completed", status.message)
 
+    def test_supervisor_restart_stops_then_starts_gateway(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            alive_checks = iter([True, False])
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                popen_factory=FakePopen,
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: next(alive_checks, False),
+                stop_grace_seconds=0.01,
+            )
+            supervisor._write_pid_marker(
+                str(profile_path),
+                4321,
+                ["hermes", "-p", "coder", "gateway", "run"],
+            )
+
+            status = supervisor.restart("coder")
+
+            self.assertEqual([(4321, "SIGTERM")], sent)
+            self.assertEqual(BotStatus.running, status.status)
+            self.assertEqual(4321, status.pid)
+            self.assertEqual("restarted", status.message)
+
+    def test_supervisor_restart_aborts_when_pid_ownership_is_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / ".zeus" / "hermes" / "profiles" / "coder"),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                popen_factory=FakePopen,
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: True,
+                stop_grace_seconds=0.01,
+            )
+
+            status = supervisor.restart("coder")
+
+            self.assertEqual([], sent)
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertIn("restart aborted", status.message)
+
     def test_supervisor_refuses_unverified_pid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -157,7 +229,9 @@ class SupervisorCliApiTests(unittest.TestCase):
                     source.read_text(encoding="utf-8"),
                     encoding="utf-8",
                 )
-                self.assertEqual(0, cli_main(["bot", "create", "coder", "--template", "coding-bot"]))
+                self.assertEqual(
+                    0, cli_main(["bot", "create", "coder", "--template", "coding-bot"])
+                )
                 self.assertTrue((root / ".zeus" / "hermes" / "profiles" / "coder").exists())
             finally:
                 os.chdir(old_cwd)
@@ -207,7 +281,9 @@ class SupervisorCliApiTests(unittest.TestCase):
                 self.assertEqual(200, response.status)
                 self.assertEqual({"status": "ok"}, json.loads(response.read()))
 
-                conn.request("POST", "/bots", body=b"{}", headers={"content-type": "application/json"})
+                conn.request(
+                    "POST", "/bots", body=b"{}", headers={"content-type": "application/json"}
+                )
                 response = conn.getresponse()
                 self.assertEqual(401, response.status)
                 response.read()
@@ -225,9 +301,9 @@ class SupervisorCliApiTests(unittest.TestCase):
                 self.assertEqual(400, response.status)
                 response.read()
 
-                create_body = json.dumps(
-                    {"bot_id": "coder", "template_id": "coding-bot"}
-                ).encode("utf-8")
+                create_body = json.dumps({"bot_id": "coder", "template_id": "coding-bot"}).encode(
+                    "utf-8"
+                )
                 conn.request(
                     "POST",
                     "/bots",

@@ -19,6 +19,9 @@ class RepoContractTests(unittest.TestCase):
             "docs/REAL_HERMES_VERIFICATION.md",
             "docs/FRESH_VPS_TEST.md",
             "docs/REPO_GENERATION.md",
+            "docs/ROADMAP.md",
+            "docs/assets/demo.cast",
+            "docs/assets/zeus-hero.png",
             "scripts/repo_check.sh",
             "scripts/fresh_vps_verify.sh",
             "templates/deepseek-coding-bot.toml",
@@ -34,7 +37,15 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("3.11", workflow)
         self.assertIn("3.12", workflow)
         self.assertIn("3.13", workflow)
+        self.assertIn('pip install -e ".[dev]"', workflow)
+        self.assertIn("ruff format --check .", workflow)
+        self.assertIn("ruff check .", workflow)
+        self.assertIn("mypy zeus", workflow)
+        self.assertIn("bandit -r zeus", workflow)
+        self.assertIn("shellcheck scripts/*.sh", workflow)
         self.assertIn("sh scripts/test.sh", workflow)
+        self.assertIn("python -m build", workflow)
+        self.assertIn("twine check dist/*", workflow)
 
     def test_test_script_runs_compile_unittest_and_doctor(self) -> None:
         script = Path("scripts/test.sh").read_text(encoding="utf-8")
@@ -42,15 +53,15 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("compileall zeus tests", script)
         self.assertIn("unittest discover -s tests -v", script)
         self.assertIn("trap cleanup EXIT INT TERM", script)
-        self.assertIn("mkdir -p \"$tmp_dir\"", script)
+        self.assertIn('mkdir -p "$tmp_dir"', script)
         self.assertIn("zeus.cli doctor --json", script)
 
     def test_repo_check_script_verifies_required_handoff_artifacts(self) -> None:
         script = Path("scripts/repo_check.sh").read_text(encoding="utf-8")
 
-        self.assertIn("tmp_dir=\".tmp/repo-check\"", script)
+        self.assertIn('tmp_dir=".tmp/repo-check"', script)
         self.assertIn("trap cleanup EXIT INT TERM", script)
-        self.assertIn("ZEUS_STATE_DIR=\"$tmp_dir/state\"", script)
+        self.assertIn('ZEUS_STATE_DIR="$tmp_dir/state"', script)
         self.assertIn("LICENSE", script)
         self.assertIn("SECURITY.md", script)
         self.assertIn("docs/ARCHITECTURE.md", script)
@@ -68,6 +79,13 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("## Why Zeus", readme)
         self.assertIn("## How It Works", readme)
         self.assertIn("## Quick Start", readme)
+        self.assertIn("## 60-Second Demo", readme)
+        self.assertIn("docs/assets/zeus-hero.png", readme)
+        self.assertIn("docs/assets/demo.cast", readme)
+        self.assertIn("docs/ROADMAP.md", readme)
+        self.assertIn("actions/workflows/ci.yml/badge.svg", readme)
+        self.assertIn("Package Build", readme)
+        self.assertIn("Security Policy", readme)
         self.assertIn("```mermaid", readme)
 
     def test_env_example_lists_deepseek_and_api_auth(self) -> None:
@@ -77,6 +95,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("ZEUS_API_KEY=", env)
         self.assertIn("DEEPSEEK_API_KEY=", env)
         self.assertIn("Mutating endpoints always require", api_docs)
+        self.assertIn("POST /bots/<bot-id>/restart", api_docs)
 
     def test_deepseek_template_uses_native_provider(self) -> None:
         text = Path("templates/deepseek-coding-bot.toml").read_text(encoding="utf-8")
@@ -114,8 +133,26 @@ class RepoContractTests(unittest.TestCase):
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
 
         self.assertNotIn("github.com/" + "example", pyproject)
-        self.assertIn("license = \"MIT\"", pyproject)
-        self.assertIn("zeus = \"zeus.cli:main\"", pyproject)
+        self.assertIn('license = "MIT"', pyproject)
+        self.assertIn('zeus = "zeus.cli:main"', pyproject)
+        self.assertIn("[project.optional-dependencies]", pyproject)
+        self.assertIn("ruff>=0.6.0", pyproject)
+        self.assertIn("mypy>=1.11.0", pyproject)
+        self.assertIn("bandit>=1.7.9", pyproject)
+        self.assertIn("[tool.ruff]", pyproject)
+        self.assertIn("[tool.mypy]", pyproject)
+        self.assertIn("[tool.bandit]", pyproject)
+
+    def test_cli_exposes_restart_lifecycle_command(self) -> None:
+        cli = Path("zeus/cli.py").read_text(encoding="utf-8")
+        supervisor = Path("zeus/supervisor.py").read_text(encoding="utf-8")
+        api = Path("zeus/api.py").read_text(encoding="utf-8")
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn('"restart"', cli)
+        self.assertIn("def restart", supervisor)
+        self.assertIn(".restart(bot_id)", api)
+        self.assertIn("zeus bot restart coder", readme)
 
     def test_brainx_maintainer_is_credited(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
@@ -124,8 +161,14 @@ class RepoContractTests(unittest.TestCase):
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
 
         self.assertIn("[Credits](CREDITS.md)", readme)
-        self.assertIn("Zeus is an orchestration layer", readme)
-        self.assertNotIn("[BrainX](https://github.com/brainx)-maintained orchestration layer", readme)
+        opener = (
+            "Zeus is a orchestration layer for running many Hermes Agent bots "
+            "from reusable templates."
+        )
+        self.assertIn(opener, readme)
+        self.assertNotIn(
+            "[BrainX](https://github.com/brainx)-maintained orchestration layer", readme
+        )
         self.assertIn("Zeus is maintained by [BrainX](https://github.com/brainx).", readme)
         self.assertIn("https://github.com/brainx", readme)
         self.assertIn("https://github.com/brainx", credits)

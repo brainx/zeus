@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 import textwrap
@@ -41,7 +40,8 @@ class FakeHermesIntegrationTests(unittest.TestCase):
 
                     if sys.argv[-2:] == ["gateway", "run"]:
                         marker = home / "fake-gateway.json"
-                        marker.write_text(json.dumps({{"profile": profile, "argv": sys.argv}}), encoding="utf-8")
+                        payload = {{"profile": profile, "argv": sys.argv}}
+                        marker.write_text(json.dumps(payload), encoding="utf-8")
                         print("fake gateway starting", flush=True)
 
                         running = True

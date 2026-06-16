@@ -55,6 +55,10 @@ Returns redacted gateway logs for a bot.
 
 Starts the Hermes gateway process for the bot.
 
+### `POST /bots/<bot-id>/restart`
+
+Stops the Hermes gateway process if it is running, waits for clean shutdown, and starts it again.
+
 ### `POST /bots/<bot-id>/stop`
 
 Stops the Hermes gateway process after verifying PID ownership.

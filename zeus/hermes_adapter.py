@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 
 from zeus.models import ID_RE
-
 
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 
@@ -48,12 +47,12 @@ class HermesAdapter:
 
     def run(self, bot_id: str, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
         argv, env = self.command(bot_id, *args)
-        return subprocess.run(
+        # Zeus executes the configured Hermes binary with validated argv and shell=False.
+        return subprocess.run(  # nosec B603
             argv,
             env=env,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=timeout,
             check=False,
         )

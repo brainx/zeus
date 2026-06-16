@@ -27,6 +27,9 @@ docs/TEMPLATE_AUTHORING.md
 docs/REAL_HERMES_VERIFICATION.md
 docs/FRESH_VPS_TEST.md
 docs/REPO_GENERATION.md
+docs/ROADMAP.md
+docs/assets/demo.cast
+docs/assets/zeus-hero.png
 scripts/test.sh
 scripts/verify_real_hermes.sh
 scripts/fresh_vps_verify.sh

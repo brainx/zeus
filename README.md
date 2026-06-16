@@ -1,8 +1,19 @@
+<p align="center">
+  <img src="docs/assets/zeus-hero.png" alt="Zeus Hermes Orchestrator" width="900">
+</p>
+
 # Zeus Hermes Orchestrator
 
 Many Hermes bots, one local supervisor.
 
-Zeus is an orchestration layer for running many Hermes Agent bots from reusable templates. It renders each bot as an isolated Hermes profile under `.zeus/`, starts and stops gateway processes, tracks PID ownership, and exposes a small loopback CLI/API for operators.
+[![CI](https://github.com/brainx/zeus/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/brainx/zeus/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/brainx/zeus?include_prereleases&sort=semver)](https://github.com/brainx/zeus/releases)
+[![Package Build](https://img.shields.io/badge/package-build%20checked-brightgreen)](.github/workflows/ci.yml)
+[![Security Policy](https://img.shields.io/badge/security-policy-informational)](SECURITY.md)
+
+Zeus is a orchestration layer for running many Hermes Agent bots from reusable templates. It renders each bot as an isolated Hermes profile under `.zeus/`, starts and stops gateway processes, tracks PID ownership, and exposes a small loopback CLI/API for operators.
 
 ## Why Zeus
 
@@ -47,6 +58,21 @@ Start the local API with an explicit key:
 ZEUS_API_KEY=change-me sh scripts/start.sh
 ```
 
+## 60-Second Demo
+
+The asciinema recording in [docs/assets/demo.cast](docs/assets/demo.cast) mirrors the local
+operator flow:
+
+```bash
+zeus doctor
+zeus template list
+zeus bot create coder --template coding-bot
+zeus bot start coder
+zeus bot status coder
+zeus bot logs coder
+zeus bot stop coder
+```
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
@@ -55,6 +81,7 @@ ZEUS_API_KEY=change-me sh scripts/start.sh
 - [Real Hermes verification](docs/REAL_HERMES_VERIFICATION.md)
 - [Fresh VPS test](docs/FRESH_VPS_TEST.md)
 - [Repository generation checklist](docs/REPO_GENERATION.md)
+- [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
 - [Credits](CREDITS.md)
 - [Security policy](SECURITY.md)
@@ -88,6 +115,7 @@ zeus bot doctor coder
 zeus bot start coder
 zeus bot status coder
 zeus bot logs coder
+zeus bot restart coder
 zeus bot stop coder
 ```
 
@@ -145,6 +173,7 @@ Useful endpoints:
 - `GET /bots`
 - `POST /bots`
 - `POST /bots/<bot-id>/start`
+- `POST /bots/<bot-id>/restart`
 - `POST /bots/<bot-id>/stop`
 
 ## Templates

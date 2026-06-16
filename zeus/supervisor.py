@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import signal
-import subprocess
+import subprocess  # nosec B404
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 from zeus.hermes_adapter import HermesAdapter
 from zeus.logging_utils import tail_file
-from zeus.models import BotStatus, BotStatusResponse
+from zeus.models import BotRecord, BotStatus, BotStatusResponse
 from zeus.state import StateStore
 
 
@@ -127,6 +128,28 @@ class Supervisor:
             message="gateway shutdown completed",
         )
 
+    def restart(self, bot_id: str) -> BotStatusResponse:
+        stopped = self.stop(bot_id)
+        if stopped.status == BotStatus.failed:
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.failed,
+                pid=stopped.pid,
+                profile_path=stopped.profile_path,
+                message="restart aborted: " + stopped.message,
+            )
+
+        started = self.start(bot_id)
+        if started.status == BotStatus.running:
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=started.status,
+                pid=started.pid,
+                profile_path=started.profile_path,
+                message="restarted",
+            )
+        return started
+
     def status(self, bot_id: str) -> BotStatusResponse:
         record = self._require_bot(bot_id)
         alive = bool(record.pid and self._pid_alive(record.pid))
@@ -159,7 +182,7 @@ class Supervisor:
     def pid_marker_path(self, profile_path: str) -> Path:
         return Path(profile_path) / "logs" / "zeus-gateway.pid.json"
 
-    def _require_bot(self, bot_id: str):
+    def _require_bot(self, bot_id: str) -> BotRecord:
         record = self.store.get_bot(bot_id)
         if record is None:
             raise KeyError(f"unknown bot: {bot_id}")

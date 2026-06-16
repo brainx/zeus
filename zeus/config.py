@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 
 def load_dotenv(path: Path = Path(".env")) -> dict[str, str]:
@@ -32,7 +32,7 @@ class Settings:
     api_key: str | None
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
+    def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         merged: dict[str, str] = load_dotenv()
         merged.update(dict(os.environ if env is None else env))
         state_dir = Path(merged.get("ZEUS_STATE_DIR", ".zeus")).resolve()
@@ -50,4 +50,3 @@ class Settings:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.hermes_root.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "logs").mkdir(parents=True, exist_ok=True)
-

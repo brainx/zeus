@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from zeus.models import BotRecord, BotStatus
@@ -41,7 +41,14 @@ class StateStore:
             conn.execute(
                 """
                 INSERT INTO bots (
-                    bot_id, template_id, display_name, profile_path, status, pid, created_at, updated_at
+                    bot_id,
+                    template_id,
+                    display_name,
+                    profile_path,
+                    status,
+                    pid,
+                    created_at,
+                    updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bot_id) DO UPDATE SET
@@ -76,7 +83,7 @@ class StateStore:
         return [self._row_to_record(row) for row in rows]
 
     def update_status(self, bot_id: str, status: BotStatus, pid: int | None = None) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         with closing(self.connect()) as conn:
             conn.execute(
                 "UPDATE bots SET status = ?, pid = ?, updated_at = ? WHERE bot_id = ?",
