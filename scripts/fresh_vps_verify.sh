@@ -82,7 +82,7 @@ venv_dir="${ZEUS_VPS_VENV_DIR:-.venv}"
 safe_relative_dir "$venv_dir" "ZEUS_VPS_VENV_DIR"
 run python3 --version
 run python3 -m venv "$venv_dir"
-# shellcheck disable=SC1090
+# shellcheck disable=SC1091
 source "$venv_dir/bin/activate"
 run python -m pip install -e .
 run python -B -m zeus.cli doctor --json
