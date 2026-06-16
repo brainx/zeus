@@ -74,7 +74,7 @@ The script writes logs under:
 
 Important files:
 
-- `run.log`: full command transcript.
+- `run.log`: full command transcript, including `git rev-parse HEAD` and `git status --short` when run from a Git checkout.
 - `hermes-install.sh`: downloaded installer, when Hermes installation is enabled.
 - `zeus-api.log`: API server log from the loopback smoke test.
 

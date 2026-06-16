@@ -57,6 +57,12 @@ test -f zeus/cli.py || fail "missing zeus/cli.py"
 run pwd
 run date -u
 run uname -a
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  run git rev-parse HEAD
+  run git status --short
+else
+  echo "Git checkout metadata unavailable; commit evidence will not be recorded."
+fi
 
 section "Optional OS Bootstrap"
 if [ "${ZEUS_VPS_INSTALL_PACKAGES:-0}" = "1" ]; then

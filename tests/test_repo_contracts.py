@@ -106,6 +106,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("ZEUS_VPS_ASYNC_PROMPT", script)
         self.assertIn("zeus-api.log", script)
         self.assertIn("safe_relative_dir", script)
+        self.assertIn("git rev-parse HEAD", script)
+        self.assertIn("git status --short", script)
 
     def test_pyproject_has_no_placeholder_repository_urls(self) -> None:
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
