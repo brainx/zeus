@@ -12,4 +12,7 @@
 - Added normal and strict doctor checks.
 - Added fake-Hermes lifecycle integration tests.
 - Added CI, local test script, and real-Hermes verification handoff script.
-
+- Added README hero assets, demo recording, roadmap, and release badges.
+- Added `zeus bot restart` and `POST /bots/<bot-id>/restart`.
+- Added ruff, mypy, Bandit, ShellCheck, package build, and twine CI gates.
+- Added systemd deployment and operations documentation.

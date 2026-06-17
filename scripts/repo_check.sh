@@ -26,10 +26,13 @@ docs/API.md
 docs/TEMPLATE_AUTHORING.md
 docs/REAL_HERMES_VERIFICATION.md
 docs/FRESH_VPS_TEST.md
+docs/SYSTEMD.md
+docs/OPERATIONS.md
 docs/REPO_GENERATION.md
 docs/ROADMAP.md
 docs/assets/demo.cast
 docs/assets/zeus-hero.png
+systemd/zeus-api.service
 scripts/test.sh
 scripts/verify_real_hermes.sh
 scripts/fresh_vps_verify.sh
@@ -64,6 +67,7 @@ paths = [
     Path(".env.example"),
     Path(".gitignore"),
     Path("docs"),
+    Path("systemd"),
     Path("scripts"),
     Path("templates"),
     Path("tests"),

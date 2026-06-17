@@ -80,6 +80,8 @@ zeus bot stop coder
 - [Template authoring](docs/TEMPLATE_AUTHORING.md)
 - [Real Hermes verification](docs/REAL_HERMES_VERIFICATION.md)
 - [Fresh VPS test](docs/FRESH_VPS_TEST.md)
+- [Systemd deployment](docs/SYSTEMD.md)
+- [Operations](docs/OPERATIONS.md)
 - [Repository generation checklist](docs/REPO_GENERATION.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)

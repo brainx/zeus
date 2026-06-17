@@ -18,10 +18,13 @@ class RepoContractTests(unittest.TestCase):
             "docs/TEMPLATE_AUTHORING.md",
             "docs/REAL_HERMES_VERIFICATION.md",
             "docs/FRESH_VPS_TEST.md",
+            "docs/SYSTEMD.md",
+            "docs/OPERATIONS.md",
             "docs/REPO_GENERATION.md",
             "docs/ROADMAP.md",
             "docs/assets/demo.cast",
             "docs/assets/zeus-hero.png",
+            "systemd/zeus-api.service",
             "scripts/repo_check.sh",
             "scripts/fresh_vps_verify.sh",
             "templates/deepseek-coding-bot.toml",
@@ -67,7 +70,10 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("docs/ARCHITECTURE.md", script)
         self.assertIn("docs/TEMPLATE_AUTHORING.md", script)
         self.assertIn("docs/FRESH_VPS_TEST.md", script)
+        self.assertIn("docs/SYSTEMD.md", script)
+        self.assertIn("docs/OPERATIONS.md", script)
         self.assertIn("docs/REPO_GENERATION.md", script)
+        self.assertIn("systemd/zeus-api.service", script)
         self.assertIn("scripts/fresh_vps_verify.sh", script)
         self.assertIn("templates/deepseek-coding-bot.toml", script)
         self.assertIn("Repository readiness check passed.", script)
@@ -82,6 +88,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("## 60-Second Demo", readme)
         self.assertIn("docs/assets/zeus-hero.png", readme)
         self.assertIn("docs/assets/demo.cast", readme)
+        self.assertIn("docs/SYSTEMD.md", readme)
+        self.assertIn("docs/OPERATIONS.md", readme)
         self.assertIn("docs/ROADMAP.md", readme)
         self.assertIn("actions/workflows/ci.yml/badge.svg", readme)
         self.assertIn("Package Build", readme)
@@ -153,6 +161,23 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("def restart", supervisor)
         self.assertIn(".restart(bot_id)", api)
         self.assertIn("zeus bot restart coder", readme)
+
+    def test_systemd_and_operations_docs_are_actionable(self) -> None:
+        service = Path("systemd/zeus-api.service").read_text(encoding="utf-8")
+        systemd_docs = Path("docs/SYSTEMD.md").read_text(encoding="utf-8")
+        operations = Path("docs/OPERATIONS.md").read_text(encoding="utf-8")
+
+        self.assertIn("EnvironmentFile=/etc/zeus/zeus.env", service)
+        self.assertIn("ExecStart=/opt/zeus/.venv/bin/python -m zeus.api", service)
+        self.assertIn("Restart=on-failure", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("ReadWritePaths=/var/lib/zeus", service)
+        self.assertIn("ZEUS_API_KEY=replace-with-a-long-random-value", systemd_docs)
+        self.assertIn("sudo systemctl enable --now zeus-api", systemd_docs)
+        self.assertIn("Backup", operations)
+        self.assertIn("Logs", operations)
+        self.assertIn("Upgrade", operations)
+        self.assertIn("Restart Policy", operations)
 
     def test_brainx_maintainer_is_credited(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
