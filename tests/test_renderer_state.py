@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from zeus.hermes_adapter import HermesAdapter
@@ -53,6 +55,62 @@ class RendererStateTests(unittest.TestCase):
             assert loaded is not None
             self.assertEqual(BotStatus.running, loaded.status)
             self.assertEqual(1234, loaded.pid)
+
+    def test_state_initializes_schema_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+
+            store.init()
+
+            with closing(sqlite3.connect(root / "zeus.db")) as conn:
+                version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            self.assertEqual(1, version)
+
+    def test_state_migrates_existing_database_without_schema_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "zeus.db"
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE bots (
+                        bot_id TEXT PRIMARY KEY,
+                        template_id TEXT NOT NULL,
+                        display_name TEXT NOT NULL,
+                        profile_path TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        pid INTEGER,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.commit()
+
+            store = StateStore(database)
+            store.init()
+
+            with closing(sqlite3.connect(database)) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
+                version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            self.assertEqual(1, version)
+            self.assertIn("restart_policy", columns)
+            self.assertIn("next_restart_at", columns)
+
+    def test_state_init_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+
+            store.init()
+            store.init()
+
+            with closing(sqlite3.connect(root / "zeus.db")) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+                version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            self.assertEqual(1, count)
+            self.assertEqual(1, version)
 
     def test_renderer_uses_native_deepseek_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

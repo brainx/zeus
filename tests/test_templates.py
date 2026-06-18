@@ -4,17 +4,46 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from zeus.models import HermesTemplate, TemplateError
+from zeus.models import BotCreateRequest, HermesTemplate, TemplateError
+from zeus.renderer import ProfileRenderer
 from zeus.templates import TemplateStore
 
 
 class TemplateTests(unittest.TestCase):
     def test_builtin_templates_include_async_delegation_caps(self) -> None:
         templates = TemplateStore().list()
-        self.assertGreaterEqual(len(templates), 3)
+        self.assertGreaterEqual(len(templates), 7)
         for template in templates:
             self.assertGreaterEqual(template.hermes.delegation.max_async_children, 1)
             self.assertLessEqual(template.hermes.delegation.max_async_children, 32)
+
+    def test_builtin_templates_have_metadata_and_required_env_placeholders(self) -> None:
+        templates = TemplateStore().list()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for template in templates:
+                with self.subTest(template=template.id):
+                    self.assertTrue(template.hermes.required_env)
+                    for name in template.hermes.required_env:
+                        self.assertRegex(name, r"^[A-Z][A-Z0-9_]{1,127}$")
+                    self.assertTrue(template.metadata.get("use_case"))
+                    self.assertIn(template.metadata.get("risk_level"), {"low", "medium", "high"})
+                    self.assertEqual("manual", template.metadata.get("recommended_restart_policy"))
+
+                    env = {name: f"${{{name}}}" for name in template.hermes.required_env}
+                    ProfileRenderer(root / template.id).render(
+                        BotCreateRequest(
+                            bot_id=template.id,
+                            template_id=template.id,
+                            env=env,
+                        ),
+                        template,
+                    )
+                    env_text = (root / template.id / "profiles" / template.id / ".env").read_text(
+                        encoding="utf-8"
+                    )
+                    for name in template.hermes.required_env:
+                        self.assertIn(f'{name}="${{{name}}}"', env_text)
 
     def test_rejects_inline_secret_like_value(self) -> None:
         with self.assertRaises(TemplateError):

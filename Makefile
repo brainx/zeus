@@ -1,13 +1,32 @@
 # Zeus Hermes Orchestrator
 # Maintained by BrainX: https://github.com/brainx
 
-.PHONY: test doctor strict-doctor repo-check verify-real-hermes fresh-vps-verify clean clean-vps
+.PHONY: install-dev test check build doctor run-api strict-doctor repo-check verify-real-hermes fresh-vps-verify clean clean-vps
+
+install-dev:
+	python3 -m venv .venv
+	. .venv/bin/activate && python -m pip install -e ".[dev]"
 
 test:
 	sh scripts/test.sh
 
+check:
+	sh scripts/test.sh
+	sh scripts/repo_check.sh
+	ruff format --check .
+	ruff check .
+	mypy zeus
+	bandit -r zeus
+
+build:
+	python -m build
+	twine check dist/*
+
 doctor:
 	python3 -B -m zeus.cli doctor --json
+
+run-api:
+	ZEUS_API_KEY=change-me sh scripts/start.sh
 
 strict-doctor:
 	python3 -B -m zeus.cli doctor --strict --json

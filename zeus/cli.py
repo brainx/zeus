@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 
-from zeus.api import serve
+from zeus.api import serve, template_to_dict
 from zeus.config import Settings
 from zeus.doctor import report_to_json, report_to_text, run_doctor
 from zeus.models import BotCreateRequest, RestartPolicy
@@ -28,7 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     template = sub.add_parser("template")
     template_sub = template.add_subparsers(dest="action", required=True)
-    template_sub.add_parser("list")
+    template_list = template_sub.add_parser("list")
+    template_list.add_argument("--json", action="store_true", dest="as_json")
 
     bot = sub.add_parser("bot")
     bot_sub = bot.add_subparsers(dest="action", required=True)
@@ -43,13 +44,20 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--restart-policy", choices=["manual", "on-failure"], default="manual")
     create.add_argument("--restart-backoff-seconds", type=float, default=5.0)
     create.add_argument("--restart-max-attempts", type=int, default=5)
+    create.add_argument("--json", action="store_true", dest="as_json")
 
-    bot_sub.add_parser("list")
+    bot_list = bot_sub.add_parser("list")
+    bot_list.add_argument("--json", action="store_true", dest="as_json")
     reconcile = bot_sub.add_parser("reconcile")
     reconcile.add_argument("bot_id", nargs="?")
+    reconcile.add_argument("--json", action="store_true", dest="as_json")
+    reconcile.add_argument("--force", action="store_true")
+    reconcile.add_argument("--reset-restart", action="store_true")
     for action in ["start", "stop", "restart", "status", "logs", "doctor"]:
         command = bot_sub.add_parser(action)
         command.add_argument("bot_id")
+        if action == "logs":
+            command.add_argument("--json", action="store_true", dest="as_json")
 
     return parser
 
@@ -87,11 +95,17 @@ def main(argv: list[str] | None = None) -> int:
     store, supervisor = _services(settings)
 
     if args.resource == "template" and args.action == "list":
+        if args.as_json:
+            print(json.dumps([template_to_dict(t) for t in TemplateStore().list()], sort_keys=True))
+            return 0
         for template in TemplateStore().list():
             print(f"{template.id}\t{template.name}\t{template.description}")
         return 0
 
     if args.resource == "bot" and args.action == "list":
+        if args.as_json:
+            print(json.dumps([bot.to_dict() for bot in store.list_bots()], sort_keys=True))
+            return 0
         for bot in store.list_bots():
             print(f"{bot.bot_id}\t{bot.status.value}\t{bot.template_id}\t{bot.display_name}")
         return 0
@@ -111,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
             template,
         )
         store.upsert_bot(record)
+        store.append_audit_event("bot.create", bot_id=record.bot_id, template_id=record.template_id)
+        if args.as_json:
+            print(json.dumps(record.to_dict(), sort_keys=True))
+            return 0
         print(f"created {record.bot_id} from {record.template_id}")
         return 0
 
@@ -124,14 +142,20 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(supervisor.restart(args.bot_id).to_dict(), sort_keys=True))
         return 0
     if args.resource == "bot" and args.action == "reconcile":
-        results = supervisor.reconcile(args.bot_id)
+        results = supervisor.reconcile(
+            args.bot_id, force=args.force, reset_restart=args.reset_restart
+        )
         print(json.dumps([result.to_dict() for result in results], sort_keys=True))
         return 0
     if args.resource == "bot" and args.action == "status":
         print(json.dumps(supervisor.status(args.bot_id).to_dict(), sort_keys=True))
         return 0
     if args.resource == "bot" and args.action == "logs":
-        print(supervisor.logs(args.bot_id), end="")
+        logs = supervisor.logs(args.bot_id)
+        if args.as_json:
+            print(json.dumps({"bot_id": args.bot_id, "logs": logs}, sort_keys=True))
+        else:
+            print(logs, end="")
         return 0
     if args.resource == "bot" and args.action == "doctor":
         result = supervisor.adapter.run(args.bot_id, "doctor", timeout=120)

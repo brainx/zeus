@@ -50,6 +50,20 @@ curl -fsS http://127.0.0.1:4311/health
 
 Use `journalctl -u zeus-api -f` for API logs. Keep the service loopback-only unless it is placed behind a TLS-terminating reverse proxy with authentication and tight firewall rules.
 
+## Reconcile Timer
+
+Install the reconcile timer when bots use `restart_policy = "on-failure"` and
+should be recovered without manual operator commands:
+
+```bash
+sudo install -m 0644 systemd/zeus-reconcile.service /etc/systemd/system/zeus-reconcile.service
+sudo install -m 0644 systemd/zeus-reconcile.timer /etc/systemd/system/zeus-reconcile.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now zeus-reconcile.timer
+```
+
+See `docs/RECONCILE.md` for reconcile semantics and timer operations.
+
 ## Hardening Notes
 
 The sample unit enables `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome=true`, and writes only to `/var/lib/zeus`. If a Hermes terminal backend needs extra host access, loosen the smallest required directive and document why.

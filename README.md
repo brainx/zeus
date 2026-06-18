@@ -82,6 +82,8 @@ zeus bot stop coder
 - [Fresh VPS test](docs/FRESH_VPS_TEST.md)
 - [Systemd deployment](docs/SYSTEMD.md)
 - [Operations](docs/OPERATIONS.md)
+- [Reconcile scheduling](docs/RECONCILE.md)
+- [Release process](docs/RELEASE.md)
 - [Repository generation checklist](docs/REPO_GENERATION.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
@@ -112,12 +114,16 @@ cp .env.example .env
 ```bash
 zeus doctor
 zeus template list
+zeus template list --json
 zeus bot create coder --template coding-bot
+zeus bot create coder-json --template coding-bot --json
 zeus bot doctor coder
 zeus bot start coder
 zeus bot status coder
 zeus bot logs coder
+zeus bot logs coder --json
 zeus bot reconcile coder
+zeus bot reconcile --json
 zeus bot restart coder
 zeus bot stop coder
 ```
@@ -171,6 +177,9 @@ reject requests instead of running anonymously. For local-only development, set
 `ZEUS_ALLOW_UNAUTH_READS=1` to allow unauthenticated `GET` endpoints while keeping
 mutations locked behind `ZEUS_API_KEY`.
 
+The OpenAPI contract is published at [docs/openapi.json](docs/openapi.json).
+API errors return an `error.code`, `error.message`, and `error.status` object.
+
 Useful endpoints:
 
 - `GET /health`
@@ -189,7 +198,7 @@ Templates live in `templates/*.toml`. They render Hermes `config.yaml`, `.env`, 
 Rendered `.env` values are serialized with quoting when needed so whitespace, `#`,
 quotes, and backslashes cannot create extra assignments.
 
-Built-in templates include OpenRouter-backed bots and `deepseek-coding-bot`, which uses Hermes' native DeepSeek provider with `DEEPSEEK_API_KEY`.
+Built-in templates include OpenRouter-backed bots and `deepseek-coding-bot`, which uses Hermes' native DeepSeek provider with `DEEPSEEK_API_KEY`. Example templates also cover gateway operations, log triage, and documentation writing.
 
 Each template should set a bounded async delegation cap:
 
@@ -222,6 +231,10 @@ Bots default to manual restart policy. Create a bot with `--restart-policy on-fa
 plus `--restart-backoff-seconds` and `--restart-max-attempts` to let
 `zeus bot reconcile [bot-id]` restart unexpectedly stopped gateways with exponential
 backoff.
+
+For unattended recovery, install `systemd/zeus-reconcile.service` and
+`systemd/zeus-reconcile.timer`. Lifecycle mutations append structured audit
+events to `$ZEUS_STATE_DIR/logs/audit.jsonl`.
 
 The test suite includes a fake Hermes executable that exercises the real Zeus subprocess path: render profile, start gateway, verify `HERMES_HOME`, stop gateway, reap the child process, and confirm logs are captured.
 

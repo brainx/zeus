@@ -7,6 +7,7 @@ import signal
 import subprocess  # nosec B404
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -87,6 +88,7 @@ class Supervisor:
         self.store.update_status(
             bot_id, BotStatus.running, pid=process.pid, reset_restart=reset_restart
         )
+        self.store.append_audit_event("bot.start", bot_id=bot_id, pid=process.pid)
         return BotStatusResponse(
             bot_id=bot_id,
             status=BotStatus.running,
@@ -100,6 +102,7 @@ class Supervisor:
         if not record.pid or not self._pid_alive(record.pid):
             self._remove_pid_marker(record.profile_path)
             self.store.update_status(bot_id, BotStatus.stopped, pid=None, reset_restart=True)
+            self.store.append_audit_event("bot.stop", bot_id=bot_id, pid=record.pid)
             return BotStatusResponse(
                 bot_id=bot_id,
                 status=BotStatus.stopped,
@@ -134,6 +137,7 @@ class Supervisor:
             )
 
         self.store.update_status(bot_id, BotStatus.stopped, pid=None, reset_restart=True)
+        self.store.append_audit_event("bot.stop", bot_id=bot_id, pid=record.pid)
         self._processes.pop(bot_id, None)
         self._remove_pid_marker(record.profile_path)
         return BotStatusResponse(
@@ -167,13 +171,33 @@ class Supervisor:
         return started
 
     def reconcile(
-        self, bot_id: str | None = None, *, now: datetime | None = None
+        self,
+        bot_id: str | None = None,
+        *,
+        now: datetime | None = None,
+        force: bool = False,
+        reset_restart: bool = False,
     ) -> list[BotStatusResponse]:
         current_time = now or datetime.now(UTC)
         records = [self._require_bot(bot_id)] if bot_id else self.store.list_bots()
-        return [self._reconcile_record(record, current_time) for record in records]
+        return [
+            self._reconcile_record(record, current_time, force=force, reset_restart=reset_restart)
+            for record in records
+        ]
 
-    def _reconcile_record(self, record: BotRecord, now: datetime) -> BotStatusResponse:
+    def _reconcile_record(
+        self, record: BotRecord, now: datetime, *, force: bool, reset_restart: bool
+    ) -> BotStatusResponse:
+        if reset_restart:
+            self.store.update_restart_state(
+                record.bot_id,
+                status=record.status,
+                pid=record.pid,
+                restart_attempts=0,
+                next_restart_at=None,
+            )
+            record = replace(record, restart_attempts=0, next_restart_at=None)
+
         if record.pid and self._pid_alive(record.pid):
             if not self._pid_owned(record.profile_path, record.pid, record.bot_id):
                 self.store.update_status(record.bot_id, BotStatus.failed, pid=record.pid)
@@ -215,7 +239,7 @@ class Supervisor:
                 status=BotStatus.failed,
                 pid=None,
                 profile_path=record.profile_path,
-                message="gateway is not running and restart policy is manual",
+                message="manual policy: not restarting",
             )
 
         if record.restart_attempts >= record.restart_max_attempts:
@@ -231,45 +255,77 @@ class Supervisor:
                 status=BotStatus.failed,
                 pid=None,
                 profile_path=record.profile_path,
-                message="restart limit reached",
+                message=(
+                    "restart limit reached: "
+                    f"{record.restart_attempts}/{record.restart_max_attempts}"
+                ),
             )
 
-        if record.next_restart_at is None:
+        if record.next_restart_at is None and not force:
             delay = self._restart_delay(record)
             next_restart_at = now + timedelta(seconds=delay)
+            attempt = record.restart_attempts + 1
             self.store.update_restart_state(
                 record.bot_id,
                 status=BotStatus.failed,
                 pid=None,
-                restart_attempts=record.restart_attempts + 1,
+                restart_attempts=attempt,
                 next_restart_at=next_restart_at,
             )
+            self.store.append_audit_event(
+                "bot.reconcile.restart_scheduled",
+                bot_id=record.bot_id,
+                attempt=attempt,
+                next_restart_at=next_restart_at.isoformat(),
+            )
             return BotStatusResponse(
                 bot_id=record.bot_id,
                 status=BotStatus.failed,
                 pid=None,
                 profile_path=record.profile_path,
-                message=f"restart scheduled in {delay:g}s",
+                message=(
+                    "restart scheduled: "
+                    f"attempt {attempt}/{record.restart_max_attempts} in {delay:g}s"
+                ),
             )
 
-        if record.next_restart_at > now:
+        if record.next_restart_at is not None and record.next_restart_at > now and not force:
             return BotStatusResponse(
                 bot_id=record.bot_id,
                 status=BotStatus.failed,
                 pid=None,
                 profile_path=record.profile_path,
-                message=f"restart pending until {record.next_restart_at.isoformat()}",
+                message=(
+                    "restart pending: "
+                    f"attempt {record.restart_attempts}/{record.restart_max_attempts} "
+                    f"due at {record.next_restart_at.isoformat()}"
+                ),
             )
 
+        attempt = record.restart_attempts
+        if record.next_restart_at is None or attempt == 0:
+            attempt += 1
         self.store.update_restart_state(
             record.bot_id,
             status=BotStatus.failed,
             pid=None,
-            restart_attempts=record.restart_attempts,
+            restart_attempts=attempt,
             next_restart_at=None,
         )
         refreshed = self._require_bot(record.bot_id)
-        return self._start_record(refreshed, reset_restart=False, message="restarted by reconcile")
+        result = self._start_record(
+            refreshed,
+            reset_restart=False,
+            message=f"restarted by reconcile: attempt {attempt}/{record.restart_max_attempts}",
+        )
+        if result.status == BotStatus.running:
+            self.store.append_audit_event(
+                "bot.reconcile.restart_started",
+                bot_id=record.bot_id,
+                pid=result.pid,
+                attempt=attempt,
+            )
+        return result
 
     def _restart_delay(self, record: BotRecord) -> float:
         delay = record.restart_backoff_seconds * (2**record.restart_attempts)

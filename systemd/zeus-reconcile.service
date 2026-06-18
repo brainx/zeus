@@ -1,0 +1,17 @@
+[Unit]
+Description=Zeus bot reconcile pass
+Documentation=https://github.com/brainx/zeus
+After=zeus-api.service
+
+[Service]
+Type=oneshot
+User=zeus
+Group=zeus
+WorkingDirectory=/opt/zeus
+EnvironmentFile=/etc/zeus/zeus.env
+ExecStart=/opt/zeus/.venv/bin/zeus bot reconcile
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zeus

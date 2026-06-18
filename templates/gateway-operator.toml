@@ -1,13 +1,13 @@
-id = "support-gateway"
-name = "Support Gateway"
-description = "Messaging-first support bot with conservative tool access."
+id = "gateway-operator"
+name = "Gateway Operator"
+description = "Operations bot for gateway health checks, runbooks, and safe escalation."
 version = "0.1.0"
 soul = """
-You are a support Hermes agent. Ask concise clarifying questions when needed, avoid exposing internal details, and escalate when a request touches billing, identity, safety, or privileged systems.
+You are a gateway operations Hermes agent. Prioritize current service health, exact command evidence, reversible actions, and clear escalation when a request touches secrets, billing, identity, or production permissions.
 """
 
 [hermes]
-required_env = ["OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN"]
+required_env = ["OPENROUTER_API_KEY"]
 
 [hermes.model]
 provider = "openrouter"
@@ -17,7 +17,7 @@ default = "anthropic/claude-sonnet-4"
 backend = "docker"
 cwd = "."
 home_mode = "profile"
-timeout = 180
+timeout = 240
 docker_image = "nikolaik/python-nodejs:python3.11-nodejs20"
 docker_mount_cwd_to_workspace = false
 
@@ -32,7 +32,7 @@ child_timeout_seconds = 0
 subagent_auto_approve = false
 
 [metadata]
-use_case = "Messaging-first support intake with conservative escalation"
+use_case = "Gateway operations and incident handoff"
 risk_level = "medium"
 recommended_restart_policy = "manual"
-tags = ["support", "messaging"]
+tags = ["operations", "gateway"]

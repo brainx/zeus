@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package and dev tools
+        run: python -m pip install -e ".[dev]"
+      - name: Run tests
+        run: sh scripts/test.sh
+      - name: Run repository contract check
+        run: sh scripts/repo_check.sh
+      - name: Build package
+        run: python -m build
+      - name: Check package metadata
+        run: twine check dist/*
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

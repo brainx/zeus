@@ -55,3 +55,13 @@ zeus bot create coder \
 ```
 
 Run `zeus bot reconcile [bot-id]` from an operator shell, cron, or systemd timer to health-check recorded PIDs and restart eligible bots with exponential backoff. Manual `zeus bot stop <bot-id>` resets restart state and does not respawn the bot.
+
+For first-class scheduling, install `systemd/zeus-reconcile.service` and
+`systemd/zeus-reconcile.timer` as described in `docs/RECONCILE.md`.
+
+## Audit Log
+
+Lifecycle mutations append JSONL audit events to
+`$ZEUS_STATE_DIR/logs/audit.jsonl`. Events include bot creation, start, stop,
+and reconcile restart scheduling or startup. Audit entries intentionally exclude
+environment maps and redact secret-like fields before writing.

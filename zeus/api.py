@@ -51,7 +51,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     logs = Supervisor(store, settings.hermes_bin, settings.hermes_root).logs(bot_id)
                     self._json(HTTPStatus.OK, {"bot_id": bot_id, "logs": logs})
                 else:
-                    self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    self._json_error_response(HTTPStatus.NOT_FOUND, "invalid_request", "not found")
             except Exception as exc:
                 self._json_error(exc)
 
@@ -75,6 +75,9 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     template = TemplateStore().get(request.template_id)
                     record = ProfileRenderer(settings.hermes_root).render(request, template)
                     store.upsert_bot(record)
+                    store.append_audit_event(
+                        "bot.create", bot_id=record.bot_id, template_id=record.template_id
+                    )
                     self._json(HTTPStatus.OK, record.to_dict())
                 elif path == "/bots/reconcile":
                     results = Supervisor(
@@ -112,7 +115,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     ).reconcile(bot_id)
                     self._json(HTTPStatus.OK, [result.to_dict() for result in results])
                 else:
-                    self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                    self._json_error_response(HTTPStatus.NOT_FOUND, "invalid_request", "not found")
             except Exception as exc:
                 self._json_error(exc)
 
@@ -162,22 +165,47 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             if read and settings.allow_unauth_reads:
                 return
             if not settings.api_key:
-                self._json(
+                self._json_error_response(
                     HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"error": "ZEUS_API_KEY is required for non-health endpoints"},
+                    "missing_api_key",
+                    "ZEUS_API_KEY is required for non-health endpoints",
                 )
                 raise _ResponseSent
             if self.headers.get("x-zeus-api-key") != settings.api_key:
-                self._json(HTTPStatus.UNAUTHORIZED, {"error": "invalid api key"})
+                self._json_error_response(
+                    HTTPStatus.UNAUTHORIZED,
+                    "invalid_api_key",
+                    "invalid api key",
+                )
                 raise _ResponseSent
 
         def _json_error(self, exc: Exception) -> None:
             if isinstance(exc, _ResponseSent):
                 return
-            if isinstance(exc, (KeyError, TemplateError, ValueError)):
-                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            if isinstance(exc, KeyError):
+                status, code, message = _key_error_response(exc)
+                self._json_error_response(status, code, message)
+            elif isinstance(exc, TemplateError):
+                code = (
+                    "invalid_bot_id"
+                    if str(exc).startswith("bot_id must match")
+                    else "invalid_request"
+                )
+                self._json_error_response(HTTPStatus.BAD_REQUEST, code, str(exc))
+            elif isinstance(exc, ValueError):
+                self._json_error_response(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
             else:
-                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal server error"})
+                self._json_error_response(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "internal server error",
+                )
+
+        def _json_error_response(self, status: HTTPStatus, code: str, message: str) -> None:
+            self._json(
+                status,
+                {"error": {"code": code, "message": message, "status": status.value}},
+            )
 
         def _json(self, status: HTTPStatus, payload: Any) -> None:
             data = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -194,6 +222,16 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
 class _ResponseSent(Exception):
     pass
+
+
+def _key_error_response(exc: KeyError) -> tuple[HTTPStatus, str, str]:
+    detail = exc.args[0] if exc.args else "missing required field"
+    message = str(detail)
+    if message.startswith("unknown bot:"):
+        return HTTPStatus.NOT_FOUND, "unknown_bot", message
+    if message.startswith("unknown template:"):
+        return HTTPStatus.BAD_REQUEST, "unknown_template", message
+    return HTTPStatus.BAD_REQUEST, "invalid_request", f"missing required field: {message}"
 
 
 def template_to_dict(template: HermesTemplate) -> dict[str, Any]:

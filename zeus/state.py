@@ -1,11 +1,34 @@
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
+from collections.abc import Mapping
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
 from zeus.models import BotRecord, BotStatus, RestartPolicy
+
+SCHEMA_VERSION = 1
+AUDIT_SECRET_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)$")
+
+
+def _safe_audit_value(key: str, value: object) -> object:
+    if AUDIT_SECRET_RE.search(key.upper()):
+        return "[redacted]"
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(child_key): _safe_audit_value(str(child_key), child_value)
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_safe_audit_value(key, child_value) for child_value in value]
+    return str(value)
 
 
 class StateStore:
@@ -20,27 +43,56 @@ class StateStore:
 
     def init(self) -> None:
         with closing(self.connect()) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bots (
-                    bot_id TEXT PRIMARY KEY,
-                    template_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL,
-                    profile_path TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    pid INTEGER,
-                    restart_policy TEXT NOT NULL DEFAULT 'manual',
-                    restart_backoff_seconds REAL NOT NULL DEFAULT 5.0,
-                    restart_max_attempts INTEGER NOT NULL DEFAULT 5,
-                    restart_attempts INTEGER NOT NULL DEFAULT 0,
-                    next_restart_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            self._ensure_schema(conn)
+            self._create_bots_table(conn)
+            self._migrate(conn)
             conn.commit()
+
+    def migrate(self) -> None:
+        with closing(self.connect()) as conn:
+            self._migrate(conn)
+            conn.commit()
+
+    def _create_bots_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bots (
+                bot_id TEXT PRIMARY KEY,
+                template_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                profile_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                pid INTEGER,
+                restart_policy TEXT NOT NULL DEFAULT 'manual',
+                restart_backoff_seconds REAL NOT NULL DEFAULT 5.0,
+                restart_max_attempts INTEGER NOT NULL DEFAULT 5,
+                restart_attempts INTEGER NOT NULL DEFAULT 0,
+                next_restart_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            )
+            """
+        )
+        row = conn.execute("SELECT version FROM schema_version ORDER BY rowid LIMIT 1").fetchone()
+        current_version = int(row["version"]) if row else 0
+        if row is None:
+            conn.execute("INSERT INTO schema_version (version) VALUES (0)")
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema version {current_version} is newer than supported "
+                f"version {SCHEMA_VERSION}"
+            )
+        if current_version < 1:
+            self._ensure_schema(conn)
+            conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
@@ -62,6 +114,24 @@ class StateStore:
         for column, statement in migrations.items():
             if column not in columns:
                 conn.execute(statement)
+
+    def audit_log_path(self) -> Path:
+        return self.database_path.parent / "logs" / "audit.jsonl"
+
+    def append_audit_event(self, event: str, **fields: object) -> None:
+        payload: dict[str, object] = {
+            "ts": datetime.now(UTC).isoformat(),
+            "event": event,
+        }
+        for key, value in fields.items():
+            payload[key] = _safe_audit_value(key, value)
+        try:
+            path = self.audit_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        except (OSError, TypeError, ValueError):
+            return
 
     def upsert_bot(self, record: BotRecord) -> None:
         with closing(self.connect()) as conn:

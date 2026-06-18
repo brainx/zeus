@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -20,14 +21,23 @@ class RepoContractTests(unittest.TestCase):
             "docs/FRESH_VPS_TEST.md",
             "docs/SYSTEMD.md",
             "docs/OPERATIONS.md",
+            "docs/RECONCILE.md",
+            "docs/RELEASE.md",
+            "docs/openapi.json",
             "docs/REPO_GENERATION.md",
             "docs/ROADMAP.md",
             "docs/assets/demo.cast",
             "docs/assets/zeus-hero.png",
+            ".github/workflows/release.yml",
             "systemd/zeus-api.service",
+            "systemd/zeus-reconcile.service",
+            "systemd/zeus-reconcile.timer",
             "scripts/repo_check.sh",
             "scripts/fresh_vps_verify.sh",
             "templates/deepseek-coding-bot.toml",
+            "templates/docs-writer-bot.toml",
+            "templates/gateway-operator.toml",
+            "templates/log-triage-bot.toml",
         ]
 
         for path in required:
@@ -72,10 +82,19 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("docs/FRESH_VPS_TEST.md", script)
         self.assertIn("docs/SYSTEMD.md", script)
         self.assertIn("docs/OPERATIONS.md", script)
+        self.assertIn("docs/RECONCILE.md", script)
+        self.assertIn("docs/RELEASE.md", script)
+        self.assertIn("docs/openapi.json", script)
         self.assertIn("docs/REPO_GENERATION.md", script)
+        self.assertIn(".github/workflows/release.yml", script)
         self.assertIn("systemd/zeus-api.service", script)
+        self.assertIn("systemd/zeus-reconcile.service", script)
+        self.assertIn("systemd/zeus-reconcile.timer", script)
         self.assertIn("scripts/fresh_vps_verify.sh", script)
         self.assertIn("templates/deepseek-coding-bot.toml", script)
+        self.assertIn("templates/docs-writer-bot.toml", script)
+        self.assertIn("templates/gateway-operator.toml", script)
+        self.assertIn("templates/log-triage-bot.toml", script)
         self.assertIn("Repository readiness check passed.", script)
 
     def test_readme_has_informative_github_landing_sections(self) -> None:
@@ -90,6 +109,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("docs/assets/demo.cast", readme)
         self.assertIn("docs/SYSTEMD.md", readme)
         self.assertIn("docs/OPERATIONS.md", readme)
+        self.assertIn("docs/RECONCILE.md", readme)
+        self.assertIn("docs/RELEASE.md", readme)
         self.assertIn("docs/ROADMAP.md", readme)
         self.assertIn("actions/workflows/ci.yml/badge.svg", readme)
         self.assertIn("Package Build", readme)
@@ -105,6 +126,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("DEEPSEEK_API_KEY=", env)
         self.assertIn("All non-health endpoints require", api_docs)
         self.assertIn("POST /bots/<bot-id>/restart", api_docs)
+        self.assertIn("docs/openapi.json", api_docs)
 
     def test_deepseek_template_uses_native_provider(self) -> None:
         text = Path("templates/deepseek-coding-bot.toml").read_text(encoding="utf-8")
@@ -169,8 +191,11 @@ class RepoContractTests(unittest.TestCase):
 
     def test_systemd_and_operations_docs_are_actionable(self) -> None:
         service = Path("systemd/zeus-api.service").read_text(encoding="utf-8")
+        reconcile_service = Path("systemd/zeus-reconcile.service").read_text(encoding="utf-8")
+        reconcile_timer = Path("systemd/zeus-reconcile.timer").read_text(encoding="utf-8")
         systemd_docs = Path("docs/SYSTEMD.md").read_text(encoding="utf-8")
         operations = Path("docs/OPERATIONS.md").read_text(encoding="utf-8")
+        reconcile_docs = Path("docs/RECONCILE.md").read_text(encoding="utf-8")
 
         self.assertIn("EnvironmentFile=/etc/zeus/zeus.env", service)
         self.assertIn("ExecStart=/opt/zeus/.venv/bin/python -m zeus.api", service)
@@ -183,6 +208,56 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("Logs", operations)
         self.assertIn("Upgrade", operations)
         self.assertIn("Restart Policy", operations)
+        self.assertIn("ExecStart=/opt/zeus/.venv/bin/zeus bot reconcile", reconcile_service)
+        self.assertIn("ReadWritePaths=/var/lib/zeus", reconcile_service)
+        self.assertIn("OnUnitActiveSec=30s", reconcile_timer)
+        self.assertIn("zeus bot reconcile", reconcile_docs)
+        self.assertIn("zeus-reconcile.timer", reconcile_docs)
+
+    def test_release_workflow_builds_tag_artifacts(self) -> None:
+        release_docs = Path("docs/RELEASE.md").read_text(encoding="utf-8")
+        workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+
+        self.assertIn("sh scripts/test.sh", release_docs)
+        self.assertIn("sh scripts/repo_check.sh", release_docs)
+        self.assertIn("python -m build", release_docs)
+        self.assertIn("twine check dist/*", release_docs)
+        self.assertIn("tags:", workflow)
+        self.assertIn('"v*.*.*"', workflow)
+        self.assertIn('python -m pip install -e ".[dev]"', workflow)
+        self.assertIn("sh scripts/test.sh", workflow)
+        self.assertIn("sh scripts/repo_check.sh", workflow)
+        self.assertIn("python -m build", workflow)
+        self.assertIn("twine check dist/*", workflow)
+        self.assertIn("actions/upload-artifact@v4", workflow)
+
+    def test_openapi_contract_loads_and_documents_required_paths(self) -> None:
+        spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
+        paths = spec["paths"]
+        required_paths = [
+            "/health",
+            "/doctor",
+            "/templates",
+            "/bots",
+            "/bots/{bot_id}/status",
+            "/bots/{bot_id}/logs",
+            "/bots/{bot_id}/start",
+            "/bots/{bot_id}/stop",
+            "/bots/{bot_id}/restart",
+            "/bots/{bot_id}/reconcile",
+            "/bots/reconcile",
+        ]
+
+        for path in required_paths:
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+
+        error_codes = spec["components"]["schemas"]["Error"]["properties"]["error"]["properties"][
+            "code"
+        ]["enum"]
+        self.assertIn("missing_api_key", error_codes)
+        self.assertIn("invalid_api_key", error_codes)
+        self.assertIn("internal_error", error_codes)
 
     def test_brainx_maintainer_is_credited(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")

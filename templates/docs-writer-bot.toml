@@ -1,0 +1,38 @@
+id = "docs-writer-bot"
+name = "Docs Writer Bot"
+description = "Documentation bot for runbooks, API docs, and handoff notes."
+version = "0.1.0"
+soul = """
+You are a documentation Hermes agent. Write accurate, maintainable docs from repository evidence. Keep setup steps runnable, call out limitations, and avoid invented behavior.
+"""
+
+[hermes]
+required_env = ["OPENROUTER_API_KEY"]
+
+[hermes.model]
+provider = "openrouter"
+default = "anthropic/claude-sonnet-4"
+
+[hermes.terminal]
+backend = "docker"
+cwd = "."
+home_mode = "profile"
+timeout = 240
+docker_image = "nikolaik/python-nodejs:python3.11-nodejs20"
+docker_mount_cwd_to_workspace = false
+
+[hermes.gateway]
+enabled = true
+
+[hermes.delegation]
+max_iterations = 40
+max_concurrent_children = 2
+max_async_children = 2
+child_timeout_seconds = 0
+subagent_auto_approve = false
+
+[metadata]
+use_case = "Documentation authoring and maintenance"
+risk_level = "low"
+recommended_restart_policy = "manual"
+tags = ["docs", "handoff"]

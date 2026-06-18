@@ -32,4 +32,7 @@ child_timeout_seconds = 0
 subagent_auto_approve = false
 
 [metadata]
+use_case = "Repository maintenance using the native DeepSeek Hermes provider"
+risk_level = "medium"
+recommended_restart_policy = "manual"
 tags = ["coding", "deepseek"]

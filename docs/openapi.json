@@ -1,0 +1,529 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Zeus Local API",
+    "version": "0.1.1",
+    "description": "Local JSON API for managing Hermes bot profiles and gateway lifecycle."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:4311"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "ZeusApiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-zeus-api-key"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message", "status"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "invalid_request",
+                  "invalid_bot_id",
+                  "unknown_bot",
+                  "unknown_template",
+                  "missing_api_key",
+                  "invalid_api_key",
+                  "internal_error"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "status": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "Bot": {
+        "type": "object",
+        "required": [
+          "bot_id",
+          "template_id",
+          "display_name",
+          "profile_path",
+          "status",
+          "pid",
+          "restart_policy",
+          "restart_backoff_seconds",
+          "restart_max_attempts",
+          "restart_attempts",
+          "next_restart_at",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "bot_id": {
+            "type": "string"
+          },
+          "template_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "profile_path": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["stopped", "starting", "running", "failed", "unknown"]
+          },
+          "pid": {
+            "type": ["integer", "null"]
+          },
+          "restart_policy": {
+            "type": "string",
+            "enum": ["manual", "on-failure"]
+          },
+          "restart_backoff_seconds": {
+            "type": "number"
+          },
+          "restart_max_attempts": {
+            "type": "integer"
+          },
+          "restart_attempts": {
+            "type": "integer"
+          },
+          "next_restart_at": {
+            "type": ["string", "null"],
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "BotCreateRequest": {
+        "type": "object",
+        "required": ["bot_id", "template_id"],
+        "properties": {
+          "bot_id": {
+            "type": "string"
+          },
+          "template_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "restart_policy": {
+            "type": "string",
+            "enum": ["manual", "on-failure"],
+            "default": "manual"
+          },
+          "restart_backoff_seconds": {
+            "type": "number",
+            "default": 5
+          },
+          "restart_max_attempts": {
+            "type": "integer",
+            "default": 5
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BotStatusResponse": {
+        "type": "object",
+        "required": ["bot_id", "status", "pid", "profile_path", "message"],
+        "properties": {
+          "bot_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["stopped", "starting", "running", "failed", "unknown"]
+          },
+          "pid": {
+            "type": ["integer", "null"]
+          },
+          "profile_path": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Template": {
+        "type": "object",
+        "required": ["id", "name", "description", "version", "metadata", "delegation"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "delegation": {
+            "type": "object"
+          }
+        }
+      },
+      "DoctorReport": {
+        "type": "object",
+        "required": ["ok", "checks"],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "ZeusApiKey": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Health check",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "const": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/doctor": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Readiness report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DoctorReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid API key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Template list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Template"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Bot list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Bot"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BotCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created bot record",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Bot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/reconcile": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "All-bot reconcile results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BotStatusResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/status": {
+      "get": {
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bot status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/logs": {
+      "get": {
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bot logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["bot_id", "logs"],
+                  "properties": {
+                    "bot_id": {
+                      "type": "string"
+                    },
+                    "logs": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/start": {
+      "post": {
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Start result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/stop": {
+      "post": {
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stop result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/restart": {
+      "post": {
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restart result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/reconcile": {
+      "post": {
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Single-bot reconcile result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BotStatusResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

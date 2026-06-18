@@ -2,7 +2,26 @@
 
 The Zeus API is a local JSON API. It binds to `127.0.0.1:4311` by default.
 
+The machine-readable OpenAPI contract is maintained in `docs/openapi.json`.
+
 All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`.
+
+## Error Model
+
+Errors use a stable object shape:
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "request body must be a JSON object",
+    "status": 400
+  }
+}
+```
+
+Known error codes are `invalid_request`, `invalid_bot_id`, `unknown_bot`,
+`unknown_template`, `missing_api_key`, `invalid_api_key`, and `internal_error`.
 
 ## Endpoints
 
