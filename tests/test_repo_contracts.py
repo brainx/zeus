@@ -159,9 +159,13 @@ class RepoContractTests(unittest.TestCase):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn('"restart"', cli)
+        self.assertIn('"reconcile"', cli)
         self.assertIn("def restart", supervisor)
+        self.assertIn("def reconcile", supervisor)
         self.assertIn(".restart(bot_id)", api)
+        self.assertIn(".reconcile(", api)
         self.assertIn("zeus bot restart coder", readme)
+        self.assertIn("zeus bot reconcile coder", readme)
 
     def test_systemd_and_operations_docs_are_actionable(self) -> None:
         service = Path("systemd/zeus-api.service").read_text(encoding="utf-8")

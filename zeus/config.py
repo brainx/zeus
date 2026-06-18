@@ -5,20 +5,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from zeus.envfile import parse_env_text
+
 
 def load_dotenv(path: Path = Path(".env")) -> dict[str, str]:
     if not path.exists():
         return {}
-    values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key:
-            values[key] = value.strip().strip('"').strip("'")
-    return values
+    return parse_env_text(path.read_text(encoding="utf-8"))
 
 
 @dataclass(frozen=True)

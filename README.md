@@ -117,6 +117,7 @@ zeus bot doctor coder
 zeus bot start coder
 zeus bot status coder
 zeus bot logs coder
+zeus bot reconcile coder
 zeus bot restart coder
 zeus bot stop coder
 ```
@@ -178,12 +179,15 @@ Useful endpoints:
 - `GET /bots`
 - `POST /bots`
 - `POST /bots/<bot-id>/start`
+- `POST /bots/<bot-id>/reconcile`
 - `POST /bots/<bot-id>/restart`
 - `POST /bots/<bot-id>/stop`
 
 ## Templates
 
 Templates live in `templates/*.toml`. They render Hermes `config.yaml`, `.env`, `SOUL.md`, `mcp.json`, and `cron/jobs.json` files under `.zeus/hermes/profiles/<bot-id>/`.
+Rendered `.env` values are serialized with quoting when needed so whitespace, `#`,
+quotes, and backslashes cannot create extra assignments.
 
 Built-in templates include OpenRouter-backed bots and `deepseek-coding-bot`, which uses Hermes' native DeepSeek provider with `DEEPSEEK_API_KEY`.
 
@@ -213,6 +217,11 @@ The doctor validates Python support, Hermes binary availability, template validi
 ## Process Safety
 
 When Zeus starts a gateway, it writes a PID ownership marker under the bot profile logs directory. `zeus bot stop` sends SIGTERM only when that marker matches the expected bot, PID, and launch command. On Linux, Zeus also compares the live process command line from `/proc/<pid>/cmdline` before trusting the PID, then waits for graceful gateway shutdown so Hermes can interrupt any running background delegations.
+
+Bots default to manual restart policy. Create a bot with `--restart-policy on-failure`
+plus `--restart-backoff-seconds` and `--restart-max-attempts` to let
+`zeus bot reconcile [bot-id]` restart unexpectedly stopped gateways with exponential
+backoff.
 
 The test suite includes a fake Hermes executable that exercises the real Zeus subprocess path: render profile, start gateway, verify `HERMES_HOME`, stop gateway, reap the child process, and confirm logs are captured.
 

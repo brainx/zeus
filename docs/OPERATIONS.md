@@ -44,4 +44,14 @@ Run `zeus doctor --strict` after upgrades on hosts where Hermes is expected to b
 
 The sample systemd unit restarts the Zeus API with `Restart=on-failure` and `RestartSec=5s`. Bot gateway processes are supervised by Zeus itself; use `zeus bot restart <bot-id>` for a controlled stop, ownership check, and clean start.
 
-Automatic bot respawn policies are intentionally not enabled in v0.1.x. Until restart policies land, use systemd for the API process and explicit Zeus lifecycle commands for bot gateways.
+Bots default to a manual restart policy. For bots that should recover from unexpected gateway exit, create them with:
+
+```bash
+zeus bot create coder \
+  --template coding-bot \
+  --restart-policy on-failure \
+  --restart-backoff-seconds 5 \
+  --restart-max-attempts 5
+```
+
+Run `zeus bot reconcile [bot-id]` from an operator shell, cron, or systemd timer to health-check recorded PIDs and restart eligible bots with exponential backoff. Manual `zeus bot stop <bot-id>` resets restart state and does not respawn the bot.

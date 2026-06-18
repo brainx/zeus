@@ -5,6 +5,7 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from zeus.api import make_handler
@@ -13,7 +14,7 @@ from zeus.config import Settings
 from zeus.doctor import run_doctor
 from zeus.hermes_adapter import HermesAdapter
 from zeus.logging_utils import redact_secrets
-from zeus.models import BotRecord, BotStatus
+from zeus.models import BotRecord, BotStatus, RestartPolicy
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
 
@@ -43,6 +44,20 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual(str(Path(tmp) / ".zeus" / "hermes"), env["HERMES_HOME"])
             self.assertEqual("test-key", env["DEEPSEEK_API_KEY"])
             self.assertEqual("enabled", env["CUSTOM_FLAG"])
+
+    def test_adapter_round_trips_quoted_env_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / ".zeus" / "hermes"
+            profile = hermes_root / "profiles" / "coder"
+            profile.mkdir(parents=True)
+            (profile / ".env").write_text(
+                'OPENROUTER_API_KEY="line one\\nline two # not comment"\n',
+                encoding="utf-8",
+            )
+
+            _, env = HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
+
+            self.assertEqual("line one\nline two # not comment", env["OPENROUTER_API_KEY"])
 
     def test_supervisor_stop_waits_for_graceful_gateway_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -287,6 +302,119 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual(BotStatus.failed, status.status)
             self.assertIn("ownership", status.message)
 
+    def test_reconcile_schedules_and_restarts_with_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                    restart_policy=RestartPolicy.on_failure,
+                    restart_backoff_seconds=10.0,
+                    restart_max_attempts=2,
+                )
+            )
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                popen_factory=FakePopen,
+                pid_alive_fn=lambda pid: False,
+            )
+            now = datetime(2026, 1, 1, tzinfo=UTC)
+
+            scheduled = supervisor.reconcile("coder", now=now)[0]
+
+            self.assertEqual(BotStatus.failed, scheduled.status)
+            self.assertIn("restart scheduled", scheduled.message)
+            loaded = store.get_bot("coder")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(1, loaded.restart_attempts)
+            self.assertEqual(now + timedelta(seconds=10), loaded.next_restart_at)
+
+            pending = supervisor.reconcile("coder", now=now + timedelta(seconds=5))[0]
+
+            self.assertEqual(BotStatus.failed, pending.status)
+            self.assertIn("restart pending", pending.message)
+
+            restarted = supervisor.reconcile("coder", now=now + timedelta(seconds=10))[0]
+
+            self.assertEqual(BotStatus.running, restarted.status)
+            self.assertEqual(4321, restarted.pid)
+            self.assertEqual("restarted by reconcile", restarted.message)
+            loaded = store.get_bot("coder")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(1, loaded.restart_attempts)
+            self.assertIsNone(loaded.next_restart_at)
+
+    def test_reconcile_honors_restart_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / ".zeus" / "hermes" / "profiles" / "coder"),
+                    status=BotStatus.failed,
+                    pid=None,
+                    restart_policy=RestartPolicy.on_failure,
+                    restart_max_attempts=2,
+                    restart_attempts=2,
+                )
+            )
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                popen_factory=FakePopen,
+                pid_alive_fn=lambda pid: False,
+            )
+
+            status = supervisor.reconcile("coder")[0]
+
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertIn("restart limit reached", status.message)
+
+    def test_reconcile_does_not_restart_manual_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / ".zeus" / "hermes" / "profiles" / "coder"),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                popen_factory=FakePopen,
+                pid_alive_fn=lambda pid: False,
+            )
+
+            status = supervisor.reconcile("coder")[0]
+
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertIn("restart policy is manual", status.message)
+
     def test_redacts_secret_lines(self) -> None:
         text = "OPENAI_API_KEY=plain-secret-value\nSERVICE_TOKEN=plain-token-value"
         redacted = redact_secrets(text)
@@ -397,6 +525,7 @@ class SupervisorCliApiTests(unittest.TestCase):
                 self.assertEqual(200, response.status)
                 created = json.loads(response.read())
                 self.assertEqual("coder", created["bot_id"])
+                self.assertEqual("manual", created["restart_policy"])
 
                 conn.request("GET", "/bots/coder/logs")
                 response = conn.getresponse()
@@ -418,6 +547,12 @@ class SupervisorCliApiTests(unittest.TestCase):
                 response = conn.getresponse()
                 self.assertEqual(400, response.status)
                 response.read()
+
+                conn.request("POST", "/bots/reconcile", headers={"x-zeus-api-key": "secret"})
+                response = conn.getresponse()
+                self.assertEqual(200, response.status)
+                reconciled = json.loads(response.read())
+                self.assertEqual("coder", reconciled[0]["bot_id"])
             finally:
                 server.shutdown()
                 server.server_close()

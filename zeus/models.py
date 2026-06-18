@@ -26,6 +26,11 @@ class BotStatus(StrEnum):
     unknown = "unknown"
 
 
+class RestartPolicy(StrEnum):
+    manual = "manual"
+    on_failure = "on-failure"
+
+
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise TemplateError(f"{name} must be a table")
@@ -326,10 +331,23 @@ class BotCreateRequest:
     template_id: str
     display_name: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    restart_policy: RestartPolicy = RestartPolicy.manual
+    restart_backoff_seconds: float = 5.0
+    restart_max_attempts: int = 5
 
     def __post_init__(self) -> None:
         validate_id(self.bot_id, "bot_id")
         validate_id(self.template_id, "template_id")
+        try:
+            policy = RestartPolicy(self.restart_policy)
+        except ValueError as exc:
+            raise TemplateError("restart_policy must be manual or on-failure") from exc
+        if self.restart_backoff_seconds < 0 or self.restart_backoff_seconds > 3600:
+            raise TemplateError("restart_backoff_seconds must be between 0 and 3600")
+        if self.restart_max_attempts < 0 or self.restart_max_attempts > 100:
+            raise TemplateError("restart_max_attempts must be between 0 and 100")
+        object.__setattr__(self, "restart_policy", policy)
+        object.__setattr__(self, "restart_backoff_seconds", float(self.restart_backoff_seconds))
 
 
 @dataclass(frozen=True)
@@ -340,6 +358,11 @@ class BotRecord:
     profile_path: str
     status: BotStatus = BotStatus.stopped
     pid: int | None = None
+    restart_policy: RestartPolicy = RestartPolicy.manual
+    restart_backoff_seconds: float = 5.0
+    restart_max_attempts: int = 5
+    restart_attempts: int = 0
+    next_restart_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -351,6 +374,11 @@ class BotRecord:
             "profile_path": self.profile_path,
             "status": self.status.value,
             "pid": self.pid,
+            "restart_policy": self.restart_policy.value,
+            "restart_backoff_seconds": self.restart_backoff_seconds,
+            "restart_max_attempts": self.restart_max_attempts,
+            "restart_attempts": self.restart_attempts,
+            "next_restart_at": self.next_restart_at.isoformat() if self.next_restart_at else None,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }

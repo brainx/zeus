@@ -6,11 +6,10 @@
 - Template validation
 - Real Hermes verification
 - API hardening
+- Restart policies
 
 ## v0.2.x
 
-- Restart policies
-- systemd integration
 - Export/import
 - TUI dashboard
 

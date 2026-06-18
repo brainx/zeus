@@ -7,12 +7,13 @@ import signal
 import subprocess  # nosec B404
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
 from zeus.hermes_adapter import HermesAdapter
 from zeus.logging_utils import tail_file
-from zeus.models import BotRecord, BotStatus, BotStatusResponse
+from zeus.models import BotRecord, BotStatus, BotStatusResponse, RestartPolicy
 from zeus.state import StateStore
 
 
@@ -37,6 +38,7 @@ class Supervisor:
         pid_alive_fn: PidAliveFn | None = None,
         cmdline_reader: CmdlineReader | None = None,
         stop_grace_seconds: float = 15.0,
+        restart_backoff_cap_seconds: float = 3600.0,
     ) -> None:
         self.store = store
         self.adapter = HermesAdapter(hermes_bin=hermes_bin, hermes_root=hermes_root)
@@ -45,6 +47,7 @@ class Supervisor:
         self.pid_alive_fn = pid_alive_fn
         self.cmdline_reader = cmdline_reader or _read_linux_cmdline
         self.stop_grace_seconds = stop_grace_seconds
+        self.restart_backoff_cap_seconds = restart_backoff_cap_seconds
         self._processes: dict[str, PopenLike] = {}
 
     def start(self, bot_id: str) -> BotStatusResponse:
@@ -59,6 +62,7 @@ class Supervisor:
                     profile_path=record.profile_path,
                     message="recorded gateway PID is alive but ownership could not be verified",
                 )
+            self.store.update_status(bot_id, BotStatus.running, pid=record.pid, reset_restart=True)
             return BotStatusResponse(
                 bot_id=bot_id,
                 status=BotStatus.running,
@@ -67,6 +71,12 @@ class Supervisor:
                 message="already running",
             )
 
+        return self._start_record(record, reset_restart=True, message="started")
+
+    def _start_record(
+        self, record: BotRecord, *, reset_restart: bool, message: str
+    ) -> BotStatusResponse:
+        bot_id = record.bot_id
         argv, env = self.adapter.command(bot_id, "gateway", "run")
         log_path = self.log_path(record.profile_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,20 +84,22 @@ class Supervisor:
             process = self.popen_factory(argv, env=env, stdout=log_file, stderr=log_file)
         self._processes[bot_id] = process
         self._write_pid_marker(record.profile_path, process.pid, argv)
-        self.store.update_status(bot_id, BotStatus.running, pid=process.pid)
+        self.store.update_status(
+            bot_id, BotStatus.running, pid=process.pid, reset_restart=reset_restart
+        )
         return BotStatusResponse(
             bot_id=bot_id,
             status=BotStatus.running,
             pid=process.pid,
             profile_path=record.profile_path,
-            message="started",
+            message=message,
         )
 
     def stop(self, bot_id: str) -> BotStatusResponse:
         record = self._require_bot(bot_id)
         if not record.pid or not self._pid_alive(record.pid):
             self._remove_pid_marker(record.profile_path)
-            self.store.update_status(bot_id, BotStatus.stopped, pid=None)
+            self.store.update_status(bot_id, BotStatus.stopped, pid=None, reset_restart=True)
             return BotStatusResponse(
                 bot_id=bot_id,
                 status=BotStatus.stopped,
@@ -121,7 +133,7 @@ class Supervisor:
                 ),
             )
 
-        self.store.update_status(bot_id, BotStatus.stopped, pid=None)
+        self.store.update_status(bot_id, BotStatus.stopped, pid=None, reset_restart=True)
         self._processes.pop(bot_id, None)
         self._remove_pid_marker(record.profile_path)
         return BotStatusResponse(
@@ -154,6 +166,115 @@ class Supervisor:
             )
         return started
 
+    def reconcile(
+        self, bot_id: str | None = None, *, now: datetime | None = None
+    ) -> list[BotStatusResponse]:
+        current_time = now or datetime.now(UTC)
+        records = [self._require_bot(bot_id)] if bot_id else self.store.list_bots()
+        return [self._reconcile_record(record, current_time) for record in records]
+
+    def _reconcile_record(self, record: BotRecord, now: datetime) -> BotStatusResponse:
+        if record.pid and self._pid_alive(record.pid):
+            if not self._pid_owned(record.profile_path, record.pid, record.bot_id):
+                self.store.update_status(record.bot_id, BotStatus.failed, pid=record.pid)
+                return BotStatusResponse(
+                    bot_id=record.bot_id,
+                    status=BotStatus.failed,
+                    pid=record.pid,
+                    profile_path=record.profile_path,
+                    message="recorded gateway PID is alive but ownership could not be verified",
+                )
+            self.store.update_status(
+                record.bot_id, BotStatus.running, pid=record.pid, reset_restart=True
+            )
+            return BotStatusResponse(
+                bot_id=record.bot_id,
+                status=BotStatus.running,
+                pid=record.pid,
+                profile_path=record.profile_path,
+                message="running",
+            )
+
+        if record.pid:
+            self._remove_pid_marker(record.profile_path)
+
+        if record.status == BotStatus.stopped:
+            self.store.update_status(record.bot_id, BotStatus.stopped, pid=None)
+            return BotStatusResponse(
+                bot_id=record.bot_id,
+                status=BotStatus.stopped,
+                pid=None,
+                profile_path=record.profile_path,
+                message="not running",
+            )
+
+        if record.restart_policy != RestartPolicy.on_failure:
+            self.store.update_status(record.bot_id, BotStatus.failed, pid=None)
+            return BotStatusResponse(
+                bot_id=record.bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message="gateway is not running and restart policy is manual",
+            )
+
+        if record.restart_attempts >= record.restart_max_attempts:
+            self.store.update_restart_state(
+                record.bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                restart_attempts=record.restart_attempts,
+                next_restart_at=None,
+            )
+            return BotStatusResponse(
+                bot_id=record.bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message="restart limit reached",
+            )
+
+        if record.next_restart_at is None:
+            delay = self._restart_delay(record)
+            next_restart_at = now + timedelta(seconds=delay)
+            self.store.update_restart_state(
+                record.bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                restart_attempts=record.restart_attempts + 1,
+                next_restart_at=next_restart_at,
+            )
+            return BotStatusResponse(
+                bot_id=record.bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message=f"restart scheduled in {delay:g}s",
+            )
+
+        if record.next_restart_at > now:
+            return BotStatusResponse(
+                bot_id=record.bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message=f"restart pending until {record.next_restart_at.isoformat()}",
+            )
+
+        self.store.update_restart_state(
+            record.bot_id,
+            status=BotStatus.failed,
+            pid=None,
+            restart_attempts=record.restart_attempts,
+            next_restart_at=None,
+        )
+        refreshed = self._require_bot(record.bot_id)
+        return self._start_record(refreshed, reset_restart=False, message="restarted by reconcile")
+
+    def _restart_delay(self, record: BotRecord) -> float:
+        delay = record.restart_backoff_seconds * (2**record.restart_attempts)
+        return float(min(delay, self.restart_backoff_cap_seconds))
+
     def status(self, bot_id: str) -> BotStatusResponse:
         record = self._require_bot(bot_id)
         alive = bool(record.pid and self._pid_alive(record.pid))
@@ -169,6 +290,8 @@ class Supervisor:
         status = BotStatus.running if alive else BotStatus.stopped
         if status != record.status:
             self.store.update_status(bot_id, status, pid=record.pid if alive else None)
+        elif status == BotStatus.running:
+            self.store.update_status(bot_id, status, pid=record.pid, reset_restart=True)
         return BotStatusResponse(
             bot_id=bot_id,
             status=status,

@@ -37,6 +37,9 @@ Request:
   "bot_id": "coder",
   "template_id": "coding-bot",
   "display_name": "Coder",
+  "restart_policy": "on-failure",
+  "restart_backoff_seconds": 5,
+  "restart_max_attempts": 5,
   "env": {
     "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
   }
@@ -58,6 +61,14 @@ Starts the Hermes gateway process for the bot.
 ### `POST /bots/<bot-id>/restart`
 
 Stops the Hermes gateway process if it is running, waits for clean shutdown, and starts it again.
+
+### `POST /bots/<bot-id>/reconcile`
+
+Checks the recorded gateway PID. If a bot with `restart_policy` set to `on-failure` is no longer running, Zeus schedules or performs a restart using exponential backoff.
+
+### `POST /bots/reconcile`
+
+Runs reconcile across all registered bots.
 
 ### `POST /bots/<bot-id>/stop`
 
