@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from zeus.config import Settings
 from zeus.doctor import run_doctor
-from zeus.models import BotCreateRequest, HermesTemplate, TemplateError, validate_id
+from zeus.models import BotCreateRequest, HermesTemplate, RestartPolicy, TemplateError, validate_id
 from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
@@ -30,7 +30,9 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 path = urlparse(self.path).path
                 if path == "/health":
                     self._json(HTTPStatus.OK, {"status": "ok"})
-                elif path == "/doctor":
+                    return
+                self._require_key(read=True)
+                if path == "/doctor":
                     self._json(HTTPStatus.OK, run_doctor(settings).to_dict())
                 elif path == "/templates":
                     self._json(HTTPStatus.OK, [template_to_dict(t) for t in TemplateStore().list()])
@@ -55,7 +57,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             try:
-                self._require_key()
+                self._require_key(read=False)
                 path = urlparse(self.path).path
                 if path == "/bots":
                     body = self._read_json()
@@ -64,11 +66,21 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                         template_id=body["template_id"],
                         display_name=body.get("display_name"),
                         env=self._env_from_body(body),
+                        restart_policy=RestartPolicy(body.get("restart_policy", "manual")),
+                        restart_backoff_seconds=self._float_from_body(
+                            body, "restart_backoff_seconds", 5.0
+                        ),
+                        restart_max_attempts=self._int_from_body(body, "restart_max_attempts", 5),
                     )
                     template = TemplateStore().get(request.template_id)
                     record = ProfileRenderer(settings.hermes_root).render(request, template)
                     store.upsert_bot(record)
                     self._json(HTTPStatus.OK, record.to_dict())
+                elif path == "/bots/reconcile":
+                    results = Supervisor(
+                        store, settings.hermes_bin, settings.hermes_root
+                    ).reconcile()
+                    self._json(HTTPStatus.OK, [result.to_dict() for result in results])
                 elif path.startswith("/bots/") and path.endswith("/start"):
                     bot_id = self._bot_id_from_path(path, "start")
                     self._json(
@@ -93,6 +105,12 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                         .restart(bot_id)
                         .to_dict(),
                     )
+                elif path.startswith("/bots/") and path.endswith("/reconcile"):
+                    bot_id = self._bot_id_from_path(path, "reconcile")
+                    results = Supervisor(
+                        store, settings.hermes_bin, settings.hermes_root
+                    ).reconcile(bot_id)
+                    self._json(HTTPStatus.OK, [result.to_dict() for result in results])
                 else:
                     self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             except Exception as exc:
@@ -122,17 +140,31 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 result[key] = value
             return result
 
+        def _float_from_body(self, body: dict[str, Any], name: str, default: float) -> float:
+            value = body.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a number")
+            return float(value)
+
+        def _int_from_body(self, body: dict[str, Any], name: str, default: int) -> int:
+            value = body.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            return value
+
         def _bot_id_from_path(self, path: str, action: str) -> str:
             parts = path.strip("/").split("/")
             if len(parts) != 3 or parts[0] != "bots" or parts[2] != action:
                 raise ValueError("invalid bot route")
             return validate_id(parts[1], "bot_id")
 
-        def _require_key(self) -> None:
+        def _require_key(self, *, read: bool) -> None:
+            if read and settings.allow_unauth_reads:
+                return
             if not settings.api_key:
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"error": "ZEUS_API_KEY is required for mutating endpoints"},
+                    {"error": "ZEUS_API_KEY is required for non-health endpoints"},
                 )
                 raise _ResponseSent
             if self.headers.get("x-zeus-api-key") != settings.api_key:

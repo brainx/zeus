@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from zeus.hermes_adapter import HermesAdapter
 from zeus.models import BotCreateRequest, BotStatus
 from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
@@ -29,7 +30,7 @@ class RendererStateTests(unittest.TestCase):
             self.assertTrue((profile / "cron" / "jobs.json").exists())
             self.assertIn("max_async_children: 3", (profile / "config.yaml").read_text())
             self.assertEqual(
-                "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}\n",
+                'OPENROUTER_API_KEY="${OPENROUTER_API_KEY}"\n',
                 (profile / ".env").read_text(encoding="utf-8"),
             )
             self.assertTrue(record.profile_path.endswith(".zeus/hermes/profiles/coder"))
@@ -72,9 +73,33 @@ class RendererStateTests(unittest.TestCase):
             self.assertNotIn("base_url:", config)
             self.assertNotIn("api_mode:", config)
             self.assertEqual(
-                "DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}\n",
+                'DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY}"\n',
                 (profile / ".env").read_text(encoding="utf-8"),
             )
+
+    def test_renderer_quotes_env_values_without_line_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            template = TemplateStore().get("coding-bot")
+            value = "good\nEVIL=value # still value"
+
+            ProfileRenderer(hermes_root).render(
+                BotCreateRequest(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    env={"OPENROUTER_API_KEY": value},
+                ),
+                template,
+            )
+
+            env_path = hermes_root / "profiles" / "coder" / ".env"
+            env_text = env_path.read_text(encoding="utf-8")
+            self.assertEqual(1, len(env_text.splitlines()))
+            self.assertNotIn("\nEVIL=", env_text)
+
+            _, env = HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
+            self.assertEqual(value, env["OPENROUTER_API_KEY"])
 
 
 if __name__ == "__main__":

@@ -5,20 +5,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from zeus.envfile import parse_env_text
+
 
 def load_dotenv(path: Path = Path(".env")) -> dict[str, str]:
     if not path.exists():
         return {}
-    values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key:
-            values[key] = value.strip().strip('"').strip("'")
-    return values
+    return parse_env_text(path.read_text(encoding="utf-8"))
 
 
 @dataclass(frozen=True)
@@ -30,6 +23,7 @@ class Settings:
     host: str
     port: int
     api_key: str | None
+    allow_unauth_reads: bool
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -44,6 +38,7 @@ class Settings:
             host=merged.get("ZEUS_HOST", "127.0.0.1"),
             port=int(merged.get("ZEUS_PORT", "4311")),
             api_key=merged.get("ZEUS_API_KEY") or None,
+            allow_unauth_reads=merged.get("ZEUS_ALLOW_UNAUTH_READS") == "1",
         )
 
     def ensure_dirs(self) -> None:

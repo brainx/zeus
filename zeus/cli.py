@@ -7,7 +7,7 @@ import sys
 from zeus.api import serve
 from zeus.config import Settings
 from zeus.doctor import report_to_json, report_to_text, run_doctor
-from zeus.models import BotCreateRequest
+from zeus.models import BotCreateRequest, RestartPolicy
 from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
@@ -40,8 +40,13 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--env", action="append", default=[], help="NAME=VALUE for rendered profile .env"
     )
+    create.add_argument("--restart-policy", choices=["manual", "on-failure"], default="manual")
+    create.add_argument("--restart-backoff-seconds", type=float, default=5.0)
+    create.add_argument("--restart-max-attempts", type=int, default=5)
 
     bot_sub.add_parser("list")
+    reconcile = bot_sub.add_parser("reconcile")
+    reconcile.add_argument("bot_id", nargs="?")
     for action in ["start", "stop", "restart", "status", "logs", "doctor"]:
         command = bot_sub.add_parser(action)
         command.add_argument("bot_id")
@@ -99,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
                 template_id=args.template_id,
                 display_name=args.display_name,
                 env=_parse_env(args.env),
+                restart_policy=RestartPolicy(args.restart_policy),
+                restart_backoff_seconds=args.restart_backoff_seconds,
+                restart_max_attempts=args.restart_max_attempts,
             ),
             template,
         )
@@ -114,6 +122,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.resource == "bot" and args.action == "restart":
         print(json.dumps(supervisor.restart(args.bot_id).to_dict(), sort_keys=True))
+        return 0
+    if args.resource == "bot" and args.action == "reconcile":
+        results = supervisor.reconcile(args.bot_id)
+        print(json.dumps([result.to_dict() for result in results], sort_keys=True))
         return 0
     if args.resource == "bot" and args.action == "status":
         print(json.dumps(supervisor.status(args.bot_id).to_dict(), sort_keys=True))

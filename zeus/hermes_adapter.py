@@ -1,35 +1,17 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess  # nosec B404
 from pathlib import Path
 
+from zeus.envfile import parse_env_text
 from zeus.models import ID_RE
-
-ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 
 
 def _load_profile_env(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
-
-    values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        key, separator, value = line.partition("=")
-        key = key.strip()
-        if separator != "=" or not ENV_KEY_RE.match(key):
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        values[key] = value
-    return values
+    return parse_env_text(path.read_text(encoding="utf-8"))
 
 
 class HermesAdapter:

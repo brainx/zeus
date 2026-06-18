@@ -101,8 +101,9 @@ class RepoContractTests(unittest.TestCase):
         api_docs = Path("docs/API.md").read_text(encoding="utf-8")
 
         self.assertIn("ZEUS_API_KEY=", env)
+        self.assertIn("ZEUS_ALLOW_UNAUTH_READS=0", env)
         self.assertIn("DEEPSEEK_API_KEY=", env)
-        self.assertIn("Mutating endpoints always require", api_docs)
+        self.assertIn("All non-health endpoints require", api_docs)
         self.assertIn("POST /bots/<bot-id>/restart", api_docs)
 
     def test_deepseek_template_uses_native_provider(self) -> None:
@@ -158,9 +159,13 @@ class RepoContractTests(unittest.TestCase):
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn('"restart"', cli)
+        self.assertIn('"reconcile"', cli)
         self.assertIn("def restart", supervisor)
+        self.assertIn("def reconcile", supervisor)
         self.assertIn(".restart(bot_id)", api)
+        self.assertIn(".reconcile(", api)
         self.assertIn("zeus bot restart coder", readme)
+        self.assertIn("zeus bot reconcile coder", readme)
 
     def test_systemd_and_operations_docs_are_actionable(self) -> None:
         service = Path("systemd/zeus-api.service").read_text(encoding="utf-8")

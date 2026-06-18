@@ -58,6 +58,8 @@ subagent_auto_approve = false
 - `logs/`
 
 Rendered `.env` files are runtime artifacts and must not be committed.
+Zeus quotes rendered values when needed so special characters remain part of the value
+instead of becoming new assignments or comments.
 
 ## DeepSeek
 

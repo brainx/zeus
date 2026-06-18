@@ -148,12 +148,18 @@ def _check_api_bind(settings: Settings) -> DoctorCheck:
 
 
 def _check_api_auth(settings: Settings) -> DoctorCheck:
-    if settings.api_key:
-        return DoctorCheck("api_auth", "pass", "Mutating API endpoints require x-zeus-api-key")
+    if settings.api_key and not settings.allow_unauth_reads:
+        return DoctorCheck("api_auth", "pass", "Non-health API endpoints require x-zeus-api-key")
+    if settings.allow_unauth_reads:
+        return DoctorCheck(
+            "api_auth",
+            "warn",
+            "ZEUS_ALLOW_UNAUTH_READS=1 permits unauthenticated read endpoints for local dev",
+        )
     return DoctorCheck(
         "api_auth",
         "warn",
-        "ZEUS_API_KEY is not configured; mutating API endpoints will reject requests",
+        "ZEUS_API_KEY is not configured; non-health API endpoints will reject requests",
     )
 
 

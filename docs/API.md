@@ -2,7 +2,7 @@
 
 The Zeus API is a local JSON API. It binds to `127.0.0.1:4311` by default.
 
-Mutating endpoints always require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, mutating endpoints reject requests.
+All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`.
 
 ## Endpoints
 
@@ -37,6 +37,9 @@ Request:
   "bot_id": "coder",
   "template_id": "coding-bot",
   "display_name": "Coder",
+  "restart_policy": "on-failure",
+  "restart_backoff_seconds": 5,
+  "restart_max_attempts": 5,
   "env": {
     "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
   }
@@ -58,6 +61,14 @@ Starts the Hermes gateway process for the bot.
 ### `POST /bots/<bot-id>/restart`
 
 Stops the Hermes gateway process if it is running, waits for clean shutdown, and starts it again.
+
+### `POST /bots/<bot-id>/reconcile`
+
+Checks the recorded gateway PID. If a bot with `restart_policy` set to `on-failure` is no longer running, Zeus schedules or performs a restart using exponential backoff.
+
+### `POST /bots/reconcile`
+
+Runs reconcile across all registered bots.
 
 ### `POST /bots/<bot-id>/stop`
 
