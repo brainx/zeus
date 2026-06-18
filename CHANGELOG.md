@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+- Required API keys for all non-health local API endpoints.
+- Added `ZEUS_ALLOW_UNAUTH_READS=1` for local unauthenticated GET endpoints.
+- Added robust quoted `.env` serialization and parsing for rendered profiles.
+- Added Linux live command-line checks to PID ownership verification.
+- Added bot restart policy state, exponential backoff, and `zeus bot reconcile`.
+- Added API reconcile endpoints and updated operator documentation.
+
 ## 0.1.0
 
 - Added stdlib-only Zeus MVP.

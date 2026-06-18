@@ -31,7 +31,7 @@ Profile logs are also stored under `$ZEUS_STATE_DIR/hermes/profiles/<bot-id>/log
 ```bash
 cd /opt/zeus
 sudo -u zeus git fetch --tags origin
-sudo -u zeus git checkout v0.1.0
+sudo -u zeus git checkout v0.1.1
 sudo -u zeus ./.venv/bin/python -m pip install -e .
 sudo -u zeus env PATH="/opt/zeus/.venv/bin:$PATH" sh scripts/test.sh
 sudo -u zeus env PATH="/opt/zeus/.venv/bin:$PATH" sh scripts/repo_check.sh
