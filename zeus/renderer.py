@@ -48,6 +48,7 @@ class ProfileRenderer:
         self.hermes_root = Path(hermes_root)
 
     def render(self, request: BotCreateRequest, template: HermesTemplate) -> BotRecord:
+        self._validate_env(template, request.env)
         profile = self.hermes_root / "profiles" / request.bot_id
         profile.mkdir(parents=True, exist_ok=True)
         (profile / "cron").mkdir(exist_ok=True)
@@ -89,3 +90,13 @@ class ProfileRenderer:
             else:
                 lines.append(f"# {name}=")
         return "\n".join(lines) + ("\n" if lines else "")
+
+    def _validate_env(self, template: HermesTemplate, provided: dict[str, str]) -> None:
+        for name in template.hermes.required_env:
+            if provided.get(name):
+                _validate_env_value(name, provided[name])
+
+
+def _validate_env_value(name: str, value: str) -> None:
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"env value for {name} contains newline or control characters")

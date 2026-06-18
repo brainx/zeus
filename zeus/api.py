@@ -30,7 +30,9 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 path = urlparse(self.path).path
                 if path == "/health":
                     self._json(HTTPStatus.OK, {"status": "ok"})
-                elif path == "/doctor":
+                    return
+                self._require_key(read=True)
+                if path == "/doctor":
                     self._json(HTTPStatus.OK, run_doctor(settings).to_dict())
                 elif path == "/templates":
                     self._json(HTTPStatus.OK, [template_to_dict(t) for t in TemplateStore().list()])
@@ -55,7 +57,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:
             try:
-                self._require_key()
+                self._require_key(read=False)
                 path = urlparse(self.path).path
                 if path == "/bots":
                     body = self._read_json()
@@ -128,11 +130,13 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 raise ValueError("invalid bot route")
             return validate_id(parts[1], "bot_id")
 
-        def _require_key(self) -> None:
+        def _require_key(self, *, read: bool) -> None:
+            if read and settings.allow_unauth_reads:
+                return
             if not settings.api_key:
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"error": "ZEUS_API_KEY is required for mutating endpoints"},
+                    {"error": "ZEUS_API_KEY is required for non-health endpoints"},
                 )
                 raise _ResponseSent
             if self.headers.get("x-zeus-api-key") != settings.api_key:

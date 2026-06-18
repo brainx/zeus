@@ -164,8 +164,11 @@ See [Fresh VPS test](docs/FRESH_VPS_TEST.md) for gateway and async-delegation pr
 ZEUS_API_KEY=change-me sh scripts/start.sh
 ```
 
-The API binds to `127.0.0.1:4311` by default. Mutating endpoints require `x-zeus-api-key`.
-If `ZEUS_API_KEY` is not configured, mutating endpoints reject requests instead of running anonymously.
+The API binds to `127.0.0.1:4311` by default. Every endpoint except `GET /health`
+requires `x-zeus-api-key`. If `ZEUS_API_KEY` is not configured, non-health endpoints
+reject requests instead of running anonymously. For local-only development, set
+`ZEUS_ALLOW_UNAUTH_READS=1` to allow unauthenticated `GET` endpoints while keeping
+mutations locked behind `ZEUS_API_KEY`.
 
 Useful endpoints:
 
@@ -209,7 +212,7 @@ The doctor validates Python support, Hermes binary availability, template validi
 
 ## Process Safety
 
-When Zeus starts a gateway, it writes a PID ownership marker under the bot profile logs directory. `zeus bot stop` sends SIGTERM only when that marker matches the bot and PID, then waits for graceful gateway shutdown so Hermes can interrupt any running background delegations.
+When Zeus starts a gateway, it writes a PID ownership marker under the bot profile logs directory. `zeus bot stop` sends SIGTERM only when that marker matches the expected bot, PID, and launch command. On Linux, Zeus also compares the live process command line from `/proc/<pid>/cmdline` before trusting the PID, then waits for graceful gateway shutdown so Hermes can interrupt any running background delegations.
 
 The test suite includes a fake Hermes executable that exercises the real Zeus subprocess path: render profile, start gateway, verify `HERMES_HOME`, stop gateway, reap the child process, and confirm logs are captured.
 

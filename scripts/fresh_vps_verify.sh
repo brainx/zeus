@@ -156,7 +156,7 @@ for _ in $(seq 1 40); do
 done
 
 run curl -fsS "http://127.0.0.1:$api_port/health"
-run curl -fsS "http://127.0.0.1:$api_port/doctor"
+run curl -fsS -H "x-zeus-api-key: $api_key" "http://127.0.0.1:$api_port/doctor"
 run curl -fsS \
   -H "x-zeus-api-key: $api_key" \
   -H "content-type: application/json" \

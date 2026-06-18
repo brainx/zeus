@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import signal
 import subprocess  # nosec B404
 import time
@@ -22,6 +23,7 @@ class PopenLike(Protocol):
 PopenFactory = Callable[..., PopenLike]
 KillFn = Callable[[int, signal.Signals], None]
 PidAliveFn = Callable[[int], bool]
+CmdlineReader = Callable[[int], list[str] | None]
 
 
 class Supervisor:
@@ -33,6 +35,7 @@ class Supervisor:
         popen_factory: PopenFactory = subprocess.Popen,
         kill_fn: KillFn = os.kill,
         pid_alive_fn: PidAliveFn | None = None,
+        cmdline_reader: CmdlineReader | None = None,
         stop_grace_seconds: float = 15.0,
     ) -> None:
         self.store = store
@@ -40,6 +43,7 @@ class Supervisor:
         self.popen_factory = popen_factory
         self.kill_fn = kill_fn
         self.pid_alive_fn = pid_alive_fn
+        self.cmdline_reader = cmdline_reader or _read_linux_cmdline
         self.stop_grace_seconds = stop_grace_seconds
         self._processes: dict[str, PopenLike] = {}
 
@@ -220,10 +224,22 @@ class Supervisor:
             return False
         if payload.get("pid") != pid:
             return False
-        argv = payload.get("argv")
-        if not isinstance(argv, list):
+        argv_value = payload.get("argv")
+        if not isinstance(argv_value, list) or not all(
+            isinstance(part, str) for part in argv_value
+        ):
             return False
-        return "-p" in argv and bot_id in argv
+        argv = list(argv_value)
+        expected_argv = self._expected_gateway_argv(bot_id)
+        if argv != expected_argv:
+            return False
+        live_argv = self.cmdline_reader(pid)
+        if live_argv is None:
+            return True
+        return _cmdline_matches_expected(live_argv, expected_argv)
+
+    def _expected_gateway_argv(self, bot_id: str) -> list[str]:
+        return [self.adapter.hermes_bin, "-p", bot_id, "gateway", "run"]
 
     def _wait_for_exit(self, bot_id: str, pid: int) -> bool:
         process = self._processes.get(bot_id)
@@ -240,3 +256,21 @@ class Supervisor:
         while self._pid_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.1)
         return not self._pid_alive(pid)
+
+
+def _read_linux_cmdline(pid: int) -> list[str] | None:
+    if platform.system() != "Linux":
+        return None
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+    return [part.decode("utf-8", errors="surrogateescape") for part in raw.split(b"\0") if part]
+
+
+def _cmdline_matches_expected(live_argv: list[str], expected_argv: list[str]) -> bool:
+    if live_argv == expected_argv:
+        return True
+    return len(live_argv) == len(expected_argv) + 1 and live_argv[1:] == expected_argv

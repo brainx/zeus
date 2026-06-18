@@ -67,6 +67,7 @@ class SupervisorCliApiTests(unittest.TestCase):
                 root / ".zeus" / "hermes",
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: next(alive_checks, False),
+                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
                 stop_grace_seconds=0.01,
             )
             supervisor._write_pid_marker(
@@ -104,6 +105,7 @@ class SupervisorCliApiTests(unittest.TestCase):
                 popen_factory=FakePopen,
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: next(alive_checks, False),
+                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
                 stop_grace_seconds=0.01,
             )
             supervisor._write_pid_marker(
@@ -174,6 +176,82 @@ class SupervisorCliApiTests(unittest.TestCase):
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: True,
                 stop_grace_seconds=0.01,
+            )
+
+            status = supervisor.stop("coder")
+
+            self.assertEqual([], sent)
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertIn("ownership", status.message)
+
+    def test_supervisor_refuses_pid_marker_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
+                stop_grace_seconds=0.01,
+            )
+            supervisor._write_pid_marker(
+                str(profile_path),
+                9999,
+                ["hermes", "-p", "coder", "gateway", "run"],
+            )
+
+            status = supervisor.stop("coder")
+
+            self.assertEqual([], sent)
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertIn("ownership", status.message)
+
+    def test_supervisor_refuses_live_command_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: ["sleep", "60"],
+                stop_grace_seconds=0.01,
+            )
+            supervisor._write_pid_marker(
+                str(profile_path),
+                4321,
+                ["hermes", "-p", "coder", "gateway", "run"],
             )
 
             status = supervisor.stop("coder")
@@ -281,6 +359,11 @@ class SupervisorCliApiTests(unittest.TestCase):
                 self.assertEqual(200, response.status)
                 self.assertEqual({"status": "ok"}, json.loads(response.read()))
 
+                conn.request("GET", "/bots")
+                response = conn.getresponse()
+                self.assertEqual(401, response.status)
+                response.read()
+
                 conn.request(
                     "POST", "/bots", body=b"{}", headers={"content-type": "application/json"}
                 )
@@ -315,13 +398,23 @@ class SupervisorCliApiTests(unittest.TestCase):
                 created = json.loads(response.read())
                 self.assertEqual("coder", created["bot_id"])
 
+                conn.request("GET", "/bots/coder/logs")
+                response = conn.getresponse()
+                self.assertEqual(401, response.status)
+                response.read()
+
                 conn.request("GET", "/doctor")
+                response = conn.getresponse()
+                self.assertEqual(401, response.status)
+                response.read()
+
+                conn.request("GET", "/doctor", headers={"x-zeus-api-key": "secret"})
                 response = conn.getresponse()
                 self.assertEqual(200, response.status)
                 doctor = json.loads(response.read())
                 self.assertIn("checks", doctor)
 
-                conn.request("GET", "/bots/Bad/status")
+                conn.request("GET", "/bots/Bad/status", headers={"x-zeus-api-key": "secret"})
                 response = conn.getresponse()
                 self.assertEqual(400, response.status)
                 response.read()
@@ -329,7 +422,7 @@ class SupervisorCliApiTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-    def test_api_mutations_require_configured_api_key(self) -> None:
+    def test_api_non_health_endpoints_require_configured_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = Settings.from_env(
@@ -347,6 +440,17 @@ class SupervisorCliApiTests(unittest.TestCase):
             thread.start()
             try:
                 conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                conn.request("GET", "/health")
+                response = conn.getresponse()
+                self.assertEqual(200, response.status)
+                response.read()
+
+                conn.request("GET", "/bots")
+                response = conn.getresponse()
+                self.assertEqual(503, response.status)
+                body = json.loads(response.read())
+                self.assertIn("ZEUS_API_KEY", body["error"])
+
                 conn.request(
                     "POST",
                     "/bots",
@@ -357,6 +461,44 @@ class SupervisorCliApiTests(unittest.TestCase):
                 self.assertEqual(503, response.status)
                 body = json.loads(response.read())
                 self.assertIn("ZEUS_API_KEY", body["error"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_api_allow_unauth_reads_keeps_mutations_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings.from_env(
+                {
+                    "ZEUS_STATE_DIR": str(root / ".zeus"),
+                    "ZEUS_ALLOW_UNAUTH_READS": "1",
+                    "ZEUS_HOST": "127.0.0.1",
+                    "ZEUS_PORT": "0",
+                }
+            )
+            handler = make_handler(settings)
+            from http.server import ThreadingHTTPServer
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                conn.request("GET", "/templates")
+                response = conn.getresponse()
+                self.assertEqual(200, response.status)
+                templates = json.loads(response.read())
+                self.assertTrue(templates)
+
+                conn.request(
+                    "POST",
+                    "/bots",
+                    body=b"{}",
+                    headers={"content-type": "application/json"},
+                )
+                response = conn.getresponse()
+                self.assertEqual(503, response.status)
+                response.read()
             finally:
                 server.shutdown()
                 server.server_close()

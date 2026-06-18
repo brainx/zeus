@@ -30,6 +30,7 @@ class Settings:
     host: str
     port: int
     api_key: str | None
+    allow_unauth_reads: bool
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -44,6 +45,7 @@ class Settings:
             host=merged.get("ZEUS_HOST", "127.0.0.1"),
             port=int(merged.get("ZEUS_PORT", "4311")),
             api_key=merged.get("ZEUS_API_KEY") or None,
+            allow_unauth_reads=merged.get("ZEUS_ALLOW_UNAUTH_READS") == "1",
         )
 
     def ensure_dirs(self) -> None:

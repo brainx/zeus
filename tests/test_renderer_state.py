@@ -76,6 +76,24 @@ class RendererStateTests(unittest.TestCase):
                 (profile / ".env").read_text(encoding="utf-8"),
             )
 
+    def test_renderer_rejects_newline_env_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            template = TemplateStore().get("coding-bot")
+
+            with self.assertRaisesRegex(ValueError, "control"):
+                ProfileRenderer(root / ".zeus" / "hermes").render(
+                    BotCreateRequest(
+                        bot_id="coder",
+                        template_id="coding-bot",
+                        env={"OPENROUTER_API_KEY": "good\nEVIL=value"},
+                    ),
+                    template,
+                )
+
+            env_path = root / ".zeus" / "hermes" / "profiles" / "coder" / ".env"
+            self.assertFalse(env_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

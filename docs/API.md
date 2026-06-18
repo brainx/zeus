@@ -2,7 +2,7 @@
 
 The Zeus API is a local JSON API. It binds to `127.0.0.1:4311` by default.
 
-Mutating endpoints always require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, mutating endpoints reject requests.
+All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`.
 
 ## Endpoints
 
