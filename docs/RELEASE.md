@@ -10,12 +10,15 @@ package-index distribution.
    ```bash
    sh scripts/test.sh
    sh scripts/repo_check.sh
+   sh scripts/wheel_smoke.sh
    python -m build
    twine check dist/*
+   cd dist && sha256sum * > SHA256SUMS.txt
    ```
 
 3. Update `CHANGELOG.md`.
-4. Bump `pyproject.toml` version.
+4. Bump `zeus/__init__.py` version. Package metadata reads the version from
+   `zeus.__version__`.
 5. Create and push a signed tag:
 
    ```bash
@@ -24,10 +27,11 @@ package-index distribution.
    ```
 
 6. Create the GitHub release from the tag and attach the generated `dist/*`
-   artifacts.
+   artifacts plus `dist/SHA256SUMS.txt`.
 
 ## GitHub Release Workflow
 
 `.github/workflows/release.yml` builds and checks distribution artifacts for
-`v*.*.*` tags. It intentionally does not publish to PyPI; release artifacts are
-uploaded to GitHub Actions for review and attachment to a GitHub release.
+`v*.*.*` tags, runs the wheel smoke test, and writes `SHA256SUMS.txt`. It
+intentionally does not publish to PyPI; release artifacts are uploaded to GitHub
+Actions for review and attachment to a GitHub release.

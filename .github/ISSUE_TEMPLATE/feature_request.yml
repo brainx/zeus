@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a focused Zeus improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the operator or developer problem this solves.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the behavior and any CLI, API, or documentation impact.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - CLI
+        - API
+        - Templates
+        - Packaging
+        - Operations
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification idea
+      description: Suggest tests or manual checks that would prove the feature works.

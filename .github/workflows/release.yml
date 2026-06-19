@@ -23,8 +23,16 @@ jobs:
         run: python -m build
       - name: Check package metadata
         run: twine check dist/*
+      - name: Smoke test built wheel
+        run: sh scripts/wheel_smoke.sh
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dist/*
+          path: |
+            dist/*
+            dist/SHA256SUMS.txt

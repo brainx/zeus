@@ -48,3 +48,5 @@ jobs:
         run: python -m build
       - name: Check package metadata
         run: twine check dist/*
+      - name: Smoke test built wheel
+        run: sh scripts/wheel_smoke.sh

@@ -61,6 +61,36 @@ class TemplateTests(unittest.TestCase):
                 }
             )
 
+    def test_rejects_lowercase_inline_secret_like_value(self) -> None:
+        with self.assertRaises(TemplateError):
+            HermesTemplate.from_dict(
+                {
+                    "id": "secret-bot",
+                    "name": "Secret Bot",
+                    "description": "Invalid secret",
+                    "version": "0.1.0",
+                    "hermes": {
+                        "model": {
+                            "provider": "openrouter",
+                            "default": "x/y",
+                            "api_key": "plain-secret-value",
+                        },
+                    },
+                    "soul": "valid soul",
+                }
+            )
+
+    def test_template_store_falls_back_to_packaged_templates_when_local_root_is_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "does-not-exist"
+            templates = TemplateStore(missing).list()
+
+        ids = {template.id for template in templates}
+        self.assertIn("coding-bot", ids)
+        self.assertIn("deepseek-coding-bot", ids)
+
     def test_rejects_unbounded_async_delegation_capacity(self) -> None:
         with self.assertRaises(TemplateError):
             HermesTemplate.from_dict(

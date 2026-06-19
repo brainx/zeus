@@ -29,11 +29,24 @@ class RepoContractTests(unittest.TestCase):
             "docs/assets/demo.cast",
             "docs/assets/zeus-hero.png",
             ".github/workflows/release.yml",
+            ".github/ISSUE_TEMPLATE/bug_report.yml",
+            ".github/ISSUE_TEMPLATE/feature_request.yml",
+            ".github/ISSUE_TEMPLATE/config.yml",
+            ".github/pull_request_template.md",
             "systemd/zeus-api.service",
             "systemd/zeus-reconcile.service",
             "systemd/zeus-reconcile.timer",
             "scripts/repo_check.sh",
+            "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
+            "zeus/bundled_templates/__init__.py",
+            "zeus/bundled_templates/coding-bot.toml",
+            "zeus/bundled_templates/deepseek-coding-bot.toml",
+            "zeus/bundled_templates/docs-writer-bot.toml",
+            "zeus/bundled_templates/gateway-operator.toml",
+            "zeus/bundled_templates/log-triage-bot.toml",
+            "zeus/bundled_templates/research-bot.toml",
+            "zeus/bundled_templates/support-gateway.toml",
             "templates/deepseek-coding-bot.toml",
             "templates/docs-writer-bot.toml",
             "templates/gateway-operator.toml",
@@ -59,6 +72,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("sh scripts/test.sh", workflow)
         self.assertIn("python -m build", workflow)
         self.assertIn("twine check dist/*", workflow)
+        self.assertIn("sh scripts/wheel_smoke.sh", workflow)
 
     def test_test_script_runs_compile_unittest_and_doctor(self) -> None:
         script = Path("scripts/test.sh").read_text(encoding="utf-8")
@@ -90,7 +104,9 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("systemd/zeus-api.service", script)
         self.assertIn("systemd/zeus-reconcile.service", script)
         self.assertIn("systemd/zeus-reconcile.timer", script)
+        self.assertIn("scripts/wheel_smoke.sh", script)
         self.assertIn("scripts/fresh_vps_verify.sh", script)
+        self.assertIn("zeus/bundled_templates/coding-bot.toml", script)
         self.assertIn("templates/deepseek-coding-bot.toml", script)
         self.assertIn("templates/docs-writer-bot.toml", script)
         self.assertIn("templates/gateway-operator.toml", script)
@@ -124,8 +140,10 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("ZEUS_API_KEY=", env)
         self.assertIn("ZEUS_ALLOW_UNAUTH_READS=0", env)
         self.assertIn("DEEPSEEK_API_KEY=", env)
+        self.assertIn("ZEUS_ENV_PASSTHROUGH=", env)
         self.assertIn("All non-health endpoints require", api_docs)
         self.assertIn("POST /bots/<bot-id>/restart", api_docs)
+        self.assertIn("unsupported_media_type", api_docs)
         self.assertIn("docs/openapi.json", api_docs)
 
     def test_deepseek_template_uses_native_provider(self) -> None:
@@ -170,9 +188,23 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("ruff>=0.6.0", pyproject)
         self.assertIn("mypy>=1.11.0", pyproject)
         self.assertIn("bandit>=1.7.9", pyproject)
+        self.assertIn('dynamic = ["version"]', pyproject)
+        self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
+        self.assertNotIn('version = "0.1.1"', pyproject)
+        self.assertIn("[tool.setuptools.package-data]", pyproject)
+        self.assertIn('"zeus.bundled_templates" = ["*.toml"]', pyproject)
         self.assertIn("[tool.ruff]", pyproject)
         self.assertIn("[tool.mypy]", pyproject)
         self.assertIn("[tool.bandit]", pyproject)
+
+    def test_package_version_is_single_sourced_from_zeus_init(self) -> None:
+        init_text = Path("zeus/__init__.py").read_text(encoding="utf-8")
+        pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertIn('__version__ = "0.1.1"', init_text)
+        self.assertIn('dynamic = ["version"]', pyproject)
+        self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
+        self.assertNotIn('version = "0.1.1"', pyproject)
 
     def test_cli_exposes_restart_lifecycle_command(self) -> None:
         cli = Path("zeus/cli.py").read_text(encoding="utf-8")
@@ -222,6 +254,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("sh scripts/repo_check.sh", release_docs)
         self.assertIn("python -m build", release_docs)
         self.assertIn("twine check dist/*", release_docs)
+        self.assertIn("sh scripts/wheel_smoke.sh", release_docs)
+        self.assertIn("SHA256SUMS.txt", release_docs)
         self.assertIn("tags:", workflow)
         self.assertIn('"v*.*.*"', workflow)
         self.assertIn('python -m pip install -e ".[dev]"', workflow)
@@ -229,6 +263,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("sh scripts/repo_check.sh", workflow)
         self.assertIn("python -m build", workflow)
         self.assertIn("twine check dist/*", workflow)
+        self.assertIn("sh scripts/wheel_smoke.sh", workflow)
+        self.assertIn("sha256sum * > SHA256SUMS.txt", workflow)
         self.assertIn("actions/upload-artifact@v4", workflow)
 
     def test_openapi_contract_loads_and_documents_required_paths(self) -> None:
@@ -257,7 +293,33 @@ class RepoContractTests(unittest.TestCase):
         ]["enum"]
         self.assertIn("missing_api_key", error_codes)
         self.assertIn("invalid_api_key", error_codes)
+        self.assertIn("unsupported_media_type", error_codes)
+        self.assertIn("method_not_allowed", error_codes)
         self.assertIn("internal_error", error_codes)
+
+    def test_cli_api_docs_and_openapi_lifecycle_parity(self) -> None:
+        cli = Path("zeus/cli.py").read_text(encoding="utf-8")
+        api_docs = Path("docs/API.md").read_text(encoding="utf-8")
+        openapi = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
+        lifecycle = ["start", "stop", "restart", "status", "logs", "reconcile"]
+
+        for action in lifecycle:
+            with self.subTest(action=action):
+                self.assertIn(f'"{action}"', cli)
+
+        required_paths = [
+            "/bots/{bot_id}/status",
+            "/bots/{bot_id}/logs",
+            "/bots/{bot_id}/start",
+            "/bots/{bot_id}/stop",
+            "/bots/{bot_id}/restart",
+            "/bots/{bot_id}/reconcile",
+            "/bots/reconcile",
+        ]
+        for path in required_paths:
+            with self.subTest(path=path):
+                self.assertIn(path, openapi["paths"])
+                self.assertIn(path.replace("{bot_id}", "<bot-id>"), api_docs)
 
     def test_brainx_maintainer_is_credited(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")

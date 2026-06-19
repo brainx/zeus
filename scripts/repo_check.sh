@@ -22,6 +22,10 @@ pyproject.toml
 .gitignore
 .github/workflows/ci.yml
 .github/workflows/release.yml
+.github/ISSUE_TEMPLATE/bug_report.yml
+.github/ISSUE_TEMPLATE/feature_request.yml
+.github/ISSUE_TEMPLATE/config.yml
+.github/pull_request_template.md
 docs/ARCHITECTURE.md
 docs/API.md
 docs/TEMPLATE_AUTHORING.md
@@ -40,6 +44,7 @@ systemd/zeus-api.service
 systemd/zeus-reconcile.service
 systemd/zeus-reconcile.timer
 scripts/test.sh
+scripts/wheel_smoke.sh
 scripts/verify_real_hermes.sh
 scripts/fresh_vps_verify.sh
 templates/coding-bot.toml
@@ -49,6 +54,14 @@ templates/gateway-operator.toml
 templates/log-triage-bot.toml
 templates/research-bot.toml
 templates/support-gateway.toml
+zeus/bundled_templates/__init__.py
+zeus/bundled_templates/coding-bot.toml
+zeus/bundled_templates/deepseek-coding-bot.toml
+zeus/bundled_templates/docs-writer-bot.toml
+zeus/bundled_templates/gateway-operator.toml
+zeus/bundled_templates/log-triage-bot.toml
+zeus/bundled_templates/research-bot.toml
+zeus/bundled_templates/support-gateway.toml
 "
 
 for file in $required_files; do
@@ -96,6 +109,8 @@ for path in paths:
     files = [path] if path.is_file() else sorted(path.rglob("*"))
     for file in files:
         if not file.is_file():
+            continue
+        if "__pycache__" in file.parts or file.suffix in {".pyc", ".pyo"}:
             continue
         text = file.read_text(encoding="utf-8", errors="ignore")
         for pattern in patterns:

@@ -26,7 +26,7 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 ## Modules
 
 - `zeus.models`: Template, bot, and status validation.
-- `zeus.templates`: TOML template discovery.
+- `zeus.templates`: Local-first and bundled-fallback TOML template discovery.
 - `zeus.renderer`: Hermes profile rendering.
 - `zeus.state`: SQLite bot registry.
 - `zeus.hermes_adapter`: Subprocess command construction for Hermes.
@@ -42,6 +42,9 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 3. Zeus writes a PID marker in the bot profile logs directory.
 4. `zeus bot stop` verifies the PID marker before signaling the process.
 5. Zeus sends SIGTERM and waits for graceful exit so Hermes can interrupt background delegations.
+
+Hermes child processes receive a minimal host environment plus profile `.env`
+values. Operators can allow specific host variables with `ZEUS_ENV_PASSTHROUGH`.
 
 ## Async Delegation
 

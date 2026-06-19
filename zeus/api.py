@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -21,6 +23,8 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
     settings.ensure_dirs()
     store = StateStore(settings.database_path)
     store.init()
+    supervisor = Supervisor(store, settings.hermes_bin, settings.hermes_root)
+    supervisor_lock = threading.RLock()
 
     class ZeusHandler(BaseHTTPRequestHandler):
         server_version = "ZeusHTTP/0.1"
@@ -40,15 +44,13 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     self._json(HTTPStatus.OK, [bot.to_dict() for bot in store.list_bots()])
                 elif path.startswith("/bots/") and path.endswith("/status"):
                     bot_id = self._bot_id_from_path(path, "status")
-                    self._json(
-                        HTTPStatus.OK,
-                        Supervisor(store, settings.hermes_bin, settings.hermes_root)
-                        .status(bot_id)
-                        .to_dict(),
-                    )
+                    with supervisor_lock:
+                        payload = supervisor.status(bot_id).to_dict()
+                    self._json(HTTPStatus.OK, payload)
                 elif path.startswith("/bots/") and path.endswith("/logs"):
                     bot_id = self._bot_id_from_path(path, "logs")
-                    logs = Supervisor(store, settings.hermes_bin, settings.hermes_root).logs(bot_id)
+                    with supervisor_lock:
+                        logs = supervisor.logs(bot_id)
                     self._json(HTTPStatus.OK, {"bot_id": bot_id, "logs": logs})
                 else:
                     self._json_error_response(HTTPStatus.NOT_FOUND, "invalid_request", "not found")
@@ -80,39 +82,28 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     )
                     self._json(HTTPStatus.OK, record.to_dict())
                 elif path == "/bots/reconcile":
-                    results = Supervisor(
-                        store, settings.hermes_bin, settings.hermes_root
-                    ).reconcile()
+                    with supervisor_lock:
+                        results = supervisor.reconcile()
                     self._json(HTTPStatus.OK, [result.to_dict() for result in results])
                 elif path.startswith("/bots/") and path.endswith("/start"):
                     bot_id = self._bot_id_from_path(path, "start")
-                    self._json(
-                        HTTPStatus.OK,
-                        Supervisor(store, settings.hermes_bin, settings.hermes_root)
-                        .start(bot_id)
-                        .to_dict(),
-                    )
+                    with supervisor_lock:
+                        payload = supervisor.start(bot_id).to_dict()
+                    self._json(HTTPStatus.OK, payload)
                 elif path.startswith("/bots/") and path.endswith("/stop"):
                     bot_id = self._bot_id_from_path(path, "stop")
-                    self._json(
-                        HTTPStatus.OK,
-                        Supervisor(store, settings.hermes_bin, settings.hermes_root)
-                        .stop(bot_id)
-                        .to_dict(),
-                    )
+                    with supervisor_lock:
+                        payload = supervisor.stop(bot_id).to_dict()
+                    self._json(HTTPStatus.OK, payload)
                 elif path.startswith("/bots/") and path.endswith("/restart"):
                     bot_id = self._bot_id_from_path(path, "restart")
-                    self._json(
-                        HTTPStatus.OK,
-                        Supervisor(store, settings.hermes_bin, settings.hermes_root)
-                        .restart(bot_id)
-                        .to_dict(),
-                    )
+                    with supervisor_lock:
+                        payload = supervisor.restart(bot_id).to_dict()
+                    self._json(HTTPStatus.OK, payload)
                 elif path.startswith("/bots/") and path.endswith("/reconcile"):
                     bot_id = self._bot_id_from_path(path, "reconcile")
-                    results = Supervisor(
-                        store, settings.hermes_bin, settings.hermes_root
-                    ).reconcile(bot_id)
+                    with supervisor_lock:
+                        results = supervisor.reconcile(bot_id)
                     self._json(HTTPStatus.OK, [result.to_dict() for result in results])
                 else:
                     self._json_error_response(HTTPStatus.NOT_FOUND, "invalid_request", "not found")
@@ -123,6 +114,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             return
 
         def _read_json(self) -> dict[str, Any]:
+            self._require_json_content_type()
             length = int(self.headers.get("content-length") or "0")
             if length > 1_000_000:
                 raise ValueError("request body too large")
@@ -131,6 +123,16 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             if not isinstance(parsed, dict):
                 raise ValueError("request body must be a JSON object")
             return parsed
+
+        def _require_json_content_type(self) -> None:
+            content_type = self.headers.get("content-type", "")
+            if content_type and "application/json" not in content_type.lower():
+                self._json_error_response(
+                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                    "unsupported_media_type",
+                    "content-type must be application/json",
+                )
+                raise _ResponseSent
 
         def _env_from_body(self, body: dict[str, Any]) -> dict[str, str]:
             env = body.get("env") or {}
@@ -171,7 +173,8 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     "ZEUS_API_KEY is required for non-health endpoints",
                 )
                 raise _ResponseSent
-            if self.headers.get("x-zeus-api-key") != settings.api_key:
+            provided = self.headers.get("x-zeus-api-key") or ""
+            if not hmac.compare_digest(provided, settings.api_key):
                 self._json_error_response(
                     HTTPStatus.UNAUTHORIZED,
                     "invalid_api_key",
@@ -212,10 +215,27 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             self.send_response(status.value)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(data)))
+            self.send_header("cache-control", "no-store")
             self.send_header("x-content-type-options", "nosniff")
             self.send_header("referrer-policy", "no-referrer")
             self.end_headers()
             self.wfile.write(data)
+
+        def do_PUT(self) -> None:
+            self._method_not_allowed()
+
+        def do_PATCH(self) -> None:
+            self._method_not_allowed()
+
+        def do_DELETE(self) -> None:
+            self._method_not_allowed()
+
+        def _method_not_allowed(self) -> None:
+            self._json_error_response(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "method not allowed",
+            )
 
     return ZeusHandler
 

@@ -101,23 +101,29 @@ def _check_templates() -> DoctorCheck:
 
 def _check_runtime_paths(settings: Settings) -> DoctorCheck:
     gitignore = Path(".gitignore")
-    ignored = gitignore.exists() and ".zeus/" in gitignore.read_text(encoding="utf-8")
+    if not gitignore.exists():
+        return DoctorCheck(
+            "runtime_paths",
+            "warn",
+            "No .gitignore found; runtime ignore check skipped outside a git checkout",
+        )
+    ignored = ".zeus/" in gitignore.read_text(encoding="utf-8")
     if ignored:
         return DoctorCheck("runtime_paths", "pass", ".zeus/ runtime state is ignored")
     return DoctorCheck("runtime_paths", "fail", ".gitignore must ignore .zeus/")
 
 
 def _check_scripts() -> DoctorCheck:
-    missing = [
-        path for path in [Path("scripts/start.sh"), Path("scripts/stop.sh")] if not path.exists()
-    ]
+    script_paths = [Path("scripts/start.sh"), Path("scripts/stop.sh")]
+    missing = [path for path in script_paths if not path.exists()]
     if missing:
-        return DoctorCheck("scripts", "fail", "Missing script(s): " + ", ".join(map(str, missing)))
-    non_exec = [
-        path
-        for path in [Path("scripts/start.sh"), Path("scripts/stop.sh")]
-        if not path.stat().st_mode & 0o111
-    ]
+        status = "fail" if Path("scripts").exists() else "warn"
+        return DoctorCheck(
+            "scripts",
+            status,
+            "Missing checkout script(s): " + ", ".join(map(str, missing)),
+        )
+    non_exec = [path for path in script_paths if not path.stat().st_mode & 0o111]
     if non_exec:
         return DoctorCheck(
             "scripts", "warn", "Script(s) are not executable: " + ", ".join(map(str, non_exec))

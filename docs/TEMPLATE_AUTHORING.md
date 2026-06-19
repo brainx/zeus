@@ -2,6 +2,13 @@
 
 Templates are TOML files under `templates/*.toml`. A template renders one Hermes profile.
 
+## Template Discovery
+
+Zeus looks for local `templates/*.toml` first. If no local template directory
+exists, it falls back to packaged bundled templates under `zeus.bundled_templates`.
+This keeps git-checkout development editable while installed wheels remain useful
+without a source tree.
+
 ## Minimal Shape
 
 ```toml
@@ -44,7 +51,7 @@ subagent_auto_approve = false
 - `required_env` entries must be environment variable names.
 - `max_async_children` must be between `1` and `32`.
 - `child_timeout_seconds` must be `0` or at least `30`.
-- Fields ending in `KEY`, `TOKEN`, `SECRET`, or `PASSWORD` must use placeholders such as `${OPENROUTER_API_KEY}` rather than inline secrets.
+- Fields ending in `KEY`, `TOKEN`, `SECRET`, or `PASSWORD`, including lower-case variants such as `api_key`, must use placeholders such as `${OPENROUTER_API_KEY}` rather than inline secrets.
 
 ## Rendering
 

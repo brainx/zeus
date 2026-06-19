@@ -40,6 +40,20 @@ sudo systemctl restart zeus-api
 
 Run `zeus doctor --strict` after upgrades on hosts where Hermes is expected to be installed and usable.
 
+## Environment Isolation
+
+Hermes child processes receive a minimal environment by default plus variables
+rendered into the bot profile `.env`. Zeus does not pass the full API service or
+operator shell environment to child processes.
+
+To pass selected host variables, set an explicit allowlist:
+
+```dotenv
+ZEUS_ENV_PASSTHROUGH=HTTP_PROXY,HTTPS_PROXY,NO_PROXY
+```
+
+Keep the allowlist empty unless the Hermes process needs those values.
+
 ## Restart Policy
 
 The sample systemd unit restarts the Zeus API with `Restart=on-failure` and `RestartSec=5s`. Bot gateway processes are supervised by Zeus itself; use `zeus bot restart <bot-id>` for a controlled stop, ownership check, and clean start.
@@ -58,6 +72,13 @@ Run `zeus bot reconcile [bot-id]` from an operator shell, cron, or systemd timer
 
 For first-class scheduling, install `systemd/zeus-reconcile.service` and
 `systemd/zeus-reconcile.timer` as described in `docs/RECONCILE.md`.
+
+## Process Shutdown
+
+Zeus sends SIGTERM to the recorded Hermes gateway PID only after checking the PID
+ownership marker and, on Linux, the live command line. Hermes owns cleanup of any
+children it starts. If the gateway does not exit before the grace period, Zeus
+marks the bot failed and does not send SIGKILL by default.
 
 ## Audit Log
 

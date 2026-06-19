@@ -109,6 +109,14 @@ pip install -e .
 cp .env.example .env
 ```
 
+## Install Modes
+
+Zeus can run from a git checkout or from a built wheel.
+
+- Git checkout: templates are loaded from `templates/*.toml` first.
+- Installed package: bundled templates are loaded from `zeus.bundled_templates` when no local template directory is present.
+- Custom operators can supply their own `templates/` directory in the active workspace.
+
 ## Commands
 
 ```bash
@@ -135,6 +143,7 @@ Run the local checks:
 ```bash
 sh scripts/test.sh
 sh scripts/repo_check.sh
+sh scripts/wheel_smoke.sh
 ```
 
 Run deployment-style diagnostics:
@@ -195,6 +204,8 @@ Useful endpoints:
 ## Templates
 
 Templates live in `templates/*.toml`. They render Hermes `config.yaml`, `.env`, `SOUL.md`, `mcp.json`, and `cron/jobs.json` files under `.zeus/hermes/profiles/<bot-id>/`.
+Installed wheels fall back to packaged copies of the built-in templates when no
+local `templates/` directory is present.
 Rendered `.env` values are serialized with quoting when needed so whitespace, `#`,
 quotes, and backslashes cannot create extra assignments.
 
@@ -241,3 +252,7 @@ The test suite includes a fake Hermes executable that exercises the real Zeus su
 ## Security Notes
 
 Templates must not contain real secrets. Use environment variables or rendered per-profile `.env` files excluded from git. Hermes profiles isolate Hermes state, not host filesystem access. Use a sandboxed Hermes terminal backend when a bot should not execute tools directly on the host.
+
+Hermes child processes receive a minimal host environment by default plus the
+rendered profile `.env`. Set `ZEUS_ENV_PASSTHROUGH=HTTP_PROXY,HTTPS_PROXY,NO_PROXY`
+only when a bot needs selected host variables.

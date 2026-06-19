@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible Zeus problem.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: zeus-version
+    attributes:
+      label: Zeus version
+      description: Output from `zeus --version` or the installed package version.
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output from `python --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Include distribution and version.
+    validations:
+      required: true
+  - type: dropdown
+    id: install-mode
+    attributes:
+      label: Install mode
+      options:
+        - Git checkout
+        - Wheel
+    validations:
+      required: true
+  - type: input
+    id: hermes-version
+    attributes:
+      label: Hermes version
+      description: Output from the Hermes CLI, if available.
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs with secrets removed
+      description: Remove API keys, tokens, passwords, private URLs, and local-only paths.
+      render: text

@@ -18,7 +18,7 @@ from zeus.config import Settings
 from zeus.doctor import run_doctor
 from zeus.hermes_adapter import HermesAdapter
 from zeus.logging_utils import redact_secrets
-from zeus.models import BotRecord, BotStatus, RestartPolicy
+from zeus.models import BotRecord, BotStatus, BotStatusResponse, RestartPolicy
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
 
@@ -68,6 +68,48 @@ class SupervisorCliApiTests(unittest.TestCase):
             _, env = HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
 
             self.assertEqual("line one\nline two # not comment", env["OPENROUTER_API_KEY"])
+
+    def test_adapter_does_not_leak_parent_secrets_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / ".zeus" / "hermes"
+            profile = hermes_root / "profiles" / "coder"
+            profile.mkdir(parents=True)
+            (profile / ".env").write_text("OPENROUTER_API_KEY=profile-key\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "ZEUS_API_KEY": "zeus-secret",
+                    "GITHUB_TOKEN": "github-secret",
+                    "PATH": "/usr/bin",
+                },
+                clear=True,
+            ):
+                _, env = HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
+
+            self.assertEqual("profile-key", env["OPENROUTER_API_KEY"])
+            self.assertEqual("/usr/bin", env["PATH"])
+            self.assertNotIn("ZEUS_API_KEY", env)
+            self.assertNotIn("GITHUB_TOKEN", env)
+
+    def test_adapter_allows_explicit_env_passthrough(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / ".zeus" / "hermes"
+            profile = hermes_root / "profiles" / "coder"
+            profile.mkdir(parents=True)
+            (profile / ".env").write_text("", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "ZEUS_ENV_PASSTHROUGH": "CUSTOM_ALLOWED",
+                    "CUSTOM_ALLOWED": "yes",
+                    "CUSTOM_BLOCKED": "no",
+                },
+                clear=True,
+            ):
+                _, env = HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
+
+            self.assertEqual("yes", env["CUSTOM_ALLOWED"])
+            self.assertNotIn("CUSTOM_BLOCKED", env)
 
     def test_supervisor_stop_waits_for_graceful_gateway_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -467,10 +509,22 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual("restarted by reconcile: attempt 1/1", restarted.message)
 
     def test_redacts_secret_lines(self) -> None:
-        text = "OPENAI_API_KEY=plain-secret-value\nSERVICE_TOKEN=plain-token-value"
+        text = """
+OPENAI_API_KEY=plain-secret-value
+SERVICE_TOKEN=plain-token-value
+api_key: plain-api-key
+"token": "plain-token-json"
+Authorization: Bearer bearer-secret
+password = "plain-password"
+"""
         redacted = redact_secrets(text)
         self.assertNotIn("plain-secret-value", redacted)
         self.assertNotIn("plain-token-value", redacted)
+        self.assertNotIn("plain-api-key", redacted)
+        self.assertNotIn("plain-token-json", redacted)
+        self.assertNotIn("bearer-secret", redacted)
+        self.assertNotIn("plain-password", redacted)
+        self.assertIn("[redacted]", redacted)
 
     def test_cli_creates_bot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,6 +705,30 @@ class SupervisorCliApiTests(unittest.TestCase):
             strict_report = run_doctor(settings, strict=True)
             self.assertFalse(strict_report.ok)
 
+    def test_doctor_allows_installed_package_without_checkout_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(tmp)
+                settings = Settings.from_env(
+                    {
+                        "ZEUS_STATE_DIR": str(Path(tmp) / ".zeus"),
+                        "ZEUS_HERMES_BIN": "definitely-missing-hermes",
+                        "ZEUS_HOST": "127.0.0.1",
+                        "ZEUS_PORT": "4311",
+                    }
+                )
+
+                report = run_doctor(settings)
+            finally:
+                os.chdir(old_cwd)
+
+        statuses = {check.name: check.status for check in report.checks}
+        self.assertTrue(report.ok)
+        self.assertEqual("pass", statuses["templates"])
+        self.assertEqual("warn", statuses["runtime_paths"])
+        self.assertEqual("warn", statuses["scripts"])
+
     def test_api_health_and_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -673,6 +751,7 @@ class SupervisorCliApiTests(unittest.TestCase):
                 conn.request("GET", "/health")
                 response = conn.getresponse()
                 self.assertEqual(200, response.status)
+                self.assertEqual("no-store", response.getheader("cache-control"))
                 self.assertEqual({"status": "ok"}, json.loads(response.read()))
 
                 conn.request("GET", "/bots")
@@ -747,9 +826,81 @@ class SupervisorCliApiTests(unittest.TestCase):
                 self.assertEqual(200, response.status)
                 reconciled = json.loads(response.read())
                 self.assertEqual("coder", reconciled[0]["bot_id"])
+
+                conn.request(
+                    "POST",
+                    "/bots",
+                    body=b"{}",
+                    headers={"content-type": "text/plain", "x-zeus-api-key": "secret"},
+                )
+                response = conn.getresponse()
+                self.assertEqual(415, response.status)
+                body = json.loads(response.read())
+                self.assertEqual("unsupported_media_type", body["error"]["code"])
+
+                conn.request("PUT", "/bots", headers={"x-zeus-api-key": "secret"})
+                response = conn.getresponse()
+                self.assertEqual(405, response.status)
+                body = json.loads(response.read())
+                self.assertEqual("method_not_allowed", body["error"]["code"])
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_api_reuses_single_supervisor_instance(self) -> None:
+        created = []
+
+        class CountingSupervisor:
+            def __init__(self, *args, **kwargs) -> None:
+                created.append(self)
+
+            def status(self, bot_id: str) -> BotStatusResponse:
+                return BotStatusResponse(
+                    bot_id=bot_id,
+                    status=BotStatus.stopped,
+                    pid=None,
+                    profile_path="/tmp/profile",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings.from_env(
+                {
+                    "ZEUS_STATE_DIR": str(root / ".zeus"),
+                    "ZEUS_API_KEY": "secret",
+                    "ZEUS_HOST": "127.0.0.1",
+                    "ZEUS_PORT": "0",
+                }
+            )
+            store = StateStore(settings.database_path)
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path="/tmp/profile",
+                )
+            )
+            with patch("zeus.api.Supervisor", CountingSupervisor):
+                handler = make_handler(settings)
+            from http.server import ThreadingHTTPServer
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                for _ in range(2):
+                    conn.request("GET", "/bots/coder/status", headers={"x-zeus-api-key": "secret"})
+                    response = conn.getresponse()
+                    self.assertEqual(200, response.status)
+                    response.read()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+        self.assertEqual(1, len(created))
 
     def test_api_non_health_endpoints_require_configured_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

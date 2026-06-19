@@ -21,7 +21,11 @@ Errors use a stable object shape:
 ```
 
 Known error codes are `invalid_request`, `invalid_bot_id`, `unknown_bot`,
-`unknown_template`, `missing_api_key`, `invalid_api_key`, and `internal_error`.
+`unknown_template`, `missing_api_key`, `invalid_api_key`,
+`unsupported_media_type`, `method_not_allowed`, and `internal_error`.
+
+JSON responses include `cache-control: no-store`. Mutating endpoints that accept
+request bodies reject non-JSON content types with `unsupported_media_type`.
 
 ## Endpoints
 

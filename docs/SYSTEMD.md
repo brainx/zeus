@@ -38,6 +38,10 @@ sudo chmod 0640 /etc/zeus/zeus.env
 
 Provider keys such as `DEEPSEEK_API_KEY` can also live in this env file. Do not commit real keys.
 
+Leave `ZEUS_ENV_PASSTHROUGH` unset unless Hermes needs selected proxy or
+certificate variables from the service environment. Profile `.env` files remain
+the preferred place for provider keys used by a bot.
+
 ## Service
 
 ```bash
@@ -67,3 +71,7 @@ See `docs/RECONCILE.md` for reconcile semantics and timer operations.
 ## Hardening Notes
 
 The sample unit enables `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome=true`, and writes only to `/var/lib/zeus`. If a Hermes terminal backend needs extra host access, loosen the smallest required directive and document why.
+
+Zeus stops bot gateways by sending SIGTERM to verified gateway PIDs. Hermes is
+responsible for cleaning up its own child processes; Zeus marks a gateway failed
+instead of force-killing it when graceful shutdown times out.

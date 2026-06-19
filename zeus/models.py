@@ -10,7 +10,7 @@ from typing import Any
 ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
-SECRET_NAME_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)$")
+SECRET_NAME_RE = re.compile(r"(API[_-]?KEY|KEY|TOKEN|SECRET|PASSWORD)$", re.IGNORECASE)
 ENV_PLACEHOLDER_RE = re.compile(r"^\$\{[A-Z][A-Z0-9_]{1,127}\}$")
 
 
