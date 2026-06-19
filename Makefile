@@ -1,7 +1,7 @@
 # Zeus Hermes Orchestrator
 # Maintained by BrainX: https://github.com/brainx
 
-.PHONY: install-dev test check build doctor run-api strict-doctor repo-check verify-real-hermes fresh-vps-verify clean clean-vps
+.PHONY: install-dev test check build wheel-smoke release-check doctor run-api strict-doctor repo-check verify-real-hermes fresh-vps-verify clean clean-vps
 
 install-dev:
 	python3 -m venv .venv
@@ -21,6 +21,23 @@ check:
 build:
 	python -m build
 	twine check dist/*
+
+wheel-smoke:
+	sh scripts/wheel_smoke.sh
+
+release-check:
+	sh scripts/test.sh
+	sh scripts/repo_check.sh
+	ruff format --check .
+	ruff check .
+	mypy zeus
+	bandit -r zeus
+	shellcheck scripts/*.sh
+	rm -rf dist
+	python -m build
+	ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh
+	twine check dist/*
+	cd dist && sha256sum * > SHA256SUMS.txt
 
 doctor:
 	python3 -B -m zeus.cli doctor --json

@@ -5,13 +5,29 @@ the repository locally first, and publish GitHub artifacts before considering
 package-index distribution.
 
 1. Ensure CI is green on the commit to release.
-2. Run the local gates:
+2. Run the full local release gate:
+
+   ```bash
+   make release-check
+   ```
+
+   This runs tests, repository checks, formatting/lint/type/security checks,
+   ShellCheck, package build, wheel smoke verification, package metadata checks,
+   and checksum generation.
+
+   Reference command sequence:
 
    ```bash
    sh scripts/test.sh
    sh scripts/repo_check.sh
-   sh scripts/wheel_smoke.sh
+   ruff format --check .
+   ruff check .
+   mypy zeus
+   bandit -r zeus
+   shellcheck scripts/*.sh
+   rm -rf dist
    python -m build
+   ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh
    twine check dist/*
    cd dist && sha256sum * > SHA256SUMS.txt
    ```

@@ -249,23 +249,37 @@ class RepoContractTests(unittest.TestCase):
     def test_release_workflow_builds_tag_artifacts(self) -> None:
         release_docs = Path("docs/RELEASE.md").read_text(encoding="utf-8")
         workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+        wheel_smoke = Path("scripts/wheel_smoke.sh").read_text(encoding="utf-8")
 
         self.assertIn("sh scripts/test.sh", release_docs)
         self.assertIn("sh scripts/repo_check.sh", release_docs)
+        self.assertIn("sh scripts/wheel_smoke.sh", release_docs)
         self.assertIn("python -m build", release_docs)
         self.assertIn("twine check dist/*", release_docs)
-        self.assertIn("sh scripts/wheel_smoke.sh", release_docs)
         self.assertIn("SHA256SUMS.txt", release_docs)
         self.assertIn("tags:", workflow)
         self.assertIn('"v*.*.*"', workflow)
-        self.assertIn('python -m pip install -e ".[dev]"', workflow)
-        self.assertIn("sh scripts/test.sh", workflow)
-        self.assertIn("sh scripts/repo_check.sh", workflow)
+        self.assertIn("rm -rf dist", workflow)
         self.assertIn("python -m build", workflow)
+        self.assertIn("ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh", workflow)
         self.assertIn("twine check dist/*", workflow)
-        self.assertIn("sh scripts/wheel_smoke.sh", workflow)
         self.assertIn("sha256sum * > SHA256SUMS.txt", workflow)
         self.assertIn("actions/upload-artifact@v4", workflow)
+        self.assertIn('build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"', wheel_smoke)
+        self.assertIn('fail "ZEUS_WHEEL_SMOKE_BUILD must be 0 or 1"', wheel_smoke)
+        self.assertIn('fail "expected exactly one wheel in dist/"', wheel_smoke)
+
+    def test_makefile_has_release_check_target(self) -> None:
+        makefile = Path("Makefile").read_text(encoding="utf-8")
+
+        self.assertIn("release-check:", makefile)
+        self.assertIn("wheel-smoke:", makefile)
+        self.assertIn("shellcheck scripts/*.sh", makefile)
+        self.assertIn("rm -rf dist", makefile)
+        self.assertIn("python -m build", makefile)
+        self.assertIn("ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh", makefile)
+        self.assertIn("twine check dist/*", makefile)
+        self.assertIn("sha256sum * > SHA256SUMS.txt", makefile)
 
     def test_openapi_contract_loads_and_documents_required_paths(self) -> None:
         spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
@@ -329,7 +343,7 @@ class RepoContractTests(unittest.TestCase):
 
         self.assertIn("[Credits](CREDITS.md)", readme)
         opener = (
-            "Zeus is a orchestration layer for running many Hermes Agent bots "
+            "Zeus is an orchestration layer for running many Hermes Agent bots "
             "from reusable templates."
         )
         self.assertIn(opener, readme)

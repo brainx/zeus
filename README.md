@@ -13,7 +13,7 @@ Many Hermes bots, one local supervisor.
 [![Package Build](https://img.shields.io/badge/package-build%20checked-brightgreen)](.github/workflows/ci.yml)
 [![Security Policy](https://img.shields.io/badge/security-policy-informational)](SECURITY.md)
 
-Zeus is a orchestration layer for running many Hermes Agent bots from reusable templates. It renders each bot as an isolated Hermes profile under `.zeus/`, starts and stops gateway processes, tracks PID ownership, and exposes a small loopback CLI/API for operators.
+Zeus is an orchestration layer for running many Hermes Agent bots from reusable templates. It renders each bot as an isolated Hermes profile under `.zeus/`, starts and stops gateway processes, tracks PID ownership, and exposes a small loopback CLI/API for operators.
 
 ## Why Zeus
 

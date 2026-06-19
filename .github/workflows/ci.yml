@@ -45,8 +45,10 @@ jobs:
       - name: Install package build tools
         run: python -m pip install -e ".[dev]"
       - name: Build package
-        run: python -m build
+        run: |
+          rm -rf dist
+          python -m build
+      - name: Smoke test built wheel
+        run: ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh
       - name: Check package metadata
         run: twine check dist/*
-      - name: Smoke test built wheel
-        run: sh scripts/wheel_smoke.sh

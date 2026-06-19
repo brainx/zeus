@@ -5,6 +5,11 @@ set -eu
 
 repo_root="$(pwd)"
 tmp_dir="$repo_root/.tmp/wheel-smoke"
+build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"
+fail() {
+  echo "wheel smoke failed: $*" >&2
+  exit 1
+}
 cleanup() {
   rm -rf "$tmp_dir"
 }
@@ -13,7 +18,6 @@ trap cleanup EXIT INT TERM
 mkdir -p "$repo_root/.tmp"
 rm -rf "$tmp_dir"
 mkdir -p "$tmp_dir"
-rm -rf dist
 if command -v python >/dev/null 2>&1; then
   python_cmd="python"
 elif [ -x ".venv/bin/python" ]; then
@@ -21,11 +25,21 @@ elif [ -x ".venv/bin/python" ]; then
 else
   python_cmd="python3"
 fi
-"$python_cmd" -m build
+if [ "$build_artifacts" = "1" ]; then
+  rm -rf dist
+  "$python_cmd" -m build
+elif [ "$build_artifacts" != "0" ]; then
+  fail "ZEUS_WHEEL_SMOKE_BUILD must be 0 or 1"
+fi
+set -- "$repo_root"/dist/*.whl
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+  fail "expected exactly one wheel in dist/"
+fi
+wheel_path="$1"
 "$python_cmd" -m venv "$tmp_dir/venv"
 venv_python="$tmp_dir/venv/bin/python"
 venv_zeus="$tmp_dir/venv/bin/zeus"
-"$venv_python" -m pip install dist/*.whl
+"$venv_python" -m pip install "$wheel_path"
 
 cd "$tmp_dir"
 "$venv_zeus" template list >template-list.txt

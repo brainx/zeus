@@ -3,11 +3,20 @@
 ## 0.1.1
 
 - Required API keys for all non-health local API endpoints.
-- Added `ZEUS_ALLOW_UNAUTH_READS=1` for local unauthenticated GET endpoints.
+- Added `ZEUS_ALLOW_UNAUTH_READS=1` for local unauthenticated GET endpoints while keeping mutations locked.
 - Added robust quoted `.env` serialization and parsing for rendered profiles.
+- Isolated Hermes child process environments by default and added explicit `ZEUS_ENV_PASSTHROUGH`.
 - Added Linux live command-line checks to PID ownership verification.
 - Added bot restart policy state, exponential backoff, and `zeus bot reconcile`.
-- Added API reconcile endpoints and updated operator documentation.
+- Added API reconcile endpoints and reused one API supervisor instance for lifecycle operations.
+- Added bundled package templates and fallback loading for installed wheel environments.
+- Added wheel smoke testing to verify installed package behavior outside a git checkout.
+- Strengthened template secret validation and log redaction for lowercase keys, JSON-like fields, and bearer tokens.
+- Hardened API responses with constant-time API-key comparison, `cache-control: no-store`, JSON `415`, and JSON `405` errors.
+- Added OpenAPI contract coverage for lifecycle endpoints and error codes.
+- Added release workflow artifacts, wheel smoke validation, and `SHA256SUMS.txt` generation.
+- Added systemd, operations, reconcile, and release documentation.
+- Added GitHub issue templates and pull request template.
 
 ## 0.1.0
 
