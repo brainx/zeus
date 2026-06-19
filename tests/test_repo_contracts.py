@@ -190,7 +190,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("bandit>=1.7.9", pyproject)
         self.assertIn('dynamic = ["version"]', pyproject)
         self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
-        self.assertNotIn('version = "0.1.1"', pyproject)
+        self.assertNotIn('version = "0.1.2"', pyproject)
         self.assertIn("[tool.setuptools.package-data]", pyproject)
         self.assertIn('"zeus.bundled_templates" = ["*.toml"]', pyproject)
         self.assertIn("[tool.ruff]", pyproject)
@@ -201,10 +201,10 @@ class RepoContractTests(unittest.TestCase):
         init_text = Path("zeus/__init__.py").read_text(encoding="utf-8")
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
 
-        self.assertIn('__version__ = "0.1.1"', init_text)
+        self.assertIn('__version__ = "0.1.2"', init_text)
         self.assertIn('dynamic = ["version"]', pyproject)
         self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
-        self.assertNotIn('version = "0.1.1"', pyproject)
+        self.assertNotIn('version = "0.1.2"', pyproject)
 
     def test_cli_exposes_restart_lifecycle_command(self) -> None:
         cli = Path("zeus/cli.py").read_text(encoding="utf-8")

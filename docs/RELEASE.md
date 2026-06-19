@@ -38,8 +38,8 @@ package-index distribution.
 5. Create and push a signed tag:
 
    ```bash
-   git tag -s v0.1.1 -m "Zeus v0.1.1"
-   git push origin v0.1.1
+   git tag -s v0.1.2 -m "Zeus v0.1.2"
+   git push origin v0.1.2
    ```
 
 6. Create the GitHub release from the tag and attach the generated `dist/*`

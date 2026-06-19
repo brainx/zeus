@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+- Polished release validation so CI and local release checks build once, smoke-test the exact wheel artifact, verify package metadata, and checksum the same distribution files.
+- Added reusable `wheel-smoke` and `release-check` Make targets.
+- Updated release documentation and repository contract tests for the artifact validation flow.
+- Fixed README grammar in the project summary.
+
 ## 0.1.1
 
 - Required API keys for all non-health local API endpoints.
