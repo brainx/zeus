@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shlex
 import signal
 import subprocess  # nosec B404
 import time
@@ -21,6 +22,8 @@ from zeus.state import StateStore
 class PopenLike(Protocol):
     pid: int
 
+    def poll(self) -> int | None: ...
+
 
 PopenFactory = Callable[..., PopenLike]
 KillFn = Callable[[int, signal.Signals], None]
@@ -38,7 +41,9 @@ class Supervisor:
         kill_fn: KillFn = os.kill,
         pid_alive_fn: PidAliveFn | None = None,
         cmdline_reader: CmdlineReader | None = None,
+        startup_grace_seconds: float = 0.25,
         stop_grace_seconds: float = 15.0,
+        kill_after_timeout: bool = False,
         restart_backoff_cap_seconds: float = 3600.0,
     ) -> None:
         self.store = store
@@ -46,8 +51,10 @@ class Supervisor:
         self.popen_factory = popen_factory
         self.kill_fn = kill_fn
         self.pid_alive_fn = pid_alive_fn
-        self.cmdline_reader = cmdline_reader or _read_linux_cmdline
+        self.cmdline_reader = cmdline_reader or _read_process_cmdline
+        self.startup_grace_seconds = startup_grace_seconds
         self.stop_grace_seconds = stop_grace_seconds
+        self.kill_after_timeout = kill_after_timeout
         self.restart_backoff_cap_seconds = restart_backoff_cap_seconds
         self._processes: dict[str, PopenLike] = {}
 
@@ -85,6 +92,26 @@ class Supervisor:
             process = self.popen_factory(argv, env=env, stdout=log_file, stderr=log_file)
         self._processes[bot_id] = process
         self._write_pid_marker(record.profile_path, process.pid, argv)
+        returncode = self._poll_startup(process)
+        if returncode is not None:
+            self._remove_pid_marker(record.profile_path)
+            self._processes.pop(bot_id, None)
+            self.store.update_status(bot_id, BotStatus.failed, pid=None)
+            self.store.append_audit_event(
+                "bot.start_failed",
+                bot_id=bot_id,
+                pid=process.pid,
+                returncode=returncode,
+            )
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message=(
+                    f"gateway exited during startup grace period with return code {returncode}"
+                ),
+            )
         self.store.update_status(
             bot_id, BotStatus.running, pid=process.pid, reset_restart=reset_restart
         )
@@ -97,7 +124,7 @@ class Supervisor:
             message=message,
         )
 
-    def stop(self, bot_id: str) -> BotStatusResponse:
+    def stop(self, bot_id: str, *, kill_after_timeout: bool | None = None) -> BotStatusResponse:
         record = self._require_bot(bot_id)
         if not record.pid or not self._pid_alive(record.pid):
             self._remove_pid_marker(record.profile_path)
@@ -123,6 +150,16 @@ class Supervisor:
 
         self.kill_fn(record.pid, signal.SIGTERM)
         stopped = self._wait_for_exit(bot_id, record.pid)
+        should_kill = self.kill_after_timeout if kill_after_timeout is None else kill_after_timeout
+        if not stopped and should_kill:
+            self.kill_fn(record.pid, signal.SIGKILL)
+            stopped = self._wait_for_exit(bot_id, record.pid)
+            self.store.append_audit_event(
+                "bot.stop_kill",
+                bot_id=bot_id,
+                pid=record.pid,
+                succeeded=stopped,
+            )
         if not stopped:
             self.store.update_status(bot_id, BotStatus.failed, pid=record.pid)
             return BotStatusResponse(
@@ -359,6 +396,27 @@ class Supervisor:
         record = self._require_bot(bot_id)
         return tail_file(self.log_path(record.profile_path), max_bytes=max_bytes)
 
+    def inspect(self, bot_id: str, max_log_bytes: int = 20_000) -> dict[str, object]:
+        record = self._require_bot(bot_id)
+        profile_path = Path(record.profile_path)
+        marker = self._read_pid_marker(record.profile_path)
+        live_cmdline_verified = False
+        if record.pid and self._pid_alive(record.pid):
+            live_cmdline_verified = self._pid_owned(record.profile_path, record.pid, bot_id)
+        return {
+            "bot": record.to_dict(),
+            "profile_files": {
+                "config.yaml": (profile_path / "config.yaml").is_file(),
+                "SOUL.md": (profile_path / "SOUL.md").is_file(),
+                ".env": (profile_path / ".env").is_file(),
+                "mcp.json": (profile_path / "mcp.json").is_file(),
+                "cron/jobs.json": (profile_path / "cron" / "jobs.json").is_file(),
+            },
+            "pid_marker": marker,
+            "live_cmdline_verified": live_cmdline_verified,
+            "recent_logs": tail_file(self.log_path(record.profile_path), max_bytes=max_log_bytes),
+        }
+
     def log_path(self, profile_path: str) -> Path:
         return Path(profile_path) / "logs" / "zeus-gateway.log"
 
@@ -396,6 +454,22 @@ class Supervisor:
         except FileNotFoundError:
             return
 
+    def _read_pid_marker(self, profile_path: str) -> dict[str, object]:
+        path = self.pid_marker_path(profile_path)
+        if not path.exists():
+            return {"exists": False}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            return {"exists": True, "valid": False, "error": str(exc)}
+        if not isinstance(payload, dict):
+            return {"exists": True, "valid": False, "error": "pid marker must be a JSON object"}
+        safe_payload: dict[str, object] = {"exists": True, "valid": True}
+        for key in ("pid", "argv", "started_at"):
+            if key in payload:
+                safe_payload[key] = payload[key]
+        return safe_payload
+
     def _pid_owned(self, profile_path: str, pid: int, bot_id: str) -> bool:
         try:
             payload = json.loads(self.pid_marker_path(profile_path).read_text(encoding="utf-8"))
@@ -413,8 +487,8 @@ class Supervisor:
         if argv != expected_argv:
             return False
         live_argv = self.cmdline_reader(pid)
-        if live_argv is None:
-            return True
+        if not live_argv:
+            return False
         return _cmdline_matches_expected(live_argv, expected_argv)
 
     def _expected_gateway_argv(self, bot_id: str) -> list[str]:
@@ -436,17 +510,60 @@ class Supervisor:
             time.sleep(0.1)
         return not self._pid_alive(pid)
 
+    def _poll_startup(self, process: PopenLike) -> int | None:
+        returncode = process.poll()
+        if returncode is not None or self.startup_grace_seconds <= 0:
+            return returncode
 
-def _read_linux_cmdline(pid: int) -> list[str] | None:
-    if platform.system() != "Linux":
-        return None
+        deadline = time.monotonic() + self.startup_grace_seconds
+        while time.monotonic() < deadline:
+            time.sleep(min(0.01, max(deadline - time.monotonic(), 0)))
+            returncode = process.poll()
+            if returncode is not None:
+                return returncode
+        return process.poll()
+
+
+def _read_process_cmdline(pid: int) -> list[str] | None:
+    system = platform.system()
+    if system == "Linux":
+        return _read_linux_cmdline(pid)
+    if system == "Darwin":
+        return _read_darwin_cmdline(pid)
+    return None
+
+
+def _read_linux_cmdline(pid: int, proc_root: Path = Path("/proc")) -> list[str]:
     try:
-        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+        raw = (proc_root / str(pid) / "cmdline").read_bytes()
     except FileNotFoundError:
         return []
     except OSError:
         return []
     return [part.decode("utf-8", errors="surrogateescape") for part in raw.split(b"\0") if part]
+
+
+def _read_darwin_cmdline(pid: int) -> list[str] | None:
+    try:
+        completed = subprocess.run(  # nosec B603
+            ["/bin/ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return []
+    command = completed.stdout.strip()
+    if not command:
+        return []
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return None
 
 
 def _cmdline_matches_expected(live_argv: list[str], expected_argv: list[str]) -> bool:

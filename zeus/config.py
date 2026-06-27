@@ -24,6 +24,7 @@ class Settings:
     port: int
     api_key: str | None
     allow_unauth_reads: bool
+    stop_kill_after_timeout: bool
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -39,6 +40,7 @@ class Settings:
             port=int(merged.get("ZEUS_PORT", "4311")),
             api_key=merged.get("ZEUS_API_KEY") or None,
             allow_unauth_reads=merged.get("ZEUS_ALLOW_UNAUTH_READS") == "1",
+            stop_kill_after_timeout=merged.get("ZEUS_STOP_KILL_AFTER_TIMEOUT") == "1",
         )
 
     def ensure_dirs(self) -> None:

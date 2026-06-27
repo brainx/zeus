@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.3
+
+- Added startup grace polling so gateways that exit immediately are reported as failed instead of running.
+- Rejected unknown template env keys before rendering profiles or writing files.
+- Strengthened PID ownership verification on Linux and macOS, including fail-closed handling when live command lines cannot be verified.
+- Added opt-in `ZEUS_STOP_KILL_AFTER_TIMEOUT` escalation for unattended shutdowns.
+- Hardened `scripts/stop.sh` against malformed, stale, or cross-workspace PID files.
+- Expanded API behavior coverage for authentication, malformed JSON, content length, content type, method, bot, and template error paths.
+- Added `zeus bot inspect --json` with redacted logs, profile-file presence, PID marker metadata, and live command verification status.
+- Added release artifact provenance attestations plus verification documentation.
+- Added operations runbooks for log rotation, SQLite backups, restores, and migration rollback.
+- Documented Zeus' local-process safety model and current known limitations.
+
 ## 0.1.2
 
 - Polished release validation so CI and local release checks build once, smoke-test the exact wheel artifact, verify package metadata, and checksum the same distribution files.

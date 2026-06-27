@@ -23,7 +23,12 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
     settings.ensure_dirs()
     store = StateStore(settings.database_path)
     store.init()
-    supervisor = Supervisor(store, settings.hermes_bin, settings.hermes_root)
+    supervisor = Supervisor(
+        store,
+        settings.hermes_bin,
+        settings.hermes_root,
+        kill_after_timeout=settings.stop_kill_after_timeout,
+    )
     supervisor_lock = threading.RLock()
 
     class ZeusHandler(BaseHTTPRequestHandler):
@@ -115,7 +120,13 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
         def _read_json(self) -> dict[str, Any]:
             self._require_json_content_type()
-            length = int(self.headers.get("content-length") or "0")
+            raw_length = self.headers.get("content-length") or "0"
+            try:
+                length = int(raw_length)
+            except ValueError as exc:
+                raise ValueError("content-length must be an integer") from exc
+            if length < 0:
+                raise ValueError("content-length must be non-negative")
             if length > 1_000_000:
                 raise ValueError("request body too large")
             data = self.rfile.read(length) if length else b"{}"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import cast
 
 from zeus.api import serve, template_to_dict
 from zeus.config import Settings
@@ -39,7 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--template", required=True, dest="template_id")
     create.add_argument("--name", dest="display_name")
     create.add_argument(
-        "--env", action="append", default=[], help="NAME=VALUE for rendered profile .env"
+        "--env",
+        action="append",
+        default=[],
+        help="NAME=VALUE for env keys declared by the selected template",
     )
     create.add_argument("--restart-policy", choices=["manual", "on-failure"], default="manual")
     create.add_argument("--restart-backoff-seconds", type=float, default=5.0)
@@ -53,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--json", action="store_true", dest="as_json")
     reconcile.add_argument("--force", action="store_true")
     reconcile.add_argument("--reset-restart", action="store_true")
+    inspect = bot_sub.add_parser("inspect")
+    inspect.add_argument("bot_id")
+    inspect.add_argument("--json", action="store_true", dest="as_json")
     for action in ["start", "stop", "restart", "status", "logs", "doctor"]:
         command = bot_sub.add_parser(action)
         command.add_argument("bot_id")
@@ -66,7 +73,12 @@ def _services(settings: Settings) -> tuple[StateStore, Supervisor]:
     settings.ensure_dirs()
     store = StateStore(settings.database_path)
     store.init()
-    return store, Supervisor(store, settings.hermes_bin, settings.hermes_root)
+    return store, Supervisor(
+        store,
+        settings.hermes_bin,
+        settings.hermes_root,
+        kill_after_timeout=settings.stop_kill_after_timeout,
+    )
 
 
 def _parse_env(pairs: list[str]) -> dict[str, str]:
@@ -156,6 +168,19 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"bot_id": args.bot_id, "logs": logs}, sort_keys=True))
         else:
             print(logs, end="")
+        return 0
+    if args.resource == "bot" and args.action == "inspect":
+        payload = supervisor.inspect(args.bot_id)
+        if args.as_json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            bot_payload = cast(dict[str, object], payload["bot"])
+            print(f"{bot_payload['bot_id']}\t{bot_payload['status']}\t{bot_payload['template_id']}")
+            profile_files = cast(dict[str, bool], payload["profile_files"])
+            for path, exists in profile_files.items():
+                state = "present" if exists else "missing"
+                print(f"{path}\t{state}")
+            print(f"live_cmdline_verified\t{payload['live_cmdline_verified']}")
         return 0
     if args.resource == "bot" and args.action == "doctor":
         result = supervisor.adapter.run(args.bot_id, "doctor", timeout=120)

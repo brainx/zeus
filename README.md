@@ -52,6 +52,12 @@ zeus bot create coder --template coding-bot
 zeus bot doctor coder
 ```
 
+Safety model: Zeus is a local process orchestrator, not a sandbox. Use Docker or
+another Hermes terminal backend for untrusted tasks. Do not expose the API
+directly to a network; keep it on loopback or behind a separately hardened
+access layer. Logs and audit events may contain sensitive operational data, so
+protect and rotate `$ZEUS_STATE_DIR`.
+
 Start the local API with an explicit key:
 
 ```bash
@@ -128,6 +134,7 @@ zeus bot create coder-json --template coding-bot --json
 zeus bot doctor coder
 zeus bot start coder
 zeus bot status coder
+zeus bot inspect coder --json
 zeus bot logs coder
 zeus bot logs coder --json
 zeus bot reconcile coder
@@ -236,7 +243,7 @@ The doctor validates Python support, Hermes binary availability, template validi
 
 ## Process Safety
 
-When Zeus starts a gateway, it writes a PID ownership marker under the bot profile logs directory. `zeus bot stop` sends SIGTERM only when that marker matches the expected bot, PID, and launch command. On Linux, Zeus also compares the live process command line from `/proc/<pid>/cmdline` before trusting the PID, then waits for graceful gateway shutdown so Hermes can interrupt any running background delegations.
+When Zeus starts a gateway, it writes a PID ownership marker under the bot profile logs directory. `zeus bot stop` sends SIGTERM only when that marker matches the expected bot, PID, and launch command. Zeus also compares the live process command line before trusting the PID on supported platforms, then waits for graceful gateway shutdown so Hermes can interrupt any running background delegations.
 
 Bots default to manual restart policy. Create a bot with `--restart-policy on-failure`
 plus `--restart-backoff-seconds` and `--restart-max-attempts` to let
@@ -248,6 +255,23 @@ For unattended recovery, install `systemd/zeus-reconcile.service` and
 events to `$ZEUS_STATE_DIR/logs/audit.jsonl`.
 
 The test suite includes a fake Hermes executable that exercises the real Zeus subprocess path: render profile, start gateway, verify `HERMES_HOME`, stop gateway, reap the child process, and confirm logs are captured.
+
+## Known Limitations
+
+- Startup verification confirms Zeus configuration, rendered profiles, and the
+  Hermes executable path; it does not prove every downstream tool, provider
+  credential, or bot task will succeed at runtime.
+- Zeus supervises the Hermes gateway PID. It does not contain arbitrary tools or
+  every child process that Hermes may start; use the Hermes terminal backend,
+  Docker, or OS policy for execution isolation.
+- PID command-line checks are strongest on Linux through `/proc`. Non-Linux
+  hosts still use Zeus ownership markers and process checks, but with less live
+  process introspection.
+- The API is local-first and binds to loopback by default. Direct network
+  exposure, shared multi-user administration, and internet-facing deployment are
+  outside the current safety model.
+- Pre-1.0 CLI, API, template, and state-schema compatibility may change between
+  releases. Pin versions for automation and read release notes before upgrades.
 
 ## Security Notes
 

@@ -38,8 +38,8 @@ package-index distribution.
 5. Create and push a signed tag:
 
    ```bash
-   git tag -s v0.1.2 -m "Zeus v0.1.2"
-   git push origin v0.1.2
+   git tag -s vX.Y.Z -m "Zeus vX.Y.Z"
+   git push origin vX.Y.Z
    ```
 
 6. Create the GitHub release from the tag and attach the generated `dist/*`
@@ -48,6 +48,34 @@ package-index distribution.
 ## GitHub Release Workflow
 
 `.github/workflows/release.yml` builds and checks distribution artifacts for
-`v*.*.*` tags, runs the wheel smoke test, and writes `SHA256SUMS.txt`. It
-intentionally does not publish to PyPI; release artifacts are uploaded to GitHub
-Actions for review and attachment to a GitHub release.
+`v*.*.*` tags, runs the wheel smoke test, writes `SHA256SUMS.txt`, and creates
+GitHub artifact attestations for the wheel, source distribution, and checksum
+file. It intentionally does not publish to PyPI; release artifacts are uploaded
+to GitHub Actions for review and attachment to a GitHub release.
+
+## Artifact Verification
+
+After downloading release assets into one directory, verify checksums before
+installing:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+On macOS, use:
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+Verify GitHub artifact attestations for each downloaded asset:
+
+```bash
+gh attestation verify zeus_hermes_orchestrator-X.Y.Z-py3-none-any.whl --repo brainx/zeus
+gh attestation verify zeus_hermes_orchestrator-X.Y.Z.tar.gz --repo brainx/zeus
+gh attestation verify SHA256SUMS.txt --repo brainx/zeus
+```
+
+The attestation should resolve to `.github/workflows/release.yml` on the
+matching `refs/tags/v*.*.*` tag. Treat checksum or attestation failures as a
+release-blocking provenance failure.

@@ -72,7 +72,20 @@ class FakeHermesIntegrationTests(unittest.TestCase):
             store = StateStore(root / ".zeus" / "zeus.db")
             store.init()
             store.upsert_bot(record)
-            supervisor = Supervisor(store, str(fake_hermes), hermes_root, stop_grace_seconds=2.0)
+            supervisor = Supervisor(
+                store,
+                str(fake_hermes),
+                hermes_root,
+                cmdline_reader=lambda pid: [
+                    sys.executable,
+                    str(fake_hermes),
+                    "-p",
+                    "coder",
+                    "gateway",
+                    "run",
+                ],
+                stop_grace_seconds=2.0,
+            )
 
             started = supervisor.start("coder")
             self.assertEqual(BotStatus.running, started.status)

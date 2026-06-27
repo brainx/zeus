@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from zeus.envfile import dump_env
-from zeus.models import BotCreateRequest, BotRecord, HermesTemplate
+from zeus.models import BotCreateRequest, BotRecord, HermesTemplate, TemplateError
 
 
 def _dump_yaml(value: Any, indent: int = 0) -> str:
@@ -49,6 +49,7 @@ class ProfileRenderer:
         self.hermes_root = Path(hermes_root)
 
     def render(self, request: BotCreateRequest, template: HermesTemplate) -> BotRecord:
+        validate_request_env(request, template)
         profile = self.hermes_root / "profiles" / request.bot_id
         profile.mkdir(parents=True, exist_ok=True)
         (profile / "cron").mkdir(exist_ok=True)
@@ -84,3 +85,11 @@ class ProfileRenderer:
             created_at=now,
             updated_at=now,
         )
+
+
+def validate_request_env(request: BotCreateRequest, template: HermesTemplate) -> None:
+    allowed = set(template.hermes.required_env)
+    unknown = sorted(set(request.env) - allowed)
+    if unknown:
+        names = ", ".join(unknown)
+        raise TemplateError(f"env contains unknown key(s) for template {template.id}: {names}")

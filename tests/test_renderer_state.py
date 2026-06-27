@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 
 from zeus.hermes_adapter import HermesAdapter
-from zeus.models import BotCreateRequest, BotStatus
+from zeus.models import BotCreateRequest, BotStatus, TemplateError
 from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
 from zeus.templates import TemplateStore
@@ -158,6 +158,30 @@ class RendererStateTests(unittest.TestCase):
 
             _, env = HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
             self.assertEqual(value, env["OPENROUTER_API_KEY"])
+
+    def test_renderer_rejects_unknown_env_keys_before_writing_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            template = TemplateStore().get("coding-bot")
+
+            with self.assertRaisesRegex(
+                TemplateError,
+                "env contains unknown key\\(s\\) for template coding-bot: CUSTOM_FLAG",
+            ):
+                ProfileRenderer(hermes_root).render(
+                    BotCreateRequest(
+                        bot_id="coder",
+                        template_id="coding-bot",
+                        env={
+                            "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+                            "CUSTOM_FLAG": "enabled",
+                        },
+                    ),
+                    template,
+                )
+
+            self.assertFalse((hermes_root / "profiles" / "coder").exists())
 
 
 if __name__ == "__main__":
