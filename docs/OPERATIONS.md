@@ -124,7 +124,7 @@ keep rotated files readable only by the service user and operator group.
 ```bash
 cd /opt/zeus
 sudo -u zeus git fetch --tags origin
-sudo -u zeus git checkout v0.1.3
+sudo -u zeus git checkout v0.1.4
 sudo -u zeus ./.venv/bin/python -m pip install -e .
 sudo -u zeus env PATH="/opt/zeus/.venv/bin:$PATH" sh scripts/test.sh
 sudo -u zeus env PATH="/opt/zeus/.venv/bin:$PATH" sh scripts/repo_check.sh

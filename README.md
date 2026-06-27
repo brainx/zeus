@@ -191,8 +191,8 @@ The API binds to `127.0.0.1:4311` by default. Every endpoint except `GET /health
 requires `x-zeus-api-key`. If `ZEUS_API_KEY` is not configured, non-health endpoints
 reject requests instead of running anonymously. For local-only development, set
 `ZEUS_ALLOW_UNAUTH_READS=1` to allow unauthenticated low-risk `GET` endpoints while
-keeping mutations locked behind `ZEUS_API_KEY`. Bot inspection still requires the API
-key because it returns runtime diagnostics and recent redacted logs.
+keeping mutations locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose
+runtime state or logs, including bot logs and inspection, still require the API key.
 
 The OpenAPI contract is published at [docs/openapi.json](docs/openapi.json).
 API errors return an `error.code`, `error.message`, and `error.status` object.

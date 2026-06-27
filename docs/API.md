@@ -4,7 +4,7 @@ The Zeus API is a local JSON API. It binds to `127.0.0.1:4311` by default.
 
 The machine-readable OpenAPI contract is maintained in `docs/openapi.json`.
 
-All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated low-risk `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`. `GET /bots/<bot-id>/inspect` always requires the API key because it exposes runtime diagnostics and recent redacted logs.
+All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated low-risk `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose runtime state or logs, including `GET /bots/<bot-id>/logs` and `GET /bots/<bot-id>/inspect`, always require `x-zeus-api-key`.
 
 ## Error Model
 
@@ -75,11 +75,11 @@ Returns Zeus status for a bot. If a PID is alive but the ownership marker does n
 
 ### `GET /bots/<bot-id>/logs`
 
-Returns redacted gateway logs for a bot.
+Returns redacted gateway logs for a bot. This endpoint always requires `x-zeus-api-key`.
 
 ### `GET /bots/<bot-id>/inspect`
 
-Returns the same runtime diagnostics as `zeus bot inspect <bot-id> --json`, including profile file presence, PID marker metadata, live command-line verification, and recent redacted logs. This endpoint requires `x-zeus-api-key` even when `ZEUS_ALLOW_UNAUTH_READS=1` is enabled.
+Returns the same runtime diagnostics as `zeus bot inspect <bot-id> --json`, including profile file presence, PID marker metadata, live command-line verification, and recent redacted logs. This endpoint always requires `x-zeus-api-key`.
 
 ### `POST /bots/<bot-id>/start`
 

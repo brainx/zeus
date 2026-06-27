@@ -40,8 +40,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 if path == "/health":
                     self._json(HTTPStatus.OK, {"status": "ok"})
                     return
-                inspect_path = path.startswith("/bots/") and path.endswith("/inspect")
-                self._require_key(read=not inspect_path)
+                self._require_key(read=not self._get_requires_strict_auth(path))
                 if path == "/doctor":
                     self._json(HTTPStatus.OK, run_doctor(settings).to_dict())
                 elif path == "/templates":
@@ -58,7 +57,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     with supervisor_lock:
                         logs = supervisor.logs(bot_id)
                     self._json(HTTPStatus.OK, {"bot_id": bot_id, "logs": logs})
-                elif inspect_path:
+                elif path.startswith("/bots/") and path.endswith("/inspect"):
                     bot_id = self._bot_id_from_path(path, "inspect")
                     with supervisor_lock:
                         payload = supervisor.inspect(bot_id)
@@ -179,6 +178,11 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             if len(parts) != 3 or parts[0] != "bots" or parts[2] != action:
                 raise ValueError("invalid bot route")
             return validate_id(parts[1], "bot_id")
+
+        def _get_requires_strict_auth(self, path: str) -> bool:
+            return path.startswith("/bots/") and (
+                path.endswith("/inspect") or path.endswith("/logs")
+            )
 
         def _require_key(self, *, read: bool) -> None:
             if read and settings.allow_unauth_reads:

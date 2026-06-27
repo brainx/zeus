@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4
+
+- Handled Hermes launch `OSError` failures such as missing or non-executable Hermes binaries with structured `failed` bot status instead of uncaught exceptions.
+- Added unit coverage for `FileNotFoundError` and `PermissionError` during gateway launch.
+- Added real fake-Hermes crash integration coverage for gateways that exit during startup.
+- Added authenticated `GET /bots/<bot-id>/inspect` diagnostics endpoint with redacted logs and no `.env` content exposure.
+- Required authentication for sensitive `GET /bots/<bot-id>/logs` diagnostics even when unauthenticated low-risk reads are enabled.
+- Documented diagnostic API auth behavior and updated OpenAPI contract.
+
 ## 0.1.3
 
 - Added startup grace polling so gateways that exit immediately are reported as failed instead of running.

@@ -160,7 +160,8 @@ def _check_api_auth(settings: Settings) -> DoctorCheck:
         return DoctorCheck(
             "api_auth",
             "warn",
-            "ZEUS_ALLOW_UNAUTH_READS=1 permits unauthenticated read endpoints for local dev",
+            "ZEUS_ALLOW_UNAUTH_READS=1 permits unauthenticated low-risk read endpoints "
+            "for local dev",
         )
     return DoctorCheck(
         "api_auth",

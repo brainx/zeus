@@ -60,6 +60,7 @@ class RepoContractTests(unittest.TestCase):
     def test_ci_runs_project_test_script_on_supported_python_versions(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
+        self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("3.11", workflow)
         self.assertIn("3.12", workflow)
         self.assertIn("3.13", workflow)
@@ -203,11 +204,38 @@ class RepoContractTests(unittest.TestCase):
     def test_package_version_is_single_sourced_from_zeus_init(self) -> None:
         init_text = Path("zeus/__init__.py").read_text(encoding="utf-8")
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+        changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+        openapi = Path("docs/openapi.json").read_text(encoding="utf-8")
 
-        self.assertIn('__version__ = "0.1.3"', init_text)
+        self.assertIn('__version__ = "0.1.4"', init_text)
         self.assertIn('dynamic = ["version"]', pyproject)
         self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
         self.assertNotIn('version = "0.1.3"', pyproject)
+        self.assertIn("## 0.1.4", changelog)
+        self.assertIn('"version": "0.1.4"', openapi)
+
+    def test_inspect_api_is_documented_and_secured(self) -> None:
+        api = Path("zeus/api.py").read_text(encoding="utf-8")
+        docs = Path("docs/API.md").read_text(encoding="utf-8")
+        openapi = Path("docs/openapi.json").read_text(encoding="utf-8")
+        tests = Path("tests/test_api.py").read_text(encoding="utf-8")
+
+        self.assertIn('path.endswith("/inspect")', api)
+        self.assertIn("supervisor.inspect(bot_id)", api)
+        self.assertIn("GET /bots/<bot-id>/inspect", docs)
+        self.assertIn("/bots/{bot_id}/inspect", openapi)
+        self.assertIn("test_bot_inspect_requires_key", tests)
+
+    def test_sensitive_get_diagnostics_require_auth(self) -> None:
+        api = Path("zeus/api.py").read_text(encoding="utf-8")
+        docs = Path("docs/API.md").read_text(encoding="utf-8")
+        tests = Path("tests/test_api.py").read_text(encoding="utf-8")
+
+        self.assertIn('path.endswith("/logs")', api)
+        self.assertIn('path.endswith("/inspect")', api)
+        self.assertIn("_get_requires_strict_auth", api)
+        self.assertIn("GET /bots/<bot-id>/logs", docs)
+        self.assertIn("test_bot_logs_requires_key", tests)
 
     def test_cli_exposes_restart_lifecycle_command(self) -> None:
         cli = Path("zeus/cli.py").read_text(encoding="utf-8")
@@ -311,6 +339,7 @@ class RepoContractTests(unittest.TestCase):
             "/bots",
             "/bots/{bot_id}/status",
             "/bots/{bot_id}/logs",
+            "/bots/{bot_id}/inspect",
             "/bots/{bot_id}/start",
             "/bots/{bot_id}/stop",
             "/bots/{bot_id}/restart",
@@ -335,7 +364,7 @@ class RepoContractTests(unittest.TestCase):
         cli = Path("zeus/cli.py").read_text(encoding="utf-8")
         api_docs = Path("docs/API.md").read_text(encoding="utf-8")
         openapi = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
-        lifecycle = ["start", "stop", "restart", "status", "logs", "reconcile"]
+        lifecycle = ["start", "stop", "restart", "status", "logs", "inspect", "reconcile"]
 
         for action in lifecycle:
             with self.subTest(action=action):
@@ -344,6 +373,7 @@ class RepoContractTests(unittest.TestCase):
         required_paths = [
             "/bots/{bot_id}/status",
             "/bots/{bot_id}/logs",
+            "/bots/{bot_id}/inspect",
             "/bots/{bot_id}/start",
             "/bots/{bot_id}/stop",
             "/bots/{bot_id}/restart",

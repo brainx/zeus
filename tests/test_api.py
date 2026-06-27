@@ -170,6 +170,32 @@ class ApiBehaviorTests(unittest.TestCase):
             self.assertEqual(401, status)
             self.assertEqual("invalid_api_key", body["error"]["code"])
 
+    def test_bot_logs_requires_key_even_when_unauth_reads_are_allowed(self) -> None:
+        with api_server({"ZEUS_API_KEY": "secret", "ZEUS_ALLOW_UNAUTH_READS": "1"}) as port:
+            status, body = request_json(
+                port,
+                "POST",
+                "/bots",
+                body=json_request_body({"bot_id": "coder", "template_id": "coding-bot"}),
+                headers=auth_json_headers(),
+            )
+            self.assertEqual(200, status)
+
+            status, body = request_json(port, "GET", "/bots/coder/logs")
+
+            self.assertEqual(401, status)
+            self.assertEqual("invalid_api_key", body["error"]["code"])
+
+            status, body = request_json(
+                port,
+                "GET",
+                "/bots/coder/logs",
+                headers={"x-zeus-api-key": "secret"},
+            )
+
+            self.assertEqual(200, status)
+            self.assertEqual("coder", body["bot_id"])
+
     def test_bot_inspect_returns_diagnostics_and_redacts_logs(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
             status, body = request_json(
