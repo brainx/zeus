@@ -148,6 +148,73 @@ class ApiBehaviorTests(unittest.TestCase):
             self.assertEqual(401, status)
             self.assertEqual("invalid_api_key", body["error"]["code"])
 
+    def test_bot_inspect_requires_key_even_when_unauth_reads_are_allowed(self) -> None:
+        with api_server({"ZEUS_API_KEY": "secret", "ZEUS_ALLOW_UNAUTH_READS": "1"}) as port:
+            status, body = request_json(
+                port,
+                "POST",
+                "/bots",
+                body=json_request_body(
+                    {
+                        "bot_id": "coder",
+                        "template_id": "coding-bot",
+                        "env": {"OPENROUTER_API_KEY": "env-secret"},
+                    }
+                ),
+                headers=auth_json_headers(),
+            )
+            self.assertEqual(200, status)
+
+            status, body = request_json(port, "GET", "/bots/coder/inspect")
+
+            self.assertEqual(401, status)
+            self.assertEqual("invalid_api_key", body["error"]["code"])
+
+    def test_bot_inspect_returns_diagnostics_and_redacts_logs(self) -> None:
+        with api_server({"ZEUS_API_KEY": "secret"}) as port:
+            status, body = request_json(
+                port,
+                "POST",
+                "/bots",
+                body=json_request_body(
+                    {
+                        "bot_id": "coder",
+                        "template_id": "coding-bot",
+                        "env": {"OPENROUTER_API_KEY": "env-secret"},
+                    }
+                ),
+                headers=auth_json_headers(),
+            )
+            self.assertEqual(200, status)
+            profile_path = Path(body["profile_path"])
+            log_path = profile_path / "logs" / "zeus-gateway.log"
+            log_path.write_text(
+                "OPENAI_API_KEY=log-secret\nAuthorization: Bearer bearer-secret\n",
+                encoding="utf-8",
+            )
+
+            status, body = request_json(
+                port, "GET", "/bots/coder/inspect", headers={"x-zeus-api-key": "secret"}
+            )
+
+            self.assertEqual(200, status)
+            self.assertEqual("coder", body["bot"]["bot_id"])
+            self.assertTrue(body["profile_files"]["config.yaml"])
+            self.assertTrue(body["profile_files"][".env"])
+            self.assertEqual({"exists": False}, body["pid_marker"])
+            self.assertFalse(body["live_cmdline_verified"])
+            self.assertIn("[redacted]", body["recent_logs"])
+            serialized = json.dumps(body)
+            self.assertNotIn("env-secret", serialized)
+            self.assertNotIn("log-secret", serialized)
+            self.assertNotIn("bearer-secret", serialized)
+
+            status, body = request_json(
+                port, "GET", "/bots/missing/inspect", headers={"x-zeus-api-key": "secret"}
+            )
+            self.assertEqual(404, status)
+            self.assertEqual("unknown_bot", body["error"]["code"])
+
     def test_rejects_malformed_json(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
             status, body = request_json(

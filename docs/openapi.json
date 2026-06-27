@@ -171,6 +171,37 @@
           }
         }
       },
+      "BotInspectResponse": {
+        "type": "object",
+        "required": [
+          "bot",
+          "profile_files",
+          "pid_marker",
+          "live_cmdline_verified",
+          "recent_logs"
+        ],
+        "properties": {
+          "bot": {
+            "$ref": "#/components/schemas/Bot"
+          },
+          "profile_files": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "boolean"
+            }
+          },
+          "pid_marker": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "live_cmdline_verified": {
+            "type": "boolean"
+          },
+          "recent_logs": {
+            "type": "string"
+          }
+        }
+      },
       "Template": {
         "type": "object",
         "required": ["id", "name", "description", "version", "metadata", "delegation"],
@@ -413,6 +444,53 @@
                       "type": "string"
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/inspect": {
+      "get": {
+        "summary": "Inspect bot profile and runtime diagnostics",
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bot inspection payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BotInspectResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid API key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown bot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }

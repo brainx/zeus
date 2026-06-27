@@ -43,6 +43,16 @@ class ExitedPopen(FakePopen):
     returncode = 7
 
 
+class MissingHermesPopen:
+    def __init__(self, argv, env, stdout, stderr):
+        raise FileNotFoundError("missing hermes")
+
+
+class PermissionDeniedPopen:
+    def __init__(self, argv, env, stdout, stderr):
+        raise PermissionError("permission denied")
+
+
 class SupervisorCliApiTests(unittest.TestCase):
     def _run_cli(self, argv: list[str]) -> str:
         stdout = io.StringIO()
@@ -191,6 +201,57 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual("bot.start_failed", audit[-1]["event"])
             self.assertEqual(4321, audit[-1]["pid"])
             self.assertEqual(7, audit[-1]["returncode"])
+
+    def test_supervisor_marks_start_failed_when_popen_raises_file_not_found(self) -> None:
+        self._assert_supervisor_start_oserror(MissingHermesPopen, "FileNotFoundError")
+
+    def test_supervisor_marks_start_failed_when_popen_raises_permission_error(self) -> None:
+        self._assert_supervisor_start_oserror(PermissionDeniedPopen, "PermissionError")
+
+    def _assert_supervisor_start_oserror(
+        self,
+        popen_factory: type[MissingHermesPopen] | type[PermissionDeniedPopen],
+        expected_error: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            supervisor = Supervisor(
+                store,
+                "missing-hermes",
+                root / ".zeus" / "hermes",
+                popen_factory=popen_factory,
+                startup_grace_seconds=0,
+            )
+
+            status = supervisor.start("coder")
+
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertIsNone(status.pid)
+            self.assertIn("failed to start gateway", status.message)
+            self.assertFalse(supervisor.pid_marker_path(str(profile_path)).exists())
+            self.assertNotIn("coder", supervisor._processes)
+            loaded = store.get_bot("coder")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(BotStatus.failed, loaded.status)
+            self.assertIsNone(loaded.pid)
+            audit = [
+                json.loads(line)
+                for line in store.audit_log_path().read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual("bot.start_failed", audit[-1]["event"])
+            self.assertEqual(expected_error, audit[-1]["error"])
 
     def test_supervisor_stop_waits_for_graceful_gateway_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

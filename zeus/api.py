@@ -40,7 +40,8 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                 if path == "/health":
                     self._json(HTTPStatus.OK, {"status": "ok"})
                     return
-                self._require_key(read=True)
+                inspect_path = path.startswith("/bots/") and path.endswith("/inspect")
+                self._require_key(read=not inspect_path)
                 if path == "/doctor":
                     self._json(HTTPStatus.OK, run_doctor(settings).to_dict())
                 elif path == "/templates":
@@ -57,6 +58,11 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
                     with supervisor_lock:
                         logs = supervisor.logs(bot_id)
                     self._json(HTTPStatus.OK, {"bot_id": bot_id, "logs": logs})
+                elif inspect_path:
+                    bot_id = self._bot_id_from_path(path, "inspect")
+                    with supervisor_lock:
+                        payload = supervisor.inspect(bot_id)
+                    self._json(HTTPStatus.OK, payload)
                 else:
                     self._json_error_response(HTTPStatus.NOT_FOUND, "invalid_request", "not found")
             except Exception as exc:

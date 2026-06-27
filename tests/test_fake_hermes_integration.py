@@ -108,6 +108,59 @@ class FakeHermesIntegrationTests(unittest.TestCase):
             self.assertFalse(supervisor.pid_marker_path(record.profile_path).exists())
             self.assertIn("fake gateway starting", supervisor.logs("coder"))
 
+    def test_start_reports_failed_when_real_fake_hermes_gateway_exits_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_hermes = root / "fake-hermes-crash"
+            fake_hermes.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import sys
+
+                    if sys.argv[-2:] == ["gateway", "run"]:
+                        print("fake gateway crash", flush=True)
+                        raise SystemExit(42)
+                    if sys.argv[-1] == "doctor":
+                        print("fake hermes doctor ok")
+                        raise SystemExit(0)
+                    raise SystemExit(2)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_hermes.chmod(0o755)
+
+            hermes_root = root / ".zeus" / "hermes"
+            template = TemplateStore().get("coding-bot")
+            record = ProfileRenderer(hermes_root).render(
+                BotCreateRequest(bot_id="coder", template_id="coding-bot"),
+                template,
+            )
+            store = StateStore(root / ".zeus" / "zeus.db")
+            store.init()
+            store.upsert_bot(record)
+            supervisor = Supervisor(
+                store,
+                str(fake_hermes),
+                hermes_root,
+                startup_grace_seconds=1.0,
+                stop_grace_seconds=1.0,
+            )
+
+            started = supervisor.start("coder")
+
+            self.assertEqual(BotStatus.failed, started.status)
+            self.assertIsNone(started.pid)
+            self.assertIn("exited during startup grace period", started.message)
+            self.assertFalse(supervisor.pid_marker_path(record.profile_path).exists())
+            self.assertIn("fake gateway crash", supervisor.logs("coder"))
+            loaded = store.get_bot("coder")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(BotStatus.failed, loaded.status)
+            self.assertIsNone(loaded.pid)
+
 
 if __name__ == "__main__":
     unittest.main()

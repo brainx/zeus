@@ -88,8 +88,26 @@ class Supervisor:
         argv, env = self.adapter.command(bot_id, "gateway", "run")
         log_path = self.log_path(record.profile_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("ab") as log_file:
-            process = self.popen_factory(argv, env=env, stdout=log_file, stderr=log_file)
+        try:
+            with log_path.open("ab") as log_file:
+                process = self.popen_factory(argv, env=env, stdout=log_file, stderr=log_file)
+        except OSError as exc:
+            self._remove_pid_marker(record.profile_path)
+            self._processes.pop(bot_id, None)
+            self.store.update_status(bot_id, BotStatus.failed, pid=None)
+            self.store.append_audit_event(
+                "bot.start_failed",
+                bot_id=bot_id,
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message=f"failed to start gateway: {exc}",
+            )
         self._processes[bot_id] = process
         self._write_pid_marker(record.profile_path, process.pid, argv)
         returncode = self._poll_startup(process)
