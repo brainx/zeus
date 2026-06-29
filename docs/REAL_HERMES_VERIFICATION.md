@@ -17,7 +17,10 @@ The script:
 5. Runs `hermes -p <bot-id> doctor`.
 6. Confirms the rendered config contains `max_async_children`.
 
-Gateway startup is opt-in because it can require messaging tokens and provider credentials:
+Gateway startup is opt-in. When enabled, the script starts the real Hermes
+gateway with the local `api_server` platform, binds it to loopback, passes a
+random per-run `API_SERVER_KEY`, verifies Zeus still reports the bot as running,
+and probes Hermes `/health` before stopping the bot:
 
 ```bash
 ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
@@ -31,6 +34,8 @@ ZEUS_VERIFY_TEMPLATE=research-bot
 ZEUS_VERIFY_STATE_DIR=.zeus-real-hermes-check
 ZEUS_VERIFY_GATEWAY_SECONDS=5
 ZEUS_VERIFY_API_KEY=real-hermes-local-check
+ZEUS_VERIFY_API_SERVER_HOST=127.0.0.1
+ZEUS_VERIFY_API_SERVER_PORT=4312
 ```
 
 Expected failure when Hermes is not installed:

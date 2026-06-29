@@ -97,9 +97,9 @@ zeus bot inspect coder --json
 ```
 
 Profile logs are also stored under `$ZEUS_STATE_DIR/hermes/profiles/<bot-id>/logs/`.
-`zeus bot inspect` reports bot metadata, expected profile-file presence, PID
-marker metadata, live command verification status, and redacted recent logs
-without printing `.env` contents.
+`zeus bot inspect` reports bot metadata, expected profile-file presence, safe PID
+marker metadata, live command verification status, ownership reason/classification,
+and redacted recent logs without printing `.env` contents.
 
 For the sample systemd deployment, install a logrotate policy like:
 

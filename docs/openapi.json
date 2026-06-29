@@ -178,6 +178,7 @@
           "profile_files",
           "pid_marker",
           "live_cmdline_verified",
+          "ownership",
           "recent_logs"
         ],
         "properties": {
@@ -196,6 +197,36 @@
           },
           "live_cmdline_verified": {
             "type": "boolean"
+          },
+          "ownership": {
+            "type": "object",
+            "required": ["verified", "reason", "classification", "expected"],
+            "properties": {
+              "verified": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "classification": {
+                "type": ["string", "null"]
+              },
+              "expected": {
+                "type": "object",
+                "required": ["bot_id", "component", "action"],
+                "properties": {
+                  "bot_id": {
+                    "type": "string"
+                  },
+                  "component": {
+                    "type": "string"
+                  },
+                  "action": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
           },
           "recent_logs": {
             "type": "string"

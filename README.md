@@ -173,6 +173,9 @@ That script creates an isolated `.zeus-real-hermes-check/` runtime, renders a bo
 ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
 ```
 
+The gateway check enables Hermes' local `api_server` platform on loopback,
+passes a random per-run API key, probes `/health`, and then stops the bot.
+
 For a clean Debian/Ubuntu host, use the fresh VPS harness:
 
 ```bash
