@@ -250,7 +250,15 @@ The doctor validates Python support, Hermes binary availability, template validi
 
 ## Process Safety
 
-When Zeus starts a gateway, it writes a PID ownership marker under the bot profile logs directory. `zeus bot stop` sends SIGTERM only when that marker matches the expected bot, PID, and launch command. Zeus also compares the live process command line before trusting the PID on supported platforms, then waits for graceful gateway shutdown so Hermes can interrupt any running background delegations.
+When Zeus starts a gateway, it writes a PID ownership marker under the bot profile
+logs directory. `zeus bot stop` sends SIGTERM only when that marker matches the
+expected bot, PID, and launch command. Zeus also compares the live process
+command line before trusting the PID on supported platforms. Schema-v2 markers
+include a process-start fingerprint when Zeus can read one, and Zeus rejects
+schema-v2 markers that omit or mismatch that fingerprint while keeping legacy
+markers on the compatibility path. After ownership is verified, Zeus waits for
+graceful gateway shutdown so Hermes can interrupt any running background
+delegations.
 
 Bots default to manual restart policy. Create a bot with `--restart-policy on-failure`
 plus `--restart-backoff-seconds` and `--restart-max-attempts` to let

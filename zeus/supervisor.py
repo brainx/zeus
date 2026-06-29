@@ -591,8 +591,23 @@ class Supervisor:
         )
         if not live_check.verified:
             return OwnershipCheck(False, live_check.reason, live_check.classification)
+        marker_schema = payload.get("schema")
         fingerprint = payload.get("proc_start_fingerprint")
-        if isinstance(fingerprint, str) and fingerprint:
+        if marker_schema == 2:
+            live_fingerprint = self.proc_start_fingerprint_reader(pid)
+            if live_fingerprint and not (isinstance(fingerprint, str) and fingerprint):
+                return OwnershipCheck(
+                    False,
+                    "pid-start-time-missing",
+                    live_check.classification,
+                )
+            if isinstance(fingerprint, str) and fingerprint and live_fingerprint != fingerprint:
+                return OwnershipCheck(
+                    False,
+                    "pid-start-time-mismatch",
+                    live_check.classification,
+                )
+        elif isinstance(fingerprint, str) and fingerprint:
             live_fingerprint = self.proc_start_fingerprint_reader(pid)
             if live_fingerprint != fingerprint:
                 return OwnershipCheck(

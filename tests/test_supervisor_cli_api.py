@@ -99,6 +99,37 @@ class SupervisorCliApiTests(unittest.TestCase):
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
+    def _write_schema_v2_pid_marker(
+        self,
+        supervisor: Supervisor,
+        profile_path: Path,
+        *,
+        pid: int,
+        bot_id: str,
+        argv: list[str],
+        proc_start_fingerprint: str | None = None,
+    ) -> None:
+        resolved_hermes_bin = supervisor._resolved_hermes_bin()
+        self.assertIsNotNone(resolved_hermes_bin)
+        assert resolved_hermes_bin is not None
+        marker_argv = list(argv)
+        marker_argv[0] = resolved_hermes_bin
+        payload: dict[str, object] = {
+            "schema": 2,
+            "pid": pid,
+            "bot_id": bot_id,
+            "component": "gateway",
+            "action": "run",
+            "argv": marker_argv,
+            "resolved_hermes_bin": resolved_hermes_bin,
+            "started_at": 1_780_000_000.0,
+        }
+        if proc_start_fingerprint is not None:
+            payload["proc_start_fingerprint"] = proc_start_fingerprint
+        marker_path = supervisor.pid_marker_path(str(profile_path))
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
     def test_adapter_builds_profile_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hermes_root = Path(tmp) / ".zeus" / "hermes"
@@ -1074,6 +1105,65 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual([], sent)
             self.assertEqual(BotStatus.failed, status.status)
             self.assertEqual("pid-start-time-mismatch", inspected["ownership"]["reason"])
+
+    def test_supervisor_schema_v2_process_start_fingerprint_cases_for_linux_and_darwin(
+        self,
+    ) -> None:
+        platforms = (
+            ("linux", "linux:/proc-starttime:123"),
+            ("darwin", "darwin:ps-lstart:Mon Jun 29 16:54:50 2026"),
+        )
+        marker_cases = (
+            ("present", "same", True, "ok"),
+            ("missing", None, False, "pid-start-time-missing"),
+            ("mismatch", "stale", False, "pid-start-time-mismatch"),
+        )
+        for platform_name, live_fingerprint in platforms:
+            for case_name, marker_value, expected_verified, expected_reason in marker_cases:
+                with (
+                    self.subTest(platform=platform_name, case=case_name),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = Path(tmp)
+                    hermes_bin = self._fake_hermes_path(root)
+                    profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+                    store = StateStore(root / "zeus.db")
+                    store.init()
+                    supervisor = Supervisor(
+                        store,
+                        hermes_bin,
+                        root / ".zeus" / "hermes",
+                        pid_alive_fn=lambda pid: True,
+                        cmdline_reader=lambda pid, bin_path=hermes_bin: self._gateway_argv(
+                            bin_path
+                        ),
+                        proc_start_fingerprint_reader=(
+                            lambda pid, fingerprint=live_fingerprint: fingerprint
+                        ),
+                    )
+                    if marker_value == "same":
+                        marker_fingerprint = live_fingerprint
+                    elif marker_value == "stale":
+                        marker_fingerprint = f"{live_fingerprint}:stale"
+                    else:
+                        marker_fingerprint = None
+                    self._write_schema_v2_pid_marker(
+                        supervisor,
+                        profile_path,
+                        pid=4321,
+                        bot_id="coder",
+                        argv=self._gateway_argv(hermes_bin),
+                        proc_start_fingerprint=marker_fingerprint,
+                    )
+
+                    ownership = supervisor._verify_gateway_pid_ownership(
+                        str(profile_path),
+                        4321,
+                        "coder",
+                    )
+
+                    self.assertEqual(expected_verified, ownership.verified)
+                    self.assertEqual(expected_reason, ownership.reason)
 
     def test_supervisor_status_flags_unverified_live_pid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

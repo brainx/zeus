@@ -173,6 +173,10 @@ ownership marker and the live command line on supported platforms. Hermes owns
 cleanup of any children it starts. If the gateway does not exit before the grace
 period, Zeus marks the bot failed and does not send SIGKILL by default.
 
+When Zeus can read a live process-start fingerprint, schema-v2 markers must
+include the same fingerprint before Zeus trusts the PID. Legacy markers remain a
+compatibility path and do not gain this stricter requirement.
+
 For unattended hosts where hard shutdown is acceptable after the graceful timeout,
 set:
 
