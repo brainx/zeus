@@ -27,6 +27,7 @@ from zeus.supervisor import (
     Supervisor,
     _read_darwin_process_start_fingerprint,
     _read_linux_cmdline,
+    _read_linux_process_start_fingerprint,
     _read_process_cmdline,
     _verify_gateway_command,
 )
@@ -181,6 +182,22 @@ class SupervisorCliApiTests(unittest.TestCase):
 
             self.assertEqual(["hermes", "-p", "coder", "gateway", "run"], argv)
             self.assertEqual([], _read_linux_cmdline(9999, proc_root=proc_root))
+
+    def test_linux_process_start_fingerprint_uses_proc_stat_starttime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp) / "proc"
+            pid_dir = proc_root / "4321"
+            pid_dir.mkdir(parents=True)
+            fields = ["S", *["0"] * 18, "987654321", "0"]
+            (pid_dir / "stat").write_text(
+                f"4321 (hermes gateway) {' '.join(fields)}\n",
+                encoding="utf-8",
+            )
+
+            fingerprint = _read_linux_process_start_fingerprint(4321, proc_root=proc_root)
+
+            self.assertEqual("linux:/proc-starttime:987654321", fingerprint)
+            self.assertIsNone(_read_linux_process_start_fingerprint(9999, proc_root=proc_root))
 
     def test_darwin_cmdline_reader_uses_ps_command(self) -> None:
         completed = subprocess.CompletedProcess(

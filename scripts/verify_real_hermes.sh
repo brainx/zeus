@@ -8,6 +8,8 @@ template_id="${ZEUS_VERIFY_TEMPLATE:-coding-bot}"
 state_dir="${ZEUS_VERIFY_STATE_DIR:-.zeus-real-hermes-check}"
 api_server_host="${ZEUS_VERIFY_API_SERVER_HOST:-127.0.0.1}"
 api_server_port="${ZEUS_VERIFY_API_SERVER_PORT:-4312}"
+health_timeout_seconds="${ZEUS_VERIFY_HEALTH_TIMEOUT_SECONDS:-30}"
+health_interval_seconds="${ZEUS_VERIFY_HEALTH_INTERVAL_SECONDS:-0.5}"
 
 case "$state_dir" in
   "" | "/" | "." | ".." | /* | ../* | */../*)
@@ -43,7 +45,9 @@ fi
 
 cleanup() {
   if [ -d "$state_dir" ]; then
-    ZEUS_STATE_DIR="$state_dir" python3 -B -m zeus.cli bot stop "$bot_id" >/dev/null 2>&1 || true
+    ZEUS_STATE_DIR="$state_dir" \
+      ZEUS_HERMES_BIN="$(command -v hermes 2>/dev/null || printf '%s' hermes)" \
+      python3 -B -m zeus.cli bot stop "$bot_id" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -80,17 +84,57 @@ if [ "${ZEUS_VERIFY_START_GATEWAY:-0}" = "1" ]; then
   ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
     python3 -B -m zeus.cli bot status "$bot_id" \
     | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "running"'
-  python3 - "$api_server_host" "$api_server_port" <<'PY'
+  ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
+    python3 -B -m zeus.cli bot inspect "$bot_id" --json \
+    | python3 -c '
 import json
 import sys
+
+payload = json.load(sys.stdin)
+ownership = payload["ownership"]
+assert ownership["verified"] is True, ownership
+assert ownership["reason"] == "ok", ownership
+assert ownership["classification"] in {
+    "direct-hermes",
+    "python-script-wrapper",
+    "legacy-marker-valid",
+}, ownership
+'
+  python3 - "$api_server_host" "$api_server_port" "$health_timeout_seconds" "$health_interval_seconds" <<'PY'
+import json
+import sys
+import time
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 host = sys.argv[1]
 port = int(sys.argv[2])
-with urlopen(f"http://{host}:{port}/health", timeout=5) as response:
-    body = json.loads(response.read().decode("utf-8"))
-assert body["status"] == "ok", body
-assert body["platform"] == "hermes-agent", body
+timeout_seconds = float(sys.argv[3])
+interval_seconds = float(sys.argv[4])
+if timeout_seconds <= 0:
+    raise SystemExit("health timeout must be positive")
+if interval_seconds <= 0:
+    raise SystemExit("health interval must be positive")
+
+url = f"http://{host}:{port}/health"
+deadline = time.monotonic() + timeout_seconds
+last_error = "not probed yet"
+while True:
+    try:
+        with urlopen(url, timeout=min(5.0, max(0.2, interval_seconds))) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        if body.get("status") == "ok" and body.get("platform") == "hermes-agent":
+            print(json.dumps(body, sort_keys=True))
+            break
+        last_error = f"unexpected health payload: {body!r}"
+    except (HTTPError, URLError, OSError, json.JSONDecodeError, ValueError) as exc:
+        last_error = f"{type(exc).__name__}: {exc}"
+    if time.monotonic() >= deadline:
+        raise SystemExit(
+            f"Hermes /health did not become ready within {timeout_seconds}s; "
+            f"last error: {last_error}"
+        )
+    time.sleep(interval_seconds)
 PY
   ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
     python3 -B -m zeus.cli bot stop "$bot_id" \
