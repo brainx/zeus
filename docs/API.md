@@ -79,7 +79,10 @@ Returns redacted gateway logs for a bot. This endpoint always requires `x-zeus-a
 
 ### `GET /bots/<bot-id>/inspect`
 
-Returns the same runtime diagnostics as `zeus bot inspect <bot-id> --json`, including profile file presence, PID marker metadata, live command-line verification, and recent redacted logs. This endpoint always requires `x-zeus-api-key`.
+Returns the same runtime diagnostics as `zeus bot inspect <bot-id> --json`,
+including profile file presence, safe PID marker metadata, live command-line
+verification, structured ownership diagnostics, and recent redacted logs. This
+endpoint always requires `x-zeus-api-key`.
 
 ### `POST /bots/<bot-id>/start`
 

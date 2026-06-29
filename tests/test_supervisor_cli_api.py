@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -22,17 +23,25 @@ from zeus.hermes_adapter import HermesAdapter
 from zeus.logging_utils import redact_secrets
 from zeus.models import BotRecord, BotStatus, BotStatusResponse, RestartPolicy
 from zeus.state import StateStore
-from zeus.supervisor import Supervisor, _read_linux_cmdline, _read_process_cmdline
+from zeus.supervisor import (
+    Supervisor,
+    _read_darwin_process_start_fingerprint,
+    _read_linux_cmdline,
+    _read_linux_process_start_fingerprint,
+    _read_process_cmdline,
+    _verify_gateway_command,
+)
 
 
 class FakePopen:
     returncode: int | None = None
 
-    def __init__(self, argv, env, stdout, stderr):
+    def __init__(self, argv, env, stdout, stderr, **kwargs):
         self.argv = argv
         self.env = env
         self.stdout = stdout
         self.stderr = stderr
+        self.kwargs = kwargs
         self.pid = 4321
 
     def poll(self) -> int | None:
@@ -44,12 +53,12 @@ class ExitedPopen(FakePopen):
 
 
 class MissingHermesPopen:
-    def __init__(self, argv, env, stdout, stderr):
+    def __init__(self, argv, env, stdout, stderr, **kwargs):
         raise FileNotFoundError("missing hermes")
 
 
 class PermissionDeniedPopen:
-    def __init__(self, argv, env, stdout, stderr):
+    def __init__(self, argv, env, stdout, stderr, **kwargs):
         raise PermissionError("permission denied")
 
 
@@ -59,6 +68,36 @@ class SupervisorCliApiTests(unittest.TestCase):
         with redirect_stdout(stdout):
             self.assertEqual(0, cli_main(argv))
         return stdout.getvalue()
+
+    def _fake_hermes_path(self, root: Path) -> str:
+        hermes = root / "bin" / "hermes"
+        hermes.parent.mkdir(parents=True, exist_ok=True)
+        hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+        hermes.chmod(0o755)
+        return str(hermes.resolve())
+
+    def _gateway_argv(self, hermes_bin: str, bot_id: str = "coder") -> list[str]:
+        return [hermes_bin, "-p", bot_id, "gateway", "run"]
+
+    def _write_legacy_pid_marker(
+        self,
+        supervisor: Supervisor,
+        profile_path: Path,
+        *,
+        pid: int,
+        argv: list[str],
+        proc_start_fingerprint: str | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "pid": pid,
+            "argv": argv,
+            "started_at": 1_780_000_000.0,
+        }
+        if proc_start_fingerprint:
+            payload["proc_start_fingerprint"] = proc_start_fingerprint
+        marker_path = supervisor.pid_marker_path(str(profile_path))
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
     def test_adapter_builds_profile_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,6 +183,22 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual(["hermes", "-p", "coder", "gateway", "run"], argv)
             self.assertEqual([], _read_linux_cmdline(9999, proc_root=proc_root))
 
+    def test_linux_process_start_fingerprint_uses_proc_stat_starttime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp) / "proc"
+            pid_dir = proc_root / "4321"
+            pid_dir.mkdir(parents=True)
+            fields = ["S", *["0"] * 18, "987654321", "0"]
+            (pid_dir / "stat").write_text(
+                f"4321 (hermes gateway) {' '.join(fields)}\n",
+                encoding="utf-8",
+            )
+
+            fingerprint = _read_linux_process_start_fingerprint(4321, proc_root=proc_root)
+
+            self.assertEqual("linux:/proc-starttime:987654321", fingerprint)
+            self.assertIsNone(_read_linux_process_start_fingerprint(9999, proc_root=proc_root))
+
     def test_darwin_cmdline_reader_uses_ps_command(self) -> None:
         completed = subprocess.CompletedProcess(
             args=["ps"],
@@ -160,6 +215,76 @@ class SupervisorCliApiTests(unittest.TestCase):
             ["/Applications/Hermes CLI/hermes", "-p", "coder", "gateway", "run"],
             argv,
         )
+
+    def test_darwin_process_start_fingerprint_uses_ps_lstart(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout="Mon Jun 29 16:54:50 2026\n",
+        )
+        with patch("zeus.supervisor.subprocess.run", return_value=completed):
+            fingerprint = _read_darwin_process_start_fingerprint(4321)
+
+        self.assertEqual("darwin:ps-lstart:Mon Jun 29 16:54:50 2026", fingerprint)
+
+    def test_gateway_command_classifier_accepts_and_rejects_expected_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
+            fake_hermes = root / "bin" / "fake-hermes"
+            fake_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_hermes.chmod(0o755)
+            cases = [
+                (["hermes", "-p", "coder", "gateway", "run"], True, "direct-hermes", "ok"),
+                (self._gateway_argv(hermes_bin), True, "direct-hermes", "ok"),
+                (
+                    [sys.executable, *self._gateway_argv(hermes_bin)],
+                    True,
+                    "python-script-wrapper",
+                    "ok",
+                ),
+                (
+                    [sys.executable, str(fake_hermes.resolve()), "-p", "coder", "gateway", "run"],
+                    False,
+                    "python-script-wrapper",
+                    "untrusted-executable",
+                ),
+                (
+                    [sys.executable, hermes_bin, "-p", "other", "gateway", "run"],
+                    False,
+                    "python-script-wrapper",
+                    "wrong-bot-id",
+                ),
+                (
+                    [sys.executable, hermes_bin, "-p", "coder", "doctor"],
+                    False,
+                    "python-script-wrapper",
+                    "wrong-command-intent",
+                ),
+                (
+                    ["python", "-c", "sleep", "-p", "coder", "gateway", "run"],
+                    False,
+                    "python-script-wrapper",
+                    "wrong-command-intent",
+                ),
+                (["sleep", "60"], False, "direct-hermes", "wrong-command-intent"),
+                ([hermes_bin, "gateway", "run"], False, "direct-hermes", "wrong-command-intent"),
+                (
+                    [hermes_bin, "-p", "coder", "-p", "other", "gateway", "run"],
+                    False,
+                    "direct-hermes",
+                    "wrong-command-intent",
+                ),
+            ]
+            with patch.dict(os.environ, {"PATH": str(root / "bin")}):
+                for argv, verified, classification, reason in cases:
+                    with self.subTest(argv=argv):
+                        check = _verify_gateway_command(
+                            argv, "coder", hermes_bin, require_trusted_path=True
+                        )
+                        self.assertEqual(verified, check.verified)
+                        self.assertEqual(classification, check.classification)
+                        self.assertEqual(reason, check.reason)
 
     def test_supervisor_marks_start_failed_when_gateway_exits_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,6 +326,94 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual("bot.start_failed", audit[-1]["event"])
             self.assertEqual(4321, audit[-1]["pid"])
             self.assertEqual(7, audit[-1]["returncode"])
+
+    def test_supervisor_detaches_gateway_process_on_start(self) -> None:
+        launches = []
+
+        class CapturingPopen(FakePopen):
+            def __init__(self, argv, env, stdout, stderr, **kwargs):
+                super().__init__(argv, env, stdout, stderr, **kwargs)
+                launches.append(self)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            supervisor = Supervisor(
+                store,
+                "hermes",
+                root / ".zeus" / "hermes",
+                popen_factory=CapturingPopen,
+                startup_grace_seconds=0,
+            )
+
+            status = supervisor.start("coder")
+
+            self.assertEqual(BotStatus.running, status.status)
+            self.assertEqual(1, len(launches))
+            if os.name == "posix":
+                self.assertIs(True, launches[0].kwargs.get("start_new_session"))
+            elif getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0):
+                self.assertEqual(
+                    subprocess.CREATE_NEW_PROCESS_GROUP,
+                    launches[0].kwargs.get("creationflags"),
+                )
+
+    def test_supervisor_accepts_configured_launcher_delegated_hermes_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outer = root / "bin" / "hermes"
+            inner = root / "venv" / "bin" / "hermes"
+            outer.parent.mkdir(parents=True)
+            inner.parent.mkdir(parents=True)
+            inner.write_text("#!/bin/sh\n", encoding="utf-8")
+            inner.chmod(0o755)
+            outer.write_text(f'#!/bin/sh\nexec "{inner}" "$@"\n', encoding="utf-8")
+            outer.chmod(0o755)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            supervisor = Supervisor(
+                store,
+                str(outer),
+                root / ".zeus" / "hermes",
+                popen_factory=FakePopen,
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: [
+                    sys.executable,
+                    str(inner.resolve()),
+                    "-p",
+                    "coder",
+                    "gateway",
+                    "run",
+                ],
+                startup_grace_seconds=0,
+            )
+
+            supervisor.start("coder")
+            status = supervisor.status("coder")
+            inspected = supervisor.inspect("coder")
+
+            self.assertEqual(BotStatus.running, status.status)
+            self.assertTrue(inspected["ownership"]["verified"])
+            self.assertEqual("python-script-wrapper", inspected["ownership"]["classification"])
 
     def test_supervisor_marks_start_failed_when_popen_raises_file_not_found(self) -> None:
         self._assert_supervisor_start_oserror(MissingHermesPopen, "FileNotFoundError")
@@ -256,6 +469,8 @@ class SupervisorCliApiTests(unittest.TestCase):
     def test_supervisor_stop_waits_for_graceful_gateway_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             store = StateStore(root / "zeus.db")
             store.init()
             store.upsert_bot(
@@ -263,7 +478,7 @@ class SupervisorCliApiTests(unittest.TestCase):
                     bot_id="coder",
                     template_id="coding-bot",
                     display_name="Coder",
-                    profile_path=str(root / ".zeus" / "hermes" / "profiles" / "coder"),
+                    profile_path=str(profile_path),
                     status=BotStatus.running,
                     pid=4321,
                 )
@@ -272,17 +487,18 @@ class SupervisorCliApiTests(unittest.TestCase):
             alive_checks = iter([True, False])
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: next(alive_checks, False),
-                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
                 stop_grace_seconds=0.01,
             )
             supervisor._write_pid_marker(
-                str(root / ".zeus" / "hermes" / "profiles" / "coder"),
+                str(profile_path),
                 4321,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
             status = supervisor.stop("coder")
             self.assertEqual([(4321, "SIGTERM")], sent)
@@ -301,6 +517,7 @@ class SupervisorCliApiTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             store = StateStore(root / "zeus.db")
             store.init()
@@ -317,18 +534,19 @@ class SupervisorCliApiTests(unittest.TestCase):
             sent = []
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: True,
-                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
                 stop_grace_seconds=0.01,
             )
             supervisor._processes["coder"] = AlwaysTimeoutProcess()
             supervisor._write_pid_marker(
                 str(profile_path),
                 4321,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
 
             status = supervisor.stop("coder")
@@ -355,6 +573,7 @@ class SupervisorCliApiTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             store = StateStore(root / "zeus.db")
             store.init()
@@ -371,11 +590,11 @@ class SupervisorCliApiTests(unittest.TestCase):
             sent = []
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: True,
-                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
                 stop_grace_seconds=0.01,
                 kill_after_timeout=True,
             )
@@ -383,7 +602,8 @@ class SupervisorCliApiTests(unittest.TestCase):
             supervisor._write_pid_marker(
                 str(profile_path),
                 4321,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
 
             status = supervisor.stop("coder")
@@ -402,6 +622,7 @@ class SupervisorCliApiTests(unittest.TestCase):
     def test_supervisor_restart_stops_then_starts_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             store = StateStore(root / "zeus.db")
             store.init()
@@ -419,18 +640,19 @@ class SupervisorCliApiTests(unittest.TestCase):
             alive_checks = iter([True, False])
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 popen_factory=FakePopen,
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: next(alive_checks, False),
-                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
                 stop_grace_seconds=0.01,
             )
             supervisor._write_pid_marker(
                 str(profile_path),
                 4321,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
 
             status = supervisor.restart("coder")
@@ -506,6 +728,7 @@ class SupervisorCliApiTests(unittest.TestCase):
     def test_supervisor_refuses_pid_marker_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             store = StateStore(root / "zeus.db")
             store.init()
@@ -522,17 +745,18 @@ class SupervisorCliApiTests(unittest.TestCase):
             sent = []
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: True,
-                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
                 stop_grace_seconds=0.01,
             )
             supervisor._write_pid_marker(
                 str(profile_path),
                 9999,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
 
             status = supervisor.stop("coder")
@@ -544,6 +768,7 @@ class SupervisorCliApiTests(unittest.TestCase):
     def test_supervisor_refuses_marker_when_live_command_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             store = StateStore(root / "zeus.db")
             store.init()
@@ -560,7 +785,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             sent = []
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: True,
@@ -570,7 +795,8 @@ class SupervisorCliApiTests(unittest.TestCase):
             supervisor._write_pid_marker(
                 str(profile_path),
                 4321,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
 
             status = supervisor.stop("coder")
@@ -582,6 +808,7 @@ class SupervisorCliApiTests(unittest.TestCase):
     def test_supervisor_refuses_live_command_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             store = StateStore(root / "zeus.db")
             store.init()
@@ -598,7 +825,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             sent = []
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
                 pid_alive_fn=lambda pid: True,
@@ -608,7 +835,8 @@ class SupervisorCliApiTests(unittest.TestCase):
             supervisor._write_pid_marker(
                 str(profile_path),
                 4321,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
 
             status = supervisor.stop("coder")
@@ -616,6 +844,236 @@ class SupervisorCliApiTests(unittest.TestCase):
             self.assertEqual([], sent)
             self.assertEqual(BotStatus.failed, status.status)
             self.assertIn("ownership", status.message)
+
+    def test_supervisor_accepts_schema_v2_python_wrapper_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            alive_checks = iter([True, False])
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                root / ".zeus" / "hermes",
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: next(alive_checks, False),
+                cmdline_reader=lambda pid: [sys.executable, *self._gateway_argv(hermes_bin)],
+                stop_grace_seconds=0.01,
+            )
+            supervisor._write_pid_marker(
+                str(profile_path),
+                4321,
+                "coder",
+                self._gateway_argv(hermes_bin),
+            )
+
+            status = supervisor.stop("coder")
+
+            self.assertEqual([(4321, "SIGTERM")], sent)
+            self.assertEqual(BotStatus.stopped, status.status)
+
+    def test_supervisor_rejects_python_wrapper_with_untrusted_script_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
+            fake_hermes = root / "bin" / "fake-hermes"
+            fake_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_hermes.chmod(0o755)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                root / ".zeus" / "hermes",
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: [
+                    sys.executable,
+                    str(fake_hermes.resolve()),
+                    "-p",
+                    "coder",
+                    "gateway",
+                    "run",
+                ],
+                stop_grace_seconds=0.01,
+            )
+            supervisor._write_pid_marker(
+                str(profile_path),
+                4321,
+                "coder",
+                self._gateway_argv(hermes_bin),
+            )
+
+            status = supervisor.stop("coder")
+            inspected = supervisor.inspect("coder")
+
+            self.assertEqual([], sent)
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertEqual("untrusted-executable", inspected["ownership"]["reason"])
+            self.assertEqual("python-script-wrapper", inspected["ownership"]["classification"])
+
+    def test_supervisor_accepts_strict_legacy_marker_with_python_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            alive_checks = iter([True, False])
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                root / ".zeus" / "hermes",
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: next(alive_checks, False),
+                cmdline_reader=lambda pid: [sys.executable, *self._gateway_argv(hermes_bin)],
+                stop_grace_seconds=0.01,
+            )
+            self._write_legacy_pid_marker(
+                supervisor,
+                profile_path,
+                pid=4321,
+                argv=["hermes", "-p", "coder", "gateway", "run"],
+            )
+
+            status = supervisor.stop("coder")
+
+            self.assertEqual([(4321, "SIGTERM")], sent)
+            self.assertEqual(BotStatus.stopped, status.status)
+
+    def test_supervisor_rejects_legacy_marker_with_wrong_live_script_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
+            fake_hermes = root / "bin" / "fake-hermes"
+            fake_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_hermes.chmod(0o755)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            sent = []
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                root / ".zeus" / "hermes",
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: [
+                    sys.executable,
+                    str(fake_hermes.resolve()),
+                    "-p",
+                    "coder",
+                    "gateway",
+                    "run",
+                ],
+                stop_grace_seconds=0.01,
+            )
+            self._write_legacy_pid_marker(
+                supervisor,
+                profile_path,
+                pid=4321,
+                argv=["hermes", "-p", "coder", "gateway", "run"],
+            )
+
+            status = supervisor.stop("coder")
+
+            self.assertEqual([], sent)
+            self.assertEqual(BotStatus.failed, status.status)
+
+    def test_supervisor_rejects_schema_v2_process_start_fingerprint_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                    status=BotStatus.running,
+                    pid=4321,
+                )
+            )
+            fingerprints = ["linux:/proc-starttime:123"]
+
+            def read_fingerprint(pid: int) -> str:
+                if fingerprints:
+                    return fingerprints.pop(0)
+                return "linux:/proc-starttime:456"
+
+            sent = []
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                root / ".zeus" / "hermes",
+                kill_fn=lambda pid, sig: sent.append((pid, sig.name)),
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
+                stop_grace_seconds=0.01,
+                proc_start_fingerprint_reader=read_fingerprint,
+            )
+            supervisor._write_pid_marker(
+                str(profile_path),
+                4321,
+                "coder",
+                self._gateway_argv(hermes_bin),
+            )
+
+            status = supervisor.stop("coder")
+            inspected = supervisor.inspect("coder")
+
+            self.assertEqual([], sent)
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertEqual("pid-start-time-mismatch", inspected["ownership"]["reason"])
 
     def test_supervisor_status_flags_unverified_live_pid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -987,6 +1445,7 @@ password = "plain-password"
     def test_supervisor_inspect_reports_metadata_without_env_contents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             (profile_path / "cron").mkdir(parents=True)
             (profile_path / "logs").mkdir()
@@ -1015,15 +1474,16 @@ password = "plain-password"
             )
             supervisor = Supervisor(
                 store,
-                "hermes",
+                hermes_bin,
                 root / ".zeus" / "hermes",
                 pid_alive_fn=lambda pid: True,
-                cmdline_reader=lambda pid: ["hermes", "-p", "coder", "gateway", "run"],
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
             )
             supervisor._write_pid_marker(
                 str(profile_path),
                 4321,
-                ["hermes", "-p", "coder", "gateway", "run"],
+                "coder",
+                self._gateway_argv(hermes_bin),
             )
 
             inspected = supervisor.inspect("coder")
@@ -1033,12 +1493,19 @@ password = "plain-password"
             self.assertTrue(inspected["profile_files"]["cron/jobs.json"])
             self.assertTrue(inspected["pid_marker"]["exists"])
             self.assertTrue(inspected["pid_marker"]["valid"])
+            self.assertEqual(
+                "direct-hermes hermes -p <bot> gateway run", inspected["pid_marker"]["argv_shape"]
+            )
             self.assertTrue(inspected["live_cmdline_verified"])
+            self.assertEqual(True, inspected["ownership"]["verified"])
+            self.assertEqual("ok", inspected["ownership"]["reason"])
+            self.assertEqual("direct-hermes", inspected["ownership"]["classification"])
             self.assertIn("ready", inspected["recent_logs"])
             serialized = json.dumps(inspected)
             self.assertNotIn("plain-secret", serialized)
             self.assertNotIn("plain-log-secret", serialized)
             self.assertNotIn("OPENROUTER_API_KEY", serialized)
+            self.assertNotIn(hermes_bin, serialized)
 
     def test_settings_parses_stop_kill_after_timeout_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

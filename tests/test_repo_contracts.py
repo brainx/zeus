@@ -168,6 +168,15 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("max_async_children", script)
         self.assertIn("ZEUS_VERIFY_START_GATEWAY", script)
         self.assertIn("ZEUS_VERIFY_API_KEY", script)
+        self.assertIn("ZEUS_VERIFY_API_SERVER_PORT", script)
+        self.assertIn("ZEUS_VERIFY_HEALTH_TIMEOUT_SECONDS", script)
+        self.assertIn("ZEUS_VERIFY_HEALTH_INTERVAL_SECONDS", script)
+        self.assertIn("API_SERVER_ENABLED", script)
+        self.assertIn("ZEUS_ENV_PASSTHROUGH", script)
+        self.assertIn("bot inspect", script)
+        self.assertIn("/health", script)
+        self.assertIn("time.monotonic", script)
+        self.assertIn("Hermes /health did not become ready", script)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")

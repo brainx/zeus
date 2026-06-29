@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shlex
+import shutil
 import signal
 import subprocess  # nosec B404
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -29,6 +31,31 @@ PopenFactory = Callable[..., PopenLike]
 KillFn = Callable[[int, signal.Signals], None]
 PidAliveFn = Callable[[int], bool]
 CmdlineReader = Callable[[int], list[str] | None]
+ProcStartFingerprintReader = Callable[[int], str | None]
+
+
+@dataclass(frozen=True)
+class OwnershipCheck:
+    verified: bool
+    reason: str
+    classification: str | None = None
+
+
+@dataclass(frozen=True)
+class _CommandCheck:
+    verified: bool
+    reason: str
+    classification: str | None = None
+
+
+_PYTHON_INTERPRETER_RE = re.compile(r"^python(?:\d+(?:\.\d+)?)?$")
+
+
+def _gateway_process_launch_kwargs() -> dict[str, object]:
+    if os.name == "posix":
+        return {"start_new_session": True}
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return {"creationflags": creationflags} if creationflags else {}
 
 
 class Supervisor:
@@ -45,6 +72,7 @@ class Supervisor:
         stop_grace_seconds: float = 15.0,
         kill_after_timeout: bool = False,
         restart_backoff_cap_seconds: float = 3600.0,
+        proc_start_fingerprint_reader: ProcStartFingerprintReader | None = None,
     ) -> None:
         self.store = store
         self.adapter = HermesAdapter(hermes_bin=hermes_bin, hermes_root=hermes_root)
@@ -56,6 +84,9 @@ class Supervisor:
         self.stop_grace_seconds = stop_grace_seconds
         self.kill_after_timeout = kill_after_timeout
         self.restart_backoff_cap_seconds = restart_backoff_cap_seconds
+        self.proc_start_fingerprint_reader = (
+            proc_start_fingerprint_reader or _read_process_start_fingerprint
+        )
         self._processes: dict[str, PopenLike] = {}
 
     def start(self, bot_id: str) -> BotStatusResponse:
@@ -90,7 +121,13 @@ class Supervisor:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with log_path.open("ab") as log_file:
-                process = self.popen_factory(argv, env=env, stdout=log_file, stderr=log_file)
+                process = self.popen_factory(
+                    argv,
+                    env=env,
+                    stdout=log_file,
+                    stderr=log_file,
+                    **_gateway_process_launch_kwargs(),
+                )
         except OSError as exc:
             self._remove_pid_marker(record.profile_path)
             self._processes.pop(bot_id, None)
@@ -109,7 +146,7 @@ class Supervisor:
                 message=f"failed to start gateway: {exc}",
             )
         self._processes[bot_id] = process
-        self._write_pid_marker(record.profile_path, process.pid, argv)
+        self._write_pid_marker(record.profile_path, process.pid, bot_id, argv)
         returncode = self._poll_startup(process)
         if returncode is not None:
             self._remove_pid_marker(record.profile_path)
@@ -418,9 +455,9 @@ class Supervisor:
         record = self._require_bot(bot_id)
         profile_path = Path(record.profile_path)
         marker = self._read_pid_marker(record.profile_path)
-        live_cmdline_verified = False
+        ownership = OwnershipCheck(False, "not-running")
         if record.pid and self._pid_alive(record.pid):
-            live_cmdline_verified = self._pid_owned(record.profile_path, record.pid, bot_id)
+            ownership = self._verify_gateway_pid_ownership(record.profile_path, record.pid, bot_id)
         return {
             "bot": record.to_dict(),
             "profile_files": {
@@ -431,7 +468,17 @@ class Supervisor:
                 "cron/jobs.json": (profile_path / "cron" / "jobs.json").is_file(),
             },
             "pid_marker": marker,
-            "live_cmdline_verified": live_cmdline_verified,
+            "live_cmdline_verified": ownership.verified,
+            "ownership": {
+                "verified": ownership.verified,
+                "reason": ownership.reason,
+                "classification": ownership.classification,
+                "expected": {
+                    "bot_id": bot_id,
+                    "component": "gateway",
+                    "action": "run",
+                },
+            },
             "recent_logs": tail_file(self.log_path(record.profile_path), max_bytes=max_log_bytes),
         }
 
@@ -456,14 +503,26 @@ class Supervisor:
             return False
         return True
 
-    def _write_pid_marker(self, profile_path: str, pid: int, argv: list[str]) -> None:
+    def _write_pid_marker(self, profile_path: str, pid: int, bot_id: str, argv: list[str]) -> None:
         path = self.pid_marker_path(profile_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_hermes_bin = self._resolved_hermes_bin()
+        marker_argv = list(argv)
+        if resolved_hermes_bin:
+            marker_argv[0] = resolved_hermes_bin
+        fingerprint = self.proc_start_fingerprint_reader(pid)
         payload = {
+            "schema": 2,
             "pid": pid,
-            "argv": argv,
+            "bot_id": bot_id,
+            "component": "gateway",
+            "action": "run",
+            "argv": marker_argv,
+            "resolved_hermes_bin": resolved_hermes_bin,
             "started_at": time.time(),
         }
+        if fingerprint:
+            payload["proc_start_fingerprint"] = fingerprint
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
     def _remove_pid_marker(self, profile_path: str) -> None:
@@ -483,34 +542,106 @@ class Supervisor:
         if not isinstance(payload, dict):
             return {"exists": True, "valid": False, "error": "pid marker must be a JSON object"}
         safe_payload: dict[str, object] = {"exists": True, "valid": True}
-        for key in ("pid", "argv", "started_at"):
+        for key in (
+            "schema",
+            "pid",
+            "bot_id",
+            "component",
+            "action",
+            "started_at",
+            "proc_start_fingerprint",
+        ):
             if key in payload:
                 safe_payload[key] = payload[key]
+        argv_value = payload.get("argv")
+        if isinstance(argv_value, list) and all(isinstance(part, str) for part in argv_value):
+            safe_payload["argv_shape"] = _safe_command_shape(argv_value)
         return safe_payload
 
     def _pid_owned(self, profile_path: str, pid: int, bot_id: str) -> bool:
+        return self._verify_gateway_pid_ownership(profile_path, pid, bot_id).verified
+
+    def _verify_gateway_pid_ownership(
+        self, profile_path: str, pid: int, bot_id: str
+    ) -> OwnershipCheck:
         try:
             payload = json.loads(self.pid_marker_path(profile_path).read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return False
+            return OwnershipCheck(False, "marker-missing")
+        if not isinstance(payload, dict):
+            return OwnershipCheck(False, "marker-mismatch")
         if payload.get("pid") != pid:
-            return False
+            return OwnershipCheck(False, "marker-mismatch")
         argv_value = payload.get("argv")
         if not isinstance(argv_value, list) or not all(
             isinstance(part, str) for part in argv_value
         ):
-            return False
-        argv = list(argv_value)
-        expected_argv = self._expected_gateway_argv(bot_id)
-        if argv != expected_argv:
-            return False
+            return OwnershipCheck(False, "marker-mismatch")
+        trusted_hermes = self._resolved_hermes_bin()
+        if trusted_hermes is None:
+            return OwnershipCheck(False, "untrusted-executable")
+        marker_check = self._verify_marker_payload(payload, list(argv_value), bot_id)
+        if not marker_check.verified:
+            return OwnershipCheck(False, marker_check.reason, marker_check.classification)
         live_argv = self.cmdline_reader(pid)
         if not live_argv:
-            return False
-        return _cmdline_matches_expected(live_argv, expected_argv)
+            return OwnershipCheck(False, "live-cmdline-missing")
+        live_check = _verify_gateway_command(
+            live_argv, bot_id, self._trusted_hermes_bins(), require_trusted_path=True
+        )
+        if not live_check.verified:
+            return OwnershipCheck(False, live_check.reason, live_check.classification)
+        fingerprint = payload.get("proc_start_fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            live_fingerprint = self.proc_start_fingerprint_reader(pid)
+            if live_fingerprint != fingerprint:
+                return OwnershipCheck(
+                    False,
+                    "pid-start-time-mismatch",
+                    live_check.classification,
+                )
+        classification = (
+            "legacy-marker-valid"
+            if marker_check.classification == "legacy-marker-valid"
+            else live_check.classification
+        )
+        return OwnershipCheck(True, "ok", classification)
 
-    def _expected_gateway_argv(self, bot_id: str) -> list[str]:
-        return [self.adapter.hermes_bin, "-p", bot_id, "gateway", "run"]
+    def _verify_marker_payload(
+        self, payload: dict[str, object], argv: list[str], bot_id: str
+    ) -> OwnershipCheck:
+        schema = payload.get("schema")
+        if schema == 2:
+            if payload.get("bot_id") != bot_id:
+                return OwnershipCheck(False, "wrong-bot-id")
+            if payload.get("component") != "gateway" or payload.get("action") != "run":
+                return OwnershipCheck(False, "wrong-command-intent")
+            resolved_hermes_bin = self._resolved_hermes_bin()
+            if not isinstance(payload.get("resolved_hermes_bin"), str):
+                return OwnershipCheck(False, "untrusted-executable")
+            marker_hermes = _resolve_executable(str(payload["resolved_hermes_bin"]))
+            if marker_hermes != resolved_hermes_bin:
+                return OwnershipCheck(False, "untrusted-executable")
+            marker_check = _verify_gateway_command(
+                argv, bot_id, resolved_hermes_bin, require_trusted_path=True
+            )
+            return OwnershipCheck(
+                marker_check.verified,
+                marker_check.reason,
+                marker_check.classification,
+            )
+        if schema is not None:
+            return OwnershipCheck(False, "marker-mismatch")
+        marker_check = _verify_gateway_command(argv, bot_id, None, require_trusted_path=False)
+        if not marker_check.verified:
+            return OwnershipCheck(False, marker_check.reason, marker_check.classification)
+        return OwnershipCheck(True, "ok", "legacy-marker-valid")
+
+    def _resolved_hermes_bin(self) -> str | None:
+        return _resolve_executable(self.adapter.hermes_bin)
+
+    def _trusted_hermes_bins(self) -> set[str]:
+        return _trusted_hermes_paths(self.adapter.hermes_bin)
 
     def _wait_for_exit(self, bot_id: str, pid: int) -> bool:
         process = self._processes.get(bot_id)
@@ -584,7 +715,142 @@ def _read_darwin_cmdline(pid: int) -> list[str] | None:
         return None
 
 
-def _cmdline_matches_expected(live_argv: list[str], expected_argv: list[str]) -> bool:
-    if live_argv == expected_argv:
-        return True
-    return len(live_argv) == len(expected_argv) + 1 and live_argv[1:] == expected_argv
+def _read_process_start_fingerprint(pid: int) -> str | None:
+    system = platform.system()
+    if system == "Darwin":
+        return _read_darwin_process_start_fingerprint(pid)
+    if system != "Linux":
+        return None
+    return _read_linux_process_start_fingerprint(pid)
+
+
+def _read_darwin_process_start_fingerprint(pid: int) -> str | None:
+    try:
+        completed = subprocess.run(  # nosec B603
+            ["/bin/ps", "-p", str(pid), "-o", "lstart="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    started = " ".join(completed.stdout.split())
+    return f"darwin:ps-lstart:{started}" if started else None
+
+
+def _read_linux_process_start_fingerprint(pid: int, proc_root: Path = Path("/proc")) -> str | None:
+    try:
+        stat = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return None
+    try:
+        fields = stat.rsplit(") ", 1)[1].split()
+    except IndexError:
+        return None
+    if len(fields) < 20:
+        return None
+    return f"linux:/proc-starttime:{fields[19]}"
+
+
+def _verify_gateway_command(
+    argv: list[str],
+    bot_id: str,
+    trusted_hermes_bin: str | set[str] | None,
+    *,
+    require_trusted_path: bool,
+) -> _CommandCheck:
+    if not argv:
+        return _CommandCheck(False, "live-cmdline-missing")
+    classification = "direct-hermes"
+    hermes_command = argv[0]
+    args = argv[1:]
+    if len(argv) >= 2 and _looks_like_python_interpreter(argv[0]):
+        classification = "python-script-wrapper"
+        hermes_command = argv[1]
+        args = argv[2:]
+    if len(args) != 4 or args.count("-p") != 1 or args[0] != "-p":
+        return _CommandCheck(False, "wrong-command-intent", classification)
+    if args[1] != bot_id:
+        return _CommandCheck(False, "wrong-bot-id", classification)
+    if args[2:] != ["gateway", "run"]:
+        return _CommandCheck(False, "wrong-command-intent", classification)
+    if require_trusted_path:
+        resolved_command = _resolve_executable(hermes_command)
+        if isinstance(trusted_hermes_bin, str):
+            trusted_hermes_bins = {trusted_hermes_bin}
+        else:
+            trusted_hermes_bins = trusted_hermes_bin or set()
+        if not trusted_hermes_bins or resolved_command not in trusted_hermes_bins:
+            return _CommandCheck(False, "untrusted-executable", classification)
+    return _CommandCheck(True, "ok", classification)
+
+
+def _looks_like_python_interpreter(command: str) -> bool:
+    return bool(_PYTHON_INTERPRETER_RE.fullmatch(Path(command).name.lower()))
+
+
+def _resolve_executable(command: str, path: str | None = None) -> str | None:
+    if not command:
+        return None
+    candidate = command if "/" in command else shutil.which(command, path=path)
+    if candidate is None:
+        return None
+    try:
+        return str(Path(candidate).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return str(Path(candidate).expanduser().absolute())
+
+
+def _trusted_hermes_paths(command: str) -> set[str]:
+    resolved = _resolve_executable(command)
+    if resolved is None:
+        return set()
+    paths = {resolved}
+    delegated = _resolve_launcher_exec_target(resolved)
+    if delegated is not None:
+        paths.add(delegated)
+    return paths
+
+
+def _resolve_launcher_exec_target(command: str) -> str | None:
+    path = Path(command)
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith("#!"):
+        return None
+    for line in text.splitlines()[1:20]:
+        stripped = line.strip()
+        if not stripped.startswith("exec "):
+            continue
+        try:
+            parts = shlex.split(stripped)
+        except ValueError:
+            continue
+        if len(parts) < 2 or parts[0] != "exec":
+            continue
+        target = parts[1]
+        if "/" not in target:
+            continue
+        resolved = _resolve_executable(target)
+        if resolved and Path(resolved).name == "hermes":
+            return resolved
+    return None
+
+
+def _safe_command_shape(argv: list[str]) -> str:
+    if not argv:
+        return "empty"
+    classification = "direct-hermes"
+    args = argv[1:]
+    if len(argv) >= 2 and _looks_like_python_interpreter(argv[0]):
+        classification = "python-script-wrapper"
+        args = argv[2:]
+    if len(args) == 4 and args[0] == "-p" and args[2:] == ["gateway", "run"]:
+        return f"{classification} hermes -p <bot> gateway run"
+    return f"{classification} unrecognized"
