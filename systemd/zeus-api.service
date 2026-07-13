@@ -1,0 +1,31 @@
+# Zeus Hermes Orchestrator
+# Maintained by BrainX: https://github.com/brainx
+[Unit]
+Description=Zeus Hermes Orchestrator API
+Documentation=https://github.com/brainx/zeus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zeus
+Group=zeus
+WorkingDirectory=/opt/zeus
+EnvironmentFile=/etc/zeus/zeus.env
+Environment=ZEUS_HOST=127.0.0.1
+Environment=ZEUS_PORT=4311
+Environment=ZEUS_STATE_DIR=/var/lib/zeus
+ExecStart=/opt/zeus/.venv/bin/python -m zeus.api
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zeus
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

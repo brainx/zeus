@@ -1,0 +1,38 @@
+id = "support-gateway"
+name = "Support Gateway"
+description = "Messaging-first support bot with conservative tool access."
+version = "0.1.0"
+soul = """
+You are a support Hermes agent. Ask concise clarifying questions when needed, avoid exposing internal details, and escalate when a request touches billing, identity, safety, or privileged systems.
+"""
+
+[hermes]
+required_env = ["OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN"]
+
+[hermes.model]
+provider = "openrouter"
+default = "anthropic/claude-sonnet-4"
+
+[hermes.terminal]
+backend = "docker"
+cwd = "."
+home_mode = "profile"
+timeout = 180
+docker_image = "nikolaik/python-nodejs:python3.11-nodejs20"
+docker_mount_cwd_to_workspace = false
+
+[hermes.gateway]
+enabled = true
+
+[hermes.delegation]
+max_iterations = 40
+max_concurrent_children = 2
+max_async_children = 2
+child_timeout_seconds = 0
+subagent_auto_approve = false
+
+[metadata]
+use_case = "Messaging-first support intake with conservative escalation"
+risk_level = "medium"
+recommended_restart_policy = "manual"
+tags = ["support", "messaging"]

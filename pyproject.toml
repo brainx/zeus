@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zeus-hermes-orchestrator"
+dynamic = ["version"]
+description = "Workspace-local orchestrator for many Hermes Agent bots"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "BrainX" },
+]
+maintainers = [
+  { name = "BrainX" },
+]
+keywords = ["hermes-agent", "orchestration", "agents", "automation", "bots"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/brainx/zeus"
+Repository = "https://github.com/brainx/zeus"
+Documentation = "https://github.com/brainx/zeus/tree/main/docs"
+Issues = "https://github.com/brainx/zeus/issues"
+Changelog = "https://github.com/brainx/zeus/blob/main/CHANGELOG.md"
+Maintainer = "https://github.com/brainx"
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.0",
+  "mypy>=1.11.0",
+  "bandit>=1.7.9",
+  "build>=1.2.1",
+  "coverage>=7.0.0",
+  "twine>=5.1.1",
+  "pytest>=8.3.0",
+]
+
+[project.scripts]
+zeus = "zeus.cli:main"
+zeus-fake-hermes = "zeus.demo.fake_hermes:main"
+
+[tool.setuptools.packages.find]
+include = ["zeus*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "zeus.__version__"}
+
+[tool.setuptools.package-data]
+"zeus.bundled_templates" = ["*.toml"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_unreachable = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]

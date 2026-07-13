@@ -1,0 +1,137 @@
+#!/bin/sh
+# Zeus Hermes Orchestrator
+# Maintained by BrainX: https://github.com/brainx
+set -eu
+
+tmp_dir=".tmp/repo-check"
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT INT TERM
+mkdir -p "$tmp_dir"
+
+required_files="
+README.md
+LICENSE
+CREDITS.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+CHANGELOG.md
+pyproject.toml
+.coveragerc
+.env.example
+.gitignore
+.github/workflows/ci.yml
+.github/workflows/release.yml
+.github/ISSUE_TEMPLATE/bug_report.yml
+.github/ISSUE_TEMPLATE/feature_request.yml
+.github/ISSUE_TEMPLATE/config.yml
+.github/pull_request_template.md
+docs/ARCHITECTURE.md
+docs/API.md
+docs/TEMPLATE_AUTHORING.md
+docs/REAL_HERMES_VERIFICATION.md
+docs/FRESH_VPS_TEST.md
+docs/SYSTEMD.md
+docs/OPERATIONS.md
+docs/RECONCILE.md
+docs/RELEASE.md
+docs/openapi.json
+docs/ROADMAP.md
+docs/assets/demo.cast
+docs/assets/zeus-hero.png
+systemd/zeus-api.service
+systemd/zeus-reconcile.service
+systemd/zeus-reconcile.timer
+scripts/test.sh
+scripts/check_version_tag.py
+scripts/wheel_smoke.sh
+scripts/generate_checksums.sh
+scripts/verify_real_hermes.sh
+scripts/fresh_vps_verify.sh
+templates/coding-bot.toml
+templates/deepseek-coding-bot.toml
+templates/docs-writer-bot.toml
+templates/gateway-operator.toml
+templates/log-triage-bot.toml
+templates/research-bot.toml
+templates/support-gateway.toml
+zeus/bundled_templates/__init__.py
+zeus/bundled_templates/coding-bot.toml
+zeus/bundled_templates/deepseek-coding-bot.toml
+zeus/bundled_templates/docs-writer-bot.toml
+zeus/bundled_templates/gateway-operator.toml
+zeus/bundled_templates/log-triage-bot.toml
+zeus/bundled_templates/research-bot.toml
+zeus/bundled_templates/support-gateway.toml
+"
+
+for file in $required_files; do
+  if [ ! -f "$file" ]; then
+    echo "missing required repository file: $file" >&2
+    exit 1
+  fi
+done
+
+for internal_path in docs/superpowers .superpowers; do
+  if [ -e "$internal_path" ]; then
+    echo "internal planning path must not be published: $internal_path" >&2
+    exit 1
+  fi
+done
+
+python3 -B -m zeus.cli template list >/dev/null
+ZEUS_STATE_DIR="$tmp_dir/state" python3 -B -m zeus.cli doctor --json >/dev/null
+
+python3 -B - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+paths = [
+    Path("README.md"),
+    Path("CREDITS.md"),
+    Path("CONTRIBUTING.md"),
+    Path("CODE_OF_CONDUCT.md"),
+    Path("SECURITY.md"),
+    Path("CHANGELOG.md"),
+    Path("pyproject.toml"),
+    Path(".coveragerc"),
+    Path(".env.example"),
+    Path(".gitignore"),
+    Path("docs"),
+    Path("systemd"),
+    Path("scripts"),
+    Path("templates"),
+    Path("tests"),
+    Path("zeus"),
+]
+
+patterns = [
+    re.compile(r"(?<![A-Za-z])sk-[A-Za-z0-9]"),
+    re.compile(r"xoxb-[A-Za-z0-9]"),
+    re.compile(r"TELEGRAM_BOT_TOKEN=[A-Za-z0-9:_-]{8,}"),
+    re.compile("/" + "Users/"),
+    re.compile(r"TO[D]O|TB[D]"),
+]
+
+failures = []
+for path in paths:
+    files = [path] if path.is_file() else sorted(path.rglob("*"))
+    for file in files:
+        if not file.is_file():
+            continue
+        if "__pycache__" in file.parts or file.suffix in {".pyc", ".pyo"}:
+            continue
+        text = file.read_text(encoding="utf-8", errors="ignore")
+        for pattern in patterns:
+            if pattern.search(text):
+                failures.append(f"{file}: matched {pattern.pattern}")
+
+if failures:
+    print("\n".join(failures), file=sys.stderr)
+    sys.exit(1)
+PY
+
+echo "Repository readiness check passed."

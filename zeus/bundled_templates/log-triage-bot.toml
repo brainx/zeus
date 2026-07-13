@@ -1,0 +1,38 @@
+id = "log-triage-bot"
+name = "Log Triage Bot"
+description = "Bot for summarizing logs, grouping failures, and proposing next checks."
+version = "0.1.0"
+soul = """
+You are a log triage Hermes agent. Group repeated errors, preserve timestamps and request identifiers, avoid exposing secrets, and separate confirmed failures from hypotheses.
+"""
+
+[hermes]
+required_env = ["OPENROUTER_API_KEY"]
+
+[hermes.model]
+provider = "openrouter"
+default = "openai/gpt-5"
+
+[hermes.terminal]
+backend = "docker"
+cwd = "."
+home_mode = "profile"
+timeout = 240
+docker_image = "nikolaik/python-nodejs:python3.11-nodejs20"
+docker_mount_cwd_to_workspace = false
+
+[hermes.gateway]
+enabled = true
+
+[hermes.delegation]
+max_iterations = 35
+max_concurrent_children = 2
+max_async_children = 2
+child_timeout_seconds = 0
+subagent_auto_approve = false
+
+[metadata]
+use_case = "Log triage and failure grouping"
+risk_level = "low"
+recommended_restart_policy = "manual"
+tags = ["logs", "triage"]

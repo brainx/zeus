@@ -1,0 +1,647 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import patch
+
+from zeus.lifecycle import LifecycleEvent, LifecycleEventInput, serialize_lifecycle_details
+from zeus.models import BotRecord, BotStatus
+from zeus.state import StateStore
+
+
+def create_v2_database_with_bots(root: Path, *bot_ids: str) -> Path:
+    database = root / "zeus.db"
+    with closing(sqlite3.connect(database)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (2);
+            CREATE TABLE bots (
+                bot_id TEXT PRIMARY KEY,
+                template_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                profile_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                pid INTEGER,
+                restart_policy TEXT NOT NULL DEFAULT 'manual',
+                restart_backoff_seconds REAL NOT NULL DEFAULT 5.0,
+                restart_max_attempts INTEGER NOT NULL DEFAULT 5,
+                restart_attempts INTEGER NOT NULL DEFAULT 0,
+                next_restart_at TEXT,
+                started_at TEXT,
+                ready_at TEXT,
+                stopped_at TEXT,
+                last_exit_code INTEGER,
+                last_error TEXT,
+                last_transition_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        for index, bot_id in enumerate(bot_ids, start=1):
+            timestamp = f"2026-01-01T00:00:0{index}+00:00"
+            conn.execute(
+                """
+                INSERT INTO bots (
+                    bot_id, template_id, display_name, profile_path, status, pid,
+                    created_at, updated_at
+                ) VALUES (?, 'coding-bot', ?, ?, 'running', ?, ?, ?)
+                """,
+                (bot_id, bot_id.title(), f"/profiles/{bot_id}", index, timestamp, timestamp),
+            )
+        conn.commit()
+    return database
+
+
+class LifecycleLedgerTests(unittest.TestCase):
+    def _event(self, *, bot_id: str = "coder", action: str = "bot.test") -> LifecycleEventInput:
+        return LifecycleEventInput(
+            bot_id=bot_id,
+            operation_id="a" * 32,
+            source="cli",
+            action=action,
+            outcome="success",
+            reason="test transition",
+        )
+
+    def _record(self, root: Path, *, status: BotStatus = BotStatus.stopped) -> BotRecord:
+        return BotRecord(
+            bot_id="coder",
+            template_id="coding-bot",
+            display_name="Coder",
+            profile_path=str(root / "profiles" / "coder"),
+            status=status,
+        )
+
+    def _invoke_atomic_mutation(
+        self,
+        store: StateStore,
+        root: Path,
+        mutation: str,
+    ) -> LifecycleEvent | bool:
+        if mutation == "upsert":
+            return store.upsert_bot_with_event(
+                self._record(root),
+                event=self._event(action="bot.create"),
+            )
+        if mutation == "lifecycle":
+            return store.update_lifecycle_with_event(
+                "coder",
+                BotStatus.running,
+                pid=4321,
+                event=self._event(action="bot.start"),
+            )
+        if mutation == "restart":
+            return store.update_restart_with_event(
+                "coder",
+                status=BotStatus.failed,
+                pid=None,
+                restart_attempts=1,
+                next_restart_at=datetime(2026, 1, 1, tzinfo=UTC),
+                event=self._event(action="bot.restart.schedule"),
+            )
+        if mutation == "delete":
+            return store.delete_bot_with_event(
+                "coder",
+                event=self._event(action="bot.delete"),
+            )
+        raise AssertionError(f"unknown mutation: {mutation}")
+
+    def test_v2_migrates_to_v3_with_deterministic_snapshot_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = create_v2_database_with_bots(Path(tmp), "zeta", "alpha")
+
+            StateStore(database).init()
+
+            with closing(sqlite3.connect(database)) as conn:
+                conn.row_factory = sqlite3.Row
+                version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
+                events = conn.execute(
+                    """
+                    SELECT event_id, bot_id, operation_id, occurred_at, source, action,
+                           outcome, status_before, status_after, pid_before, pid_after,
+                           reason, details_json
+                    FROM lifecycle_events
+                    WHERE operation_id = 'migration-v3'
+                    ORDER BY event_id
+                    """
+                ).fetchall()
+                desired_events = conn.execute(
+                    """
+                    SELECT event_id, bot_id FROM lifecycle_events
+                    WHERE operation_id = 'migration-v5' ORDER BY event_id
+                    """
+                ).fetchall()
+                projections = conn.execute(
+                    "SELECT bot_id, last_event_id FROM bots ORDER BY bot_id"
+                ).fetchall()
+
+            self.assertEqual(6, version)
+            self.assertIn("last_event_id", columns)
+            self.assertEqual(["alpha", "zeta"], [row["bot_id"] for row in events])
+            self.assertEqual(
+                ["migration.snapshot", "migration.snapshot"],
+                [row["action"] for row in events],
+            )
+            self.assertEqual(
+                ["migration-v3", "migration-v3"],
+                [row["operation_id"] for row in events],
+            )
+            self.assertEqual(["migration", "migration"], [row["source"] for row in events])
+            self.assertEqual(["success", "success"], [row["outcome"] for row in events])
+            self.assertEqual(["running", "running"], [row["status_before"] for row in events])
+            self.assertEqual(["running", "running"], [row["status_after"] for row in events])
+            self.assertEqual([1, 2], [row["event_id"] for row in events])
+            self.assertEqual(
+                {row["bot_id"]: row["event_id"] for row in desired_events},
+                {row["bot_id"]: row["last_event_id"] for row in projections},
+            )
+            self.assertTrue(all(json.loads(row["details_json"]) == {} for row in events))
+
+    def test_v3_schema_matches_contract_and_events_are_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = create_v2_database_with_bots(Path(tmp), "coder")
+            StateStore(database).init()
+
+            with closing(sqlite3.connect(database)) as conn:
+                columns = [row[1] for row in conn.execute("PRAGMA table_info(lifecycle_events)")]
+                indexes = {
+                    row[1] for row in conn.execute("PRAGMA index_list(lifecycle_events)").fetchall()
+                }
+                foreign_keys = conn.execute("PRAGMA foreign_key_list(lifecycle_events)").fetchall()
+                self.assertEqual(
+                    [
+                        "event_id",
+                        "bot_id",
+                        "operation_id",
+                        "request_id",
+                        "occurred_at",
+                        "source",
+                        "action",
+                        "outcome",
+                        "status_before",
+                        "status_after",
+                        "pid_before",
+                        "pid_after",
+                        "reason",
+                        "error_code",
+                        "error_message",
+                        "details_json",
+                    ],
+                    columns,
+                )
+                self.assertEqual(
+                    {"idx_lifecycle_events_bot", "idx_lifecycle_events_operation"},
+                    indexes,
+                )
+                self.assertEqual([], foreign_keys)
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute(
+                        "UPDATE lifecycle_events SET action = 'changed' WHERE event_id = 1"
+                    )
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM lifecycle_events WHERE event_id = 1")
+
+    def test_v2_migration_failure_rolls_back_schema_version_data_and_ddl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = create_v2_database_with_bots(Path(tmp), "coder")
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute(
+                    """
+                    CREATE TRIGGER inject_v3_migration_failure
+                    BEFORE UPDATE ON bots
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected migration failure');
+                    END
+                    """
+                )
+                conn.commit()
+
+            with self.assertRaisesRegex(sqlite3.DatabaseError, "injected migration failure"):
+                StateStore(database).init()
+
+            with closing(sqlite3.connect(database)) as conn:
+                version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+                row = conn.execute(
+                    "SELECT status, pid, updated_at FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()
+                columns = {item[1] for item in conn.execute("PRAGMA table_info(bots)").fetchall()}
+                lifecycle_table = conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table' AND name = 'lifecycle_events'
+                    """
+                ).fetchone()
+
+            self.assertEqual(2, version)
+            self.assertEqual(("running", 1, "2026-01-01T00:00:01+00:00"), row)
+            self.assertNotIn("last_event_id", columns)
+            self.assertIsNone(lifecycle_table)
+
+    def test_newer_schema_is_rejected_without_changes(self) -> None:
+        for operation in ("init", "migrate"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
+                database = create_v2_database_with_bots(Path(tmp), "coder")
+                with closing(sqlite3.connect(database)) as conn:
+                    conn.execute("UPDATE schema_version SET version = 7")
+                    conn.commit()
+                    before = list(conn.iterdump())
+                    self.assertEqual("delete", conn.execute("PRAGMA journal_mode").fetchone()[0])
+
+                with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+                    getattr(StateStore(database), operation)()
+
+                with closing(sqlite3.connect(database)) as conn:
+                    self.assertEqual("delete", conn.execute("PRAGMA journal_mode").fetchone()[0])
+                    self.assertEqual(before, list(conn.iterdump()))
+
+    def test_history_is_newest_first_uses_exclusive_cursor_and_survives_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = create_v2_database_with_bots(Path(tmp), "coder")
+            store = StateStore(database)
+            store.init()
+            with closing(sqlite3.connect(database)) as conn:
+                for action in ("bot.start", "bot.ready", "bot.stop"):
+                    conn.execute(
+                        """
+                        INSERT INTO lifecycle_events (
+                            bot_id, operation_id, occurred_at, source, action, outcome
+                        ) VALUES ('coder', 'operation', '2026-01-02T00:00:00+00:00',
+                                  'cli', ?, 'success')
+                        """,
+                        (action,),
+                    )
+                conn.execute("DELETE FROM bots WHERE bot_id = 'coder'")
+                conn.commit()
+
+            first_page = store.list_lifecycle_events("coder", limit=2, before=None)
+            second_page = store.list_lifecycle_events(
+                "coder", limit=2, before=first_page[-1].event_id
+            )
+
+            self.assertEqual(["bot.stop", "bot.ready"], [event.action for event in first_page])
+            self.assertEqual(
+                ["bot.start", "migration.desired_state_snapshot"],
+                [event.action for event in second_page],
+            )
+            self.assertGreater(first_page[0].event_id, first_page[1].event_id)
+            self.assertTrue(
+                set(event.event_id for event in first_page).isdisjoint(
+                    event.event_id for event in second_page
+                )
+            )
+
+    def test_history_rejects_unsafe_limits_and_cursors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "zeus.db")
+            store.init()
+            for invalid_limit in (True, 0, 1001, 1.5, "1"):
+                with self.subTest(limit=invalid_limit), self.assertRaises((TypeError, ValueError)):
+                    store.list_lifecycle_events(
+                        "coder",
+                        limit=invalid_limit,  # type: ignore[arg-type]
+                        before=None,
+                    )
+            for invalid_before in (True, 0, -1, 1.5, "1"):
+                with (
+                    self.subTest(before=invalid_before),
+                    self.assertRaises((TypeError, ValueError)),
+                ):
+                    store.list_lifecycle_events(
+                        "coder",
+                        limit=50,
+                        before=invalid_before,  # type: ignore[arg-type]
+                    )
+
+    def test_event_input_is_frozen_and_recursively_redacts_bounded_details(self) -> None:
+        nested_items = [{"visible": "value"}]
+        nested: dict[str, object] = {
+            "safe": "original",
+            "items": nested_items,
+        }
+        event = LifecycleEventInput(
+            bot_id="coder",
+            operation_id="operation",
+            source="cli",
+            action="bot.start",
+            outcome="success",
+            details={
+                "safe": "x" * 10_000,
+                "api_key": "plain-secret",
+                "nested": {
+                    "authorization": "Bearer token-secret",
+                    "message": "TOKEN=embedded-secret",
+                    "request_body": {"field": "raw-body"},
+                    "client_address": "10.0.0.1:1234",
+                    "traceback": "secret stack trace",
+                },
+                "mutable": nested,
+            },
+        )
+
+        nested["safe"] = "changed-after-construction"
+        nested_items[0]["visible"] = "changed-after-construction"
+        serialized = serialize_lifecycle_details(event.details)
+        self.assertLessEqual(len(serialized), 8192)
+        for secret in (
+            "plain-secret",
+            "token-secret",
+            "embedded-secret",
+            "raw-body",
+            "10.0.0.1",
+            "secret stack trace",
+        ):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("[redacted]", serialized)
+        self.assertNotIn("changed-after-construction", serialized)
+        with self.assertRaises(FrozenInstanceError):
+            event.action = "changed"  # type: ignore[misc]
+        with self.assertRaises(TypeError):
+            event.details["new"] = "value"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            event.details["mutable"]["safe"] = "changed"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            event.details["mutable"]["items"][0]["visible"] = "changed"  # type: ignore[index]
+
+    def test_event_details_normalize_forbidden_names_and_are_json_compatible(self) -> None:
+        secrets = {
+            "authorizationHeader": "authorization-secret",
+            "RequestBody": "request-secret",
+            "response-body": "response-secret",
+            "raw query": "raw-query-secret",
+            "queryString": "query-secret",
+            "forwardedFor": "forwarded-secret",
+            "xForwardedFor": "x-forwarded-secret",
+            "clientAddress": "address-secret",
+            "clientIp": "ip-secret",
+            "client.port": "port-secret",
+            "remoteAddr": "remote-secret",
+            "traceback": "traceback-secret",
+            "exceptionTrace": "exception-secret",
+            "idempotencyKey": "idempotency-secret",
+            "apiKey": "api-secret",
+            "accessToken": "token-secret",
+            "clientSecret": "client-secret",
+            "db_password": "password-secret",
+        }
+        event = LifecycleEventInput(
+            bot_id="coder",
+            operation_id="operation",
+            source="api",
+            action="bot.start",
+            outcome="success",
+            details={"outer": {"items": [secrets]}},
+        )
+
+        serialized = serialize_lifecycle_details(event.details)
+        for secret in secrets.values():
+            self.assertNotIn(secret, serialized)
+        self.assertEqual(len(secrets), serialized.count("[redacted]"))
+
+        stored = LifecycleEvent(
+            event_id=1,
+            bot_id="coder",
+            operation_id="operation",
+            request_id=None,
+            occurred_at=datetime.now(UTC),
+            source="api",
+            action="bot.start",
+            outcome="success",
+            status_before="stopped",
+            status_after="running",
+            pid_before=None,
+            pid_after=123,
+            reason="started",
+            error_code=None,
+            error_message=None,
+            details={"nested": {"items": ["value"]}},
+        )
+        with self.assertRaises(TypeError):
+            stored.details["nested"]["items"][0] = "changed"  # type: ignore[index]
+        self.assertEqual(
+            {"nested": {"items": ["value"]}},
+            stored.to_dict()["details"],
+        )
+        json.dumps(stored.to_dict(), sort_keys=True)
+
+    def test_upsert_bot_with_event_rolls_back_projection_when_event_insert_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+
+            with (
+                patch.object(
+                    store,
+                    "_insert_lifecycle_event",
+                    side_effect=sqlite3.Error("boom"),
+                ),
+                self.assertRaisesRegex(sqlite3.Error, "boom"),
+            ):
+                store.upsert_bot_with_event(self._record(root), event=self._event())
+
+            self.assertIsNone(store.get_bot("coder"))
+            self.assertEqual([], store.list_lifecycle_events("coder", limit=50, before=None))
+
+    def test_update_lifecycle_with_event_rolls_back_when_event_insert_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(self._record(root))
+
+            with (
+                patch.object(
+                    store,
+                    "_insert_lifecycle_event",
+                    side_effect=sqlite3.Error("boom"),
+                ),
+                self.assertRaisesRegex(sqlite3.Error, "boom"),
+            ):
+                store.update_lifecycle_with_event(
+                    "coder",
+                    BotStatus.running,
+                    pid=4321,
+                    event=self._event(action="bot.start"),
+                )
+
+            record = store.get_bot("coder")
+            assert record is not None
+            self.assertEqual(BotStatus.stopped, record.status)
+            self.assertIsNone(record.pid)
+            self.assertEqual([], store.list_lifecycle_events("coder", limit=50, before=None))
+
+    def test_update_restart_with_event_rolls_back_projection_when_event_insert_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(self._record(root))
+
+            with (
+                patch.object(
+                    store,
+                    "_insert_lifecycle_event",
+                    side_effect=sqlite3.Error("boom"),
+                ),
+                self.assertRaisesRegex(sqlite3.Error, "boom"),
+            ):
+                store.update_restart_with_event(
+                    "coder",
+                    status=BotStatus.failed,
+                    pid=None,
+                    restart_attempts=1,
+                    next_restart_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    event=self._event(action="bot.restart.schedule"),
+                )
+
+            record = store.get_bot("coder")
+            assert record is not None
+            self.assertEqual(BotStatus.stopped, record.status)
+            self.assertEqual(0, record.restart_attempts)
+            self.assertIsNone(record.next_restart_at)
+            self.assertEqual([], store.list_lifecycle_events("coder", limit=50, before=None))
+
+    def test_delete_bot_with_event_rolls_back_projection_when_event_insert_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(self._record(root))
+
+            with (
+                patch.object(
+                    store,
+                    "_insert_lifecycle_event",
+                    side_effect=sqlite3.Error("boom"),
+                ),
+                self.assertRaisesRegex(sqlite3.Error, "boom"),
+            ):
+                store.delete_bot_with_event("coder", event=self._event(action="bot.delete"))
+
+            self.assertIsNotNone(store.get_bot("coder"))
+            self.assertEqual([], store.list_lifecycle_events("coder", limit=50, before=None))
+
+    def test_atomic_mutations_roll_back_when_event_materialization_fails(self) -> None:
+        for mutation in ("upsert", "lifecycle", "restart", "delete"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = StateStore(root / "zeus.db")
+                store.init()
+                if mutation != "upsert":
+                    store.upsert_bot(self._record(root))
+
+                with (
+                    patch.object(
+                        store,
+                        "_row_to_lifecycle_event",
+                        side_effect=sqlite3.Error("materialization failed"),
+                    ),
+                    self.assertRaisesRegex(sqlite3.Error, "materialization failed"),
+                ):
+                    self._invoke_atomic_mutation(store, root, mutation)
+
+                record = store.get_bot("coder")
+                if mutation == "upsert":
+                    self.assertIsNone(record)
+                else:
+                    assert record is not None
+                    self.assertEqual(BotStatus.stopped, record.status)
+                    self.assertIsNone(record.pid)
+                    self.assertEqual(0, record.restart_attempts)
+                    self.assertIsNone(record.next_restart_at)
+                self.assertEqual([], store.list_lifecycle_events("coder", limit=50, before=None))
+
+    def test_atomic_mutations_ignore_post_commit_audit_failures(self) -> None:
+        expected_actions = {
+            "upsert": "bot.create",
+            "lifecycle": "bot.start",
+            "restart": "bot.restart.schedule",
+            "delete": "bot.delete",
+        }
+        for mutation in ("upsert", "lifecycle", "restart", "delete"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = StateStore(root / "zeus.db")
+                store.init()
+                if mutation != "upsert":
+                    store.upsert_bot(self._record(root))
+
+                with patch.object(
+                    store,
+                    "_append_lifecycle_audit",
+                    side_effect=RuntimeError("audit failed"),
+                ):
+                    result = self._invoke_atomic_mutation(store, root, mutation)
+
+                if mutation == "delete":
+                    self.assertIs(result, True)
+                    self.assertIsNone(store.get_bot("coder"))
+                else:
+                    self.assertIsInstance(result, LifecycleEvent)
+                    self.assertEqual(expected_actions[mutation], result.action)
+                    self.assertIsNotNone(store.get_bot("coder"))
+                events = store.list_lifecycle_events("coder", limit=50, before=None)
+                self.assertEqual([expected_actions[mutation]], [event.action for event in events])
+
+    def test_atomic_mutations_advance_last_event_and_delete_preserves_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+
+            created = store.upsert_bot_with_event(
+                self._record(root),
+                event=self._event(action="bot.create"),
+            )
+            started = store.update_lifecycle_with_event(
+                "coder",
+                BotStatus.running,
+                pid=4321,
+                event=self._event(action="bot.start"),
+            )
+            scheduled = store.update_restart_with_event(
+                "coder",
+                status=BotStatus.failed,
+                pid=None,
+                restart_attempts=1,
+                next_restart_at=datetime(2026, 1, 1, tzinfo=UTC),
+                event=self._event(action="bot.restart.schedule"),
+            )
+
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                last_event_id = conn.execute(
+                    "SELECT last_event_id FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()[0]
+            self.assertEqual(scheduled.event_id, last_event_id)
+            self.assertEqual((None, "stopped"), (created.status_before, created.status_after))
+            self.assertEqual(
+                ("stopped", "running", None, 4321),
+                (
+                    started.status_before,
+                    started.status_after,
+                    started.pid_before,
+                    started.pid_after,
+                ),
+            )
+
+            store.delete_bot_with_event("coder", event=self._event(action="bot.delete"))
+
+            self.assertIsNone(store.get_bot("coder"))
+            history = store.list_lifecycle_events("coder", limit=50, before=None)
+            self.assertEqual(4, len(history))
+            self.assertEqual("bot.delete", history[0].action)
+            self.assertEqual("failed", history[0].status_before)
+            self.assertIsNone(history[0].status_after)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,10 @@
+[run]
+branch = True
+source =
+    zeus
+
+[report]
+fail_under = 70
+precision = 2
+show_missing = True
+skip_covered = True
