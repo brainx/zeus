@@ -440,7 +440,8 @@ def summarize_results(
 
 
 class _ReconciliationStore(Protocol):
-    database_path: Path
+    @property
+    def database_path(self) -> Path: ...
 
     def list_bots(self) -> list[BotRecord]: ...
 
