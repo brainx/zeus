@@ -194,6 +194,9 @@ class RepoContractTests(unittest.TestCase):
         contributing = Path("CONTRIBUTING.md").read_text(encoding="utf-8")
         roadmap = Path("docs/ROADMAP.md").read_text(encoding="utf-8")
         roadmap_text = " ".join(roadmap.split())
+        ci_workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        release_workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+        pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
         compatibility_path = Path("docs/COMPATIBILITY.md")
 
         self.assertTrue(compatibility_path.is_file())
@@ -203,6 +206,8 @@ class RepoContractTests(unittest.TestCase):
         offline_heading = "### 1. Credential-free offline demo"
         hermes_heading = "### 2. Real Hermes setup"
         self.assertLess(readme.index(offline_heading), readme.index(hermes_heading))
+        offline_path = readme.split(offline_heading, 1)[1].split(hermes_heading, 1)[0]
+        hermes_path = readme.split(hermes_heading, 1)[1].split("\n## ", 1)[0]
         for command in (
             "python3 -m venv .venv",
             "python -m pip install -e .",
@@ -210,7 +215,7 @@ class RepoContractTests(unittest.TestCase):
             "zeus demo status",
             "zeus demo down",
         ):
-            self.assertIn(command, readme)
+            self.assertIn(command, offline_path)
         for command in (
             "hermes version",
             "cp .env.example .env",
@@ -219,8 +224,8 @@ class RepoContractTests(unittest.TestCase):
             "--env-from OPENROUTER_API_KEY",
             "zeus bot doctor coder",
         ):
-            self.assertIn(command, readme)
-        self.assertIn("real, non-empty provider key", readme)
+            self.assertIn(command, hermes_path)
+        self.assertIn("real, non-empty provider key", hermes_path)
         self.assertIn("docs/COMPATIBILITY.md", readme)
         self.assertIn("no required third-party Python runtime dependencies", readme)
 
@@ -249,8 +254,24 @@ class RepoContractTests(unittest.TestCase):
         ):
             self.assertIn(statement, roadmap_text)
 
-        self.assertIn("`ubuntu-latest`", compatibility_text)
-        self.assertIn("Python 3.11, 3.12, and 3.13", compatibility_text)
+        workflow_text = ci_workflow + "\n" + release_workflow
+        workflow_runners = set(
+            re.findall(r"(?m)^\s*runs-on:\s*([^\s#]+)", workflow_text)
+        )
+        workflow_python_versions = set(re.findall(r'"(3\.\d+)"', workflow_text))
+        documented_python_versions = set(
+            re.findall(r"(?<![\d.])3\.\d+(?![\d.])", compatibility)
+        )
+        requires_python = re.search(r'(?m)^requires-python = "([^"]+)"$', pyproject)
+
+        self.assertIsNotNone(requires_python)
+        for runner in workflow_runners:
+            self.assertIn(f"`{runner}`", compatibility_text)
+        self.assertEqual(workflow_python_versions, documented_python_versions)
+        self.assertIn(
+            f'`requires-python = "{requires_python.group(1)}"`',
+            compatibility_text,
+        )
         self.assertIn("focused lifecycle and package jobs use Python 3.11", compatibility_text)
         self.assertIn("Debian and Ubuntu", compatibility_text)
         self.assertIn("No Hermes version is pinned", compatibility_text)

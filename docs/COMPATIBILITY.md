@@ -19,9 +19,9 @@ the underlying Linux image and may update it over time. macOS and Windows are
 not currently automated. Results from an individual developer machine are local
 evidence for that run, not an automated platform guarantee.
 
-The package metadata requires Python 3.11 or newer, while committed CI currently
-tests the versions listed above. A version absent from that matrix is not covered
-by the current automated compatibility claim.
+The package metadata declares `requires-python = ">=3.11"`, while committed CI
+currently tests the versions listed above. A version absent from that matrix is
+not covered by the current automated compatibility claim.
 
 ## Manual clean-host evidence
 
