@@ -17,10 +17,16 @@ from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, NoReturn
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
+from zeus import api_request
 from zeus.api_errors import map_api_exception
 from zeus.api_logging import ApiLogWriter
+from zeus.api_request import (
+    decode_json_object,
+    normalize_api_path,
+    parse_query,
+)
 from zeus.config import Settings, validate_api_exposure
 from zeus.doctor import run_doctor
 from zeus.idempotency import IdempotencyClaim, canonical_request_hash, hash_key
@@ -53,8 +59,8 @@ BOT_CREATE_FIELDS = frozenset(
         "restart_max_attempts",
     }
 )
-MAX_JSON_DEPTH = 64
-MAX_QUERY_FIELDS = 16
+MAX_JSON_DEPTH = api_request.MAX_JSON_DEPTH
+MAX_QUERY_FIELDS = api_request.MAX_QUERY_FIELDS
 MAX_IDEMPOTENCY_MESSAGE_JSON_BYTES = 4_096
 _IDEMPOTENCY_MESSAGE_REPLACEMENT = "response message omitted because it exceeded the replay budget"
 _IDEMPOTENCY_OWNER_LOCK = threading.Lock()
@@ -214,31 +220,6 @@ def _bound_idempotent_messages(value: object) -> tuple[object, bool]:
             exceeds_response_cap = exceeds_response_cap or exceeds
         return bounded_mapping, exceeds_response_cap
     return value, False
-
-
-def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON field: {key}")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> Any:
-    raise ValueError(f"invalid JSON constant: {value}")
-
-
-def _validate_json_depth(value: Any) -> None:
-    stack = [(value, 1)]
-    while stack:
-        current, depth = stack.pop()
-        if depth > MAX_JSON_DEPTH:
-            raise ValueError(f"request JSON nesting exceeds {MAX_JSON_DEPTH}")
-        if isinstance(current, dict):
-            stack.extend((child, depth + 1) for child in current.values())
-        elif isinstance(current, list):
-            stack.extend((child, depth + 1) for child in current)
 
 
 class ThreadingHTTPServer(_ThreadingHTTPServer):
@@ -411,6 +392,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         _request_context: RequestContext
         _response_status: int
         _response_error_code: str | None
+        _validated_query_values: dict[str, list[str]]
 
         def send_error(
             self,
@@ -818,18 +800,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             if length > 1_000_000:
                 raise ValueError("request body too large")
             data = self.rfile.read(length) if length else b"{}"
-            try:
-                parsed = json.loads(
-                    data.decode("utf-8"),
-                    object_pairs_hook=_json_object_without_duplicates,
-                    parse_constant=_reject_json_constant,
-                )
-            except RecursionError as exc:
-                raise ValueError(f"request JSON nesting exceeds {MAX_JSON_DEPTH}") from exc
-            _validate_json_depth(parsed)
-            if not isinstance(parsed, dict):
-                raise ValueError("request body must be a JSON object")
-            return parsed
+            return decode_json_object(data)
 
         def _require_json_content_type(self) -> None:
             content_encoding = self.headers.get("content-encoding", "").strip().lower()
@@ -880,34 +851,13 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             return validate_id(parts[1], "bot_id")
 
         def _normalized_path(self) -> str:
-            parsed = urlparse(self.path)
-            if parsed.fragment:
-                raise ValueError("request target must not include a fragment")
-            path = parsed.path
-            if path == "/v1":
-                return "/"
-            if path.startswith("/v1/"):
-                return path[3:]
-            return path
+            return normalize_api_path(self.path)
 
         def _query_values(self) -> dict[str, list[str]]:
-            try:
-                return parse_qs(
-                    urlparse(self.path).query,
-                    keep_blank_values=True,
-                    max_num_fields=MAX_QUERY_FIELDS,
-                )
-            except ValueError as exc:
-                raise ValueError("too many query parameters") from exc
+            return self._validated_query_values
 
         def _validate_query_parameters(self, allowed: set[str]) -> None:
-            values = self._query_values()
-            unknown = sorted(set(values) - allowed)
-            if unknown:
-                raise ValueError(f"unknown query parameter: {unknown[0]}")
-            duplicates = sorted(name for name, entries in values.items() if len(entries) > 1)
-            if duplicates:
-                raise ValueError(f"query parameter {duplicates[0]} must be specified once")
+            self._validated_query_values = parse_query(self.path, frozenset(allowed))
 
         def _post_query_parameters(self, path: str) -> set[str] | None:
             if path == "/bots":
@@ -1264,6 +1214,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             self._request_context.route = _safe_route_template(self.path)
             self._response_status = HTTPStatus.INTERNAL_SERVER_ERROR.value
             self._response_error_code = None
+            self._validated_query_values = {}
             try:
                 dispatch()
             except Exception as exc:
