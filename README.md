@@ -53,6 +53,8 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
 cp .env.example .env
+chmod 0600 .env
+# Edit .env and set OPENROUTER_API_KEY to a non-empty provider key.
 
 zeus doctor
 zeus template list
