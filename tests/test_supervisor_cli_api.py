@@ -2848,7 +2848,7 @@ password = "plain-password"
                 },
                 payload["counts"],
             )
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     1,
                     conn.execute("SELECT COUNT(*) FROM reconcile_runs").fetchone()[0],

@@ -69,10 +69,21 @@ class RepoContractTests(unittest.TestCase):
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
 
         self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("runs-on: ubuntu-24.04", workflow)
+        self.assertNotIn("runs-on: ubuntu-latest", workflow)
         self.assertIn("3.11", workflow)
         self.assertIn("3.12", workflow)
         self.assertIn("3.13", workflow)
+        self.assertIn("python-3-14:", workflow)
+        self.assertIn('python-version: "3.14"', workflow)
+        self.assertIn("continue-on-error: true", workflow)
+        self.assertIn("macos-process-lifecycle:", workflow)
+        self.assertIn("runs-on: macos-26", workflow)
+        self.assertIn("tests.test_subprocess_lifecycle", workflow)
+        self.assertIn("tests.test_fake_hermes_integration", workflow)
+        self.assertIn("tests.test_crash_recovery.GatewayLauncherTests", workflow)
         self.assertIn('pip install -e ".[dev]"', workflow)
+        self.assertIn("python -m pip check", workflow)
         self.assertIn("ruff format --check .", workflow)
         self.assertIn("ruff check .", workflow)
         self.assertIn("mypy zeus", workflow)
@@ -92,6 +103,9 @@ class RepoContractTests(unittest.TestCase):
 
         self.assertIn("compileall zeus tests", script)
         self.assertIn("unittest discover -s tests -v", script)
+        self.assertIn("-W error::ResourceWarning", script)
+        self.assertIn('warning_log="$tmp_dir/unittest-stderr.log"', script)
+        self.assertIn('grep -F "ResourceWarning" "$warning_log"', script)
         self.assertIn("trap cleanup EXIT INT TERM", script)
         self.assertIn('mkdir -p "$tmp_dir"', script)
         self.assertIn("zeus.cli doctor --json", script)
@@ -118,7 +132,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("branch = True", config)
         self.assertRegex(config, r"(?m)^source =\s*$")
         self.assertRegex(config, r"(?m)^[ \t]+zeus[ \t]*$")
-        self.assertIn("fail_under = 70", config)
+        self.assertIn("fail_under = 79", config)
+        self.assertNotIn("fail_under = 70", config)
         self.assertIn("precision = 2", config)
 
     def test_workflow_actions_are_pinned_to_immutable_commits(self) -> None:
@@ -255,13 +270,9 @@ class RepoContractTests(unittest.TestCase):
             self.assertIn(statement, roadmap_text)
 
         workflow_text = ci_workflow + "\n" + release_workflow
-        workflow_runners = set(
-            re.findall(r"(?m)^\s*runs-on:\s*([^\s#]+)", workflow_text)
-        )
+        workflow_runners = set(re.findall(r"(?m)^\s*runs-on:\s*([^\s#]+)", workflow_text))
         workflow_python_versions = set(re.findall(r'"(3\.\d+)"', workflow_text))
-        documented_python_versions = set(
-            re.findall(r"(?<![\d.])3\.\d+(?![\d.])", compatibility)
-        )
+        documented_python_versions = set(re.findall(r"(?<![\d.])3\.\d+(?![\d.])", compatibility))
         requires_python = re.search(r'(?m)^requires-python = "([^"]+)"$', pyproject)
 
         self.assertIsNotNone(requires_python)
@@ -272,12 +283,14 @@ class RepoContractTests(unittest.TestCase):
             f'`requires-python = "{requires_python.group(1)}"`',
             compatibility_text,
         )
-        self.assertIn("focused lifecycle and package jobs use Python 3.11", compatibility_text)
+        self.assertIn("lifecycle and package jobs use Python 3.11", compatibility_text)
         self.assertIn("Debian and Ubuntu", compatibility_text)
         self.assertIn("No Hermes version is pinned", compatibility_text)
         self.assertIn("whichever `hermes` executable is installed", compatibility_text)
-        self.assertIn("macOS and Windows are not currently automated", compatibility_text)
-        self.assertNotIn("Python 3.14", compatibility_text)
+        self.assertIn("Python 3.14", compatibility_text)
+        self.assertIn("provisional Zeus-only", compatibility_text)
+        self.assertIn("focused process", compatibility_text.lower())
+        self.assertIn("Windows is not currently automated", compatibility_text)
 
     def test_env_example_lists_deepseek_and_api_auth(self) -> None:
         env = Path(".env.example").read_text(encoding="utf-8")
@@ -334,7 +347,8 @@ class RepoContractTests(unittest.TestCase):
     def test_architecture_terminal_schema_compatibility_matches_runtime(self) -> None:
         architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
         compatibility_statements = re.findall(
-            r"Databases newer than\s+schema v(?P<version>\d+) are rejected rather than downgraded\.",
+            r"Databases newer than\s+schema v(?P<version>\d+) "
+            r"are rejected rather than downgraded\.",
             architecture,
         )
 
@@ -411,6 +425,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("mypy>=1.11.0", pyproject)
         self.assertIn("bandit>=1.7.9", pyproject)
         self.assertIn("coverage>=7.0.0", pyproject)
+        self.assertNotIn('"pytest', pyproject)
         self.assertIn('dynamic = ["version"]', pyproject)
         self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
         self.assertIn('Repository = "https://github.com/brainx/zeus"', pyproject)
@@ -565,6 +580,9 @@ class RepoContractTests(unittest.TestCase):
 
     def test_makefile_has_release_check_target(self) -> None:
         makefile = Path("Makefile").read_text(encoding="utf-8")
+        check_recipe = re.search(r"(?m)^check:\n(?P<body>(?:\t[^\n]*\n)+)", makefile)
+        build_recipe = re.search(r"(?m)^build:\n(?P<body>(?:\t[^\n]*\n)+)", makefile)
+        release_recipe = re.search(r"(?m)^release-check:\n(?P<body>(?:\t[^\n]*\n)+)", makefile)
 
         self.assertIn("release-check:", makefile)
         self.assertIn("coverage:", makefile)
@@ -574,6 +592,12 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("coverage report", makefile)
         self.assertNotIn("coverage report --fail-under", makefile)
         self.assertIn("shellcheck scripts/*.sh", makefile)
+        self.assertIsNotNone(check_recipe)
+        self.assertIsNotNone(build_recipe)
+        self.assertIsNotNone(release_recipe)
+        self.assertIn("shellcheck scripts/*.sh", check_recipe.group("body"))
+        self.assertIn("python -m pip check", build_recipe.group("body"))
+        self.assertIn("python -m pip check", release_recipe.group("body"))
         self.assertIn("rm -rf dist", makefile)
         self.assertIn("python -m build", makefile)
         self.assertIn("ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh", makefile)

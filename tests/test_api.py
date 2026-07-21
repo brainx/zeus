@@ -1052,7 +1052,7 @@ class ApiBehaviorTests(unittest.TestCase):
                     },
                     set(payload["results"][0]),
                 )
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     2,
                     conn.execute("SELECT COUNT(*) FROM reconcile_runs").fetchone()[0],
@@ -1114,7 +1114,7 @@ class ApiBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(404, status)
             self.assertEqual("unknown_bot", body["error"]["code"])
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     0,
                     conn.execute("SELECT COUNT(*) FROM reconcile_runs").fetchone()[0],
@@ -1291,7 +1291,7 @@ class ApiBehaviorTests(unittest.TestCase):
             self.assertEqual(["coder"], [item["bot_id"] for item in first["results"]])
             self.assertNotIn("idempotency-replayed", first_headers)
             self.assertEqual("true", replay_headers["idempotency-replayed"])
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     1,
                     conn.execute("SELECT COUNT(*) FROM reconcile_runs").fetchone()[0],
@@ -1417,7 +1417,7 @@ class ApiBehaviorTests(unittest.TestCase):
                     )
 
             self.assertEqual(1, effects)
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     (0, 1),
                     (
@@ -1449,7 +1449,7 @@ class ApiBehaviorTests(unittest.TestCase):
 
             self.assertEqual(422, status)
             self.assertEqual("idempotency_response_too_large", body["error"]["code"])
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     (0, 0),
                     (
@@ -2382,6 +2382,7 @@ class ApiBehaviorTests(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         first.kill()
                         first.wait(timeout=5)
+                first.communicate()
 
 
 class ApiRateLimitTests(unittest.TestCase):

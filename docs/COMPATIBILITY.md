@@ -8,16 +8,24 @@ an untested platform or external Hermes release into a support claim.
 
 | Gate | Committed runner | Python | Scope |
 | --- | --- | --- | --- |
-| Main CI matrix | Linux `ubuntu-latest` | Python 3.11, 3.12, and 3.13 | Unit and integration tests, repository contracts, source-and-branch coverage, formatting, lint, typing, Bandit, and ShellCheck |
-| Subprocess lifecycle | Linux `ubuntu-latest` | Python 3.11 | Focused multi-process lifecycle and locking behavior |
-| Package build | Linux `ubuntu-latest` | Python 3.11 | Wheel and source build, installed-wheel smoke test, and metadata checks |
+| Main CI matrix | Linux `ubuntu-24.04` | Python 3.11, 3.12, and 3.13 | Unit and integration tests, repository contracts, source-and-branch coverage, formatting, lint, typing, Bandit, and ShellCheck |
+| Provisional Python compatibility | Linux `ubuntu-24.04` | Python 3.14 | Full Zeus test suite; non-required and Zeus-only because no Hermes baseline is pinned |
+| Subprocess lifecycle | Linux `ubuntu-24.04` | Python 3.11 | Focused multi-process lifecycle and locking behavior |
+| macOS process lifecycle | macOS `macos-26` | Python 3.13 | Focused process, fake-Hermes integration, and gateway-launcher recovery tests |
+| Package build | Linux `ubuntu-24.04` | Python 3.11 | Wheel and source build, installed-wheel smoke test, dependency consistency, and metadata checks |
 | Tagged release build | Linux `ubuntu-latest` | Python 3.11 | Full release gate, artifact checksums, and GitHub release artifacts |
 
-In short, the focused lifecycle and package jobs use Python 3.11. The
-`ubuntu-latest` label is the exact committed runner selection, but GitHub manages
-the underlying Linux image and may update it over time. macOS and Windows are
-not currently automated. Results from an individual developer machine are local
-evidence for that run, not an automated platform guarantee.
+In short, the focused Linux lifecycle and package jobs use Python 3.11. Main CI
+uses the explicit `ubuntu-24.04` image, while the separate tagged-release
+workflow still uses `ubuntu-latest`. The focused macOS lane uses `macos-26` and
+Python 3.13. Windows is not currently automated. GitHub manages the contents of
+all hosted runner images and may update them over time; results from an
+individual developer machine remain local evidence rather than an automated
+platform guarantee.
+
+Python 3.14 is a provisional Zeus-only lane with `continue-on-error` behavior.
+It does not promote Python 3.14 to required Hermes compatibility: the repository
+has not yet pinned and passed a Hermes baseline on that interpreter.
 
 The package metadata declares `requires-python = ">=3.11"`, while committed CI
 currently tests the versions listed above. A version absent from that matrix is
