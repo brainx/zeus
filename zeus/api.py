@@ -19,24 +19,22 @@ from pathlib import Path
 from typing import Any, NoReturn
 from urllib.parse import parse_qs, urlparse
 
+from zeus.api_errors import map_api_exception
 from zeus.api_logging import ApiLogWriter
 from zeus.config import Settings, validate_api_exposure
 from zeus.doctor import run_doctor
-from zeus.errors import ZeusConflictError
 from zeus.idempotency import IdempotencyClaim, canonical_request_hash, hash_key
 from zeus.models import (
     BotCreateRequest,
     BotStatus,
     HermesTemplate,
     RestartPolicy,
-    TemplateError,
     validate_id,
 )
 from zeus.process_lock import BotProcessLock, LockTimeoutError
 from zeus.rate_limit import TokenBucket
 from zeus.reconciliation import (
     MAX_RECONCILE_TEXT_LENGTH,
-    ReconcileLockTimeoutError,
     ReconcileOutcome,
 )
 from zeus.request_context import RequestContext, new_request_id, route_template
@@ -1057,39 +1055,10 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         def _json_error(self, exc: Exception) -> None:
             if isinstance(exc, _ResponseSent):
                 return
-            if isinstance(exc, KeyError):
-                status, code, message = _key_error_response(exc)
-                self._json_error_response(status, code, message)
-            elif isinstance(exc, TemplateError):
-                code = (
-                    "invalid_bot_id"
-                    if str(exc).startswith("bot_id must match")
-                    else "invalid_request"
-                )
-                self._json_error_response(HTTPStatus.BAD_REQUEST, code, str(exc))
-            elif isinstance(exc, ReconcileLockTimeoutError):
-                self._json_error_response(
-                    HTTPStatus.CONFLICT,
-                    "reconcile_locked",
-                    "reconciliation is already in progress",
-                )
-            elif isinstance(exc, LockTimeoutError):
-                self._json_error_response(
-                    HTTPStatus.CONFLICT,
-                    "bot_locked",
-                    "bot lifecycle operation is already in progress",
-                )
-            elif isinstance(exc, ZeusConflictError):
-                self._json_error_response(HTTPStatus.CONFLICT, exc.code, str(exc))
-            elif isinstance(exc, ValueError):
-                self._json_error_response(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
-            else:
+            error = map_api_exception(exc)
+            if error.log_exception:
                 api_log_writer.error(self._request_context.request_id, exc)
-                self._json_error_response(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "internal server error",
-                )
+            self._json_error_response(error.status, error.code, error.message)
 
         def _handle_idempotency_outcome(self, claim: IdempotencyClaim) -> bool:
             if claim.kind == "claimed":
@@ -1150,41 +1119,19 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             raise RuntimeError("invalid idempotency claim outcome")
 
         def _buffer_error(self, exc: Exception) -> BufferedJsonResponse:
-            if isinstance(exc, KeyError):
-                status, code, message = _key_error_response(exc)
-            elif isinstance(exc, TemplateError):
-                status = HTTPStatus.BAD_REQUEST
-                code = (
-                    "invalid_bot_id"
-                    if str(exc).startswith("bot_id must match")
-                    else "invalid_request"
-                )
-                message = str(exc)
-            elif isinstance(exc, ReconcileLockTimeoutError):
-                status = HTTPStatus.CONFLICT
-                code = "reconcile_locked"
-                message = "reconciliation is already in progress"
-            elif isinstance(exc, LockTimeoutError):
-                status = HTTPStatus.CONFLICT
-                code = "bot_locked"
-                message = "bot lifecycle operation is already in progress"
-            elif isinstance(exc, ZeusConflictError):
-                status = HTTPStatus.CONFLICT
-                code = exc.code
-                message = str(exc)
-            elif isinstance(exc, ValueError):
-                status = HTTPStatus.BAD_REQUEST
-                code = "invalid_request"
-                message = str(exc)
-            else:
-                status = HTTPStatus.INTERNAL_SERVER_ERROR
-                code = "internal_error"
-                message = "internal server error"
+            error = map_api_exception(exc)
+            if error.log_exception:
                 api_log_writer.error(self._request_context.request_id, exc)
-            self._response_error_code = code
+            self._response_error_code = error.code
             return BufferedJsonResponse(
-                status,
-                {"error": {"code": code, "message": message, "status": status.value}},
+                error.status,
+                {
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                        "status": error.status.value,
+                    }
+                },
             )
 
         def _buffer_internal_error(self, exc: Exception) -> BufferedJsonResponse:
@@ -1351,16 +1298,6 @@ def _safe_route_template(target: str) -> str | None:
         return route_template(urlparse(target).path)
     except (UnicodeError, ValueError):
         return None
-
-
-def _key_error_response(exc: KeyError) -> tuple[HTTPStatus, str, str]:
-    detail = exc.args[0] if exc.args else "missing required field"
-    message = str(detail)
-    if message.startswith("unknown bot:"):
-        return HTTPStatus.NOT_FOUND, "unknown_bot", message
-    if message.startswith("unknown template:"):
-        return HTTPStatus.BAD_REQUEST, "unknown_template", message
-    return HTTPStatus.BAD_REQUEST, "invalid_request", f"missing required field: {message}"
 
 
 def template_to_dict(template: HermesTemplate) -> dict[str, Any]:
