@@ -1643,6 +1643,120 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
         marker_path.write_text(json.dumps(marker), encoding="utf-8")
         return marker_path
 
+    def test_strict_marker_final_profile_validation_enoent_is_untrusted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            _store, supervisor = self._fixture(root)
+            record = _store.get_bot("coder")
+            assert record is not None
+            profile = Path(record.profile_path)
+            marker_path = self._write_runtime_marker(
+                supervisor,
+                record.profile_path,
+                self._runtime_marker(supervisor),
+            )
+            displaced = root / "profile-displaced-during-validation"
+            profiles_stat = profile.parent.stat()
+            real_stat = os.stat
+            profile_observations = 0
+            restored = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal profile_observations, restored
+                if path == profile.name and dir_fd is not None:
+                    parent = os.fstat(dir_fd)
+                    if (
+                        parent.st_dev == profiles_stat.st_dev
+                        and parent.st_ino == profiles_stat.st_ino
+                    ):
+                        profile_observations += 1
+                        if profile_observations == 2:
+                            profile.rename(displaced)
+                            try:
+                                return real_stat(
+                                    path,
+                                    dir_fd=dir_fd,
+                                    follow_symlinks=follow_symlinks,
+                                )
+                            except FileNotFoundError:
+                                displaced.rename(profile)
+                                restored = True
+                                raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat):
+                observation = supervisor._read_strict_runtime_marker("coder", record.profile_path)
+
+            self.assertEqual(2, profile_observations)
+            self.assertTrue(restored)
+            self.assertEqual("untrusted", observation.kind)
+            self.assertTrue(profile.is_dir())
+            self.assertTrue(marker_path.is_file())
+
+    def test_inspect_marker_final_profile_validation_enoent_is_unsafe(self) -> None:
+        from zeus.private_io import UnsafeFileError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            _store, supervisor = self._fixture(root)
+            record = _store.get_bot("coder")
+            assert record is not None
+            profile = Path(record.profile_path)
+            marker_path = self._write_runtime_marker(
+                supervisor,
+                record.profile_path,
+                self._runtime_marker(supervisor),
+            )
+            displaced = root / "profile-displaced-during-inspect"
+            profiles_stat = profile.parent.stat()
+            real_stat = os.stat
+            profile_observations = 0
+            restored = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal profile_observations, restored
+                if path == profile.name and dir_fd is not None:
+                    parent = os.fstat(dir_fd)
+                    if (
+                        parent.st_dev == profiles_stat.st_dev
+                        and parent.st_ino == profiles_stat.st_ino
+                    ):
+                        profile_observations += 1
+                        if profile_observations == 2:
+                            profile.rename(displaced)
+                            try:
+                                return real_stat(
+                                    path,
+                                    dir_fd=dir_fd,
+                                    follow_symlinks=follow_symlinks,
+                                )
+                            except FileNotFoundError:
+                                displaced.rename(profile)
+                                restored = True
+                                raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with (
+                patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat),
+                self.assertRaises(UnsafeFileError),
+            ):
+                supervisor._read_pid_marker(record.profile_path)
+
+            self.assertEqual(2, profile_observations)
+            self.assertTrue(restored)
+            self.assertTrue(profile.is_dir())
+            self.assertTrue(marker_path.is_file())
+
     def _compat_marker(
         self,
         supervisor: Supervisor,

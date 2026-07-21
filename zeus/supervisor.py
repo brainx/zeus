@@ -36,6 +36,7 @@ from zeus.gateway_launcher import (
     MAX_PAYLOAD_BYTES,
     LaunchPayloadError,
     _confirm_marker_missing,
+    _ConfirmedMissing,
     _is_owned_runtime_marker,
     _open_logs,
     _open_profile_chain,
@@ -1225,9 +1226,9 @@ class Supervisor:
         logs_fd = marker_fd = -1
         try:
             profile = _open_profile_chain(profile_path)
+        except _ConfirmedMissing:
+            return _MarkerObservation("missing", reason="marker is missing")
         except (OSError, ValueError) as exc:
-            if isinstance(exc.__cause__, FileNotFoundError):
-                return _MarkerObservation("missing", reason="marker is missing")
             return _MarkerObservation(
                 "untrusted", reason=f"registered profile cannot be opened safely: {exc}"
             )
@@ -1279,8 +1280,8 @@ class Supervisor:
                 return _MarkerObservation("untrusted", reason=f"marker is invalid: {exc}")
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 return _MarkerObservation("untrusted", reason=f"marker is invalid: {exc}")
-        except FileNotFoundError:
-            return _MarkerObservation("missing", reason="marker is missing")
+        except FileNotFoundError as exc:
+            return _MarkerObservation("untrusted", reason=f"marker is invalid: {exc}")
         finally:
             for fd in (marker_fd, logs_fd):
                 if fd >= 0:
@@ -3399,6 +3400,8 @@ class Supervisor:
                 profile = _open_profile_chain(safe_profile_path)
                 logs_fd = _open_logs(profile.fd, create=False)
                 marker_fd, marker_stat = _open_regular_marker(logs_fd)
+            except _ConfirmedMissing:
+                return {"exists": False}
             except (LaunchPayloadError, OSError, ValueError) as exc:
                 if _caused_by_missing_path(exc):
                     try:
@@ -3406,6 +3409,10 @@ class Supervisor:
                             _confirm_marker_missing(profile, logs_fd)
                         elif profile is not None:
                             profile.confirm_missing("logs")
+                        else:
+                            raise UnsafeFileError(
+                                "PID marker absence cannot be confirmed safely"
+                            ) from exc
                     except (LaunchPayloadError, OSError, ValueError) as confirm_error:
                         raise UnsafeFileError(
                             "PID marker absence cannot be confirmed safely"

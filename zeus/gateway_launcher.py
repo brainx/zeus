@@ -66,6 +66,10 @@ class LaunchPayloadError(ValueError):
     pass
 
 
+class _ConfirmedMissing(LaunchPayloadError):
+    """A missing path component whose absence was rechecked on retained descriptors."""
+
+
 def command_fingerprint(argv: list[str]) -> str:
     encoded = json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -388,6 +392,7 @@ def _open_profile_chain(profile_path: Path) -> _OpenedProfile:
             except LaunchPayloadError as exc:
                 if _caused_by_missing_path(exc):
                     _OpenedProfile(descriptors, tuple(names)).confirm_missing(component)
+                    raise _ConfirmedMissing("profile path component is missing") from exc
                 raise
             descriptors.append(next_fd)
             names.append(component)

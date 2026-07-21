@@ -329,6 +329,69 @@ class PrivateIOTests(unittest.TestCase):
         self.assertEqual(0o777, stat.S_IMODE(created_parent.stat().st_mode))
         self.assertEqual(0o700, stat.S_IMODE(private_dir.stat().st_mode))
 
+    def test_pin_directory_closes_duplicate_when_exit_binding_validation_fails(self) -> None:
+        private_dir = self.root / "private"
+        private_dir.mkdir(mode=0o700)
+        displaced = self.root / "private-displaced"
+        parent_stat = private_dir.parent.stat()
+        opened: set[int] = set()
+        duplicated: set[int] = set()
+        real_close = os.close
+        real_dup = os.dup
+        real_fstat = os.fstat
+        real_lstat = os.lstat
+        real_open = os.open
+        raced = False
+
+        def tracking_open(
+            name: str | bytes,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            descriptor = real_open(name, flags, mode, dir_fd=dir_fd)
+            opened.add(descriptor)
+            return descriptor
+
+        def tracking_dup(fd: int) -> int:
+            descriptor = real_dup(fd)
+            opened.add(descriptor)
+            duplicated.add(descriptor)
+            return descriptor
+
+        def racing_lstat(name: str | bytes, *, dir_fd: int | None = None) -> os.stat_result:
+            nonlocal raced
+            if duplicated and not raced and name == private_dir.name and dir_fd is not None:
+                parent = real_fstat(dir_fd)
+                if parent.st_dev == parent_stat.st_dev and parent.st_ino == parent_stat.st_ino:
+                    private_dir.rename(displaced)
+                    raced = True
+            return real_lstat(name, dir_fd=dir_fd)
+
+        with (
+            patch.object(private_io.os, "open", side_effect=tracking_open),
+            patch.object(private_io.os, "dup", side_effect=tracking_dup),
+            patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+            self.assertRaises(UnsafeFileError),
+            private_io.pin_private_directory(private_dir),
+        ):
+            self.fail("pin context must not be entered after binding drift")
+
+        leaked: list[int] = []
+        for descriptor in opened:
+            try:
+                real_fstat(descriptor)
+            except OSError:
+                continue
+            leaked.append(descriptor)
+        for descriptor in leaked:
+            real_close(descriptor)
+
+        self.assertTrue(raced)
+        self.assertEqual(1, len(duplicated))
+        self.assertEqual([], leaked)
+
     def test_existing_file_and_parent_modes_are_tightened_before_append(self) -> None:
         private_dir = self.root / "logs"
         private_dir.mkdir(mode=0o755)

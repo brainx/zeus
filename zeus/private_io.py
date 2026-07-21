@@ -723,25 +723,26 @@ def pin_private_directory(path: Path) -> Iterator[_PinnedPrivateDirectory]:
     parts = _validate_path(path, file_path=False)
     platform = _require_platform()
     pinned_fd = -1
-    with _open_directory_path(parts, create=False, platform=platform) as opened:
-        try:
-            pinned_fd = os.dup(opened.fd)
-            identity = os.fstat(pinned_fd)
-            _validate_directory_snapshots((identity,), "pinned private directory")
-            _validate_directory_requirement(
-                (identity,),
-                _DirectoryRequirement.exact_private,
-                platform.euid,
-                "pinned private directory",
-            )
-        except UnsafeFileError:
-            if pinned_fd >= 0:
-                _close_suppressing_error(pinned_fd)
-            raise
-        except (OSError, TypeError, ValueError) as exc:
-            if pinned_fd >= 0:
-                _close_suppressing_error(pinned_fd)
-            raise UnsafeFileError("private directory could not be pinned safely") from exc
+    try:
+        with _open_directory_path(parts, create=False, platform=platform) as opened:
+            try:
+                pinned_fd = os.dup(opened.fd)
+                identity = os.fstat(pinned_fd)
+                _validate_directory_snapshots((identity,), "pinned private directory")
+                _validate_directory_requirement(
+                    (identity,),
+                    _DirectoryRequirement.exact_private,
+                    platform.euid,
+                    "pinned private directory",
+                )
+            except UnsafeFileError:
+                raise
+            except (OSError, TypeError, ValueError) as exc:
+                raise UnsafeFileError("private directory could not be pinned safely") from exc
+    except BaseException:
+        if pinned_fd >= 0:
+            _close_suppressing_error(pinned_fd)
+        raise
     pinned = _PinnedPrivateDirectory(pinned_fd, identity, platform)
     try:
         yield pinned
