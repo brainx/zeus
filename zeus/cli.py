@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
 from zeus.api import serve, template_to_dict
-from zeus.config import Settings
+from zeus.config import Settings, load_dotenv
 from zeus.doctor import report_to_json, report_to_text, run_doctor
+from zeus.envfile import ENV_KEY_RE
 from zeus.errors import ZeusConflictError
 from zeus.models import BotCreateRequest, BotStatus, BotStatusResponse, RestartPolicy, TemplateError
 from zeus.process_lock import LockTimeoutError
@@ -60,7 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--env",
         action="append",
         default=[],
-        help="NAME=VALUE for env keys declared by the selected template",
+        help=(
+            "NAME=VALUE for env keys declared by the selected template; "
+            "unsafe for secrets because values enter argv"
+        ),
+    )
+    create.add_argument(
+        "--env-from",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="import NAME from the process environment, then trusted ./.env, without argv values",
     )
     create.add_argument("--restart-policy", choices=["manual", "on-failure"], default="manual")
     create.add_argument("--restart-backoff-seconds", type=float, default=5.0)
@@ -234,8 +246,44 @@ def _parse_env(pairs: list[str]) -> dict[str, str]:
     return values
 
 
+def _resolve_create_env(
+    pairs: list[str],
+    imported_names: list[str],
+    *,
+    process_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    values = _parse_env(pairs)
+    for name in imported_names:
+        if not ENV_KEY_RE.fullmatch(name):
+            raise ValueError("--env-from requires a valid environment variable name")
+
+    duplicate_names = sorted(set(values).intersection(imported_names))
+    if duplicate_names:
+        raise ValueError(
+            "environment variable provided by both --env and --env-from: "
+            + ", ".join(duplicate_names)
+        )
+
+    source_env = os.environ if process_env is None else process_env
+    needs_dotenv = any(name not in source_env for name in imported_names)
+    dotenv = load_dotenv(Path(".env")) if needs_dotenv else {}
+    for name in imported_names:
+        value = source_env[name] if name in source_env else dotenv.get(name)
+        if value is None or value == "":
+            raise ValueError(f"environment variable {name} is missing or empty")
+        values[name] = value
+    return values
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    create_env: dict[str, str] = {}
+    if args.resource == "bot" and args.action == "create":
+        try:
+            create_env = _resolve_create_env(args.env, args.env_from)
+        except ValueError as exc:
+            return _print_cli_error("invalid_request", str(exc), as_json=args.as_json)
+
     try:
         settings = Settings.from_env()
     except ValueError as exc:
@@ -305,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
                 bot_id=args.bot_id,
                 template_id=args.template_id,
                 display_name=args.display_name,
-                env=_parse_env(args.env),
+                env=create_env,
                 restart_policy=RestartPolicy(args.restart_policy),
                 restart_backoff_seconds=args.restart_backoff_seconds,
                 restart_max_attempts=args.restart_max_attempts,

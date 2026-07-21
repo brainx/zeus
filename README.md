@@ -56,9 +56,17 @@ cp .env.example .env
 
 zeus doctor
 zeus template list
-zeus bot create coder --template coding-bot
+zeus bot create coder --template coding-bot --env-from OPENROUTER_API_KEY
 zeus bot doctor coder
 ```
+
+`--env-from NAME` imports a named value from the process environment first and
+then the trusted workspace `./.env`; the value never enters the Zeus argument
+list or command output. A present but empty process value is an error and does
+not fall back to `.env`. Keep the workspace `.env` private with `chmod 0600 .env`.
+The legacy `--env NAME=VALUE` form remains available
+for non-secret compatibility values, but is unsafe for secrets because command
+arguments can be retained in shell history and exposed in process listings.
 
 Safety model: Zeus is a local process orchestrator, not a sandbox. Use Docker or
 another Hermes terminal backend for untrusted tasks. Do not expose the API
@@ -287,6 +295,20 @@ rejected unless the file is an exact mirror copy of a bundled template in the
 source tree.
 Rendered `.env` values are serialized with quoting when needed so whitespace, `#`,
 quotes, and backslashes cannot create extra assignments.
+
+Import template secrets by name instead of placing their values in argv:
+
+```bash
+zeus bot create coder \
+  --template coding-bot \
+  --env-from OPENROUTER_API_KEY
+```
+
+Zeus looks for each imported name in the process environment and then the
+trusted workspace `./.env`. Process values take precedence. Missing and empty
+values fail bot creation without printing the value. Keep `./.env` mode `0600`;
+Zeus also writes the imported values only to the selected profile's mode-`0600`
+`.env` file.
 
 Built-in templates include OpenRouter-backed bots and `deepseek-coding-bot`, which uses Hermes' native DeepSeek provider with `DEEPSEEK_API_KEY`. Example templates also cover gateway operations, log triage, and documentation writing.
 

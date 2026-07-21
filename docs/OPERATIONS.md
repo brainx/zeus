@@ -354,6 +354,23 @@ Hermes child processes receive a minimal environment by default plus variables
 rendered into the bot profile `.env`. Zeus does not pass the full API service or
 operator shell environment to child processes.
 
+Import bot secrets without putting their values in command arguments:
+
+```bash
+zeus bot create coder \
+  --template coding-bot \
+  --env-from OPENROUTER_API_KEY
+```
+
+For every `--env-from NAME`, Zeus reads the process environment first and then
+the trusted workspace `./.env`. A present but empty process value fails closed;
+it does not fall back to `.env`. Missing and empty errors identify only the
+variable name, and imported values are not printed. Keep the trusted source
+private with `chmod 0600 .env`. Zeus persists imported values only in the
+selected bot profile's `.env`, which Zeus writes with mode `0600`. The legacy
+`--env NAME=VALUE` form remains compatible for non-secret values but is unsafe
+for secrets because argv can be visible in shell history and process listings.
+
 To pass selected host variables, set an explicit allowlist:
 
 ```dotenv

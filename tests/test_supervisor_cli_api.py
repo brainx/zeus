@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import http.client
 import io
 import json
@@ -21,10 +22,11 @@ from unittest.mock import patch
 
 from zeus.api import main as api_main
 from zeus.api import make_handler
-from zeus.cli import _services, build_parser
+from zeus.cli import _parse_env, _services, build_parser
 from zeus.cli import main as cli_main
 from zeus.config import Settings
 from zeus.doctor import _check_runtime_paths, run_doctor
+from zeus.envfile import parse_env_text
 from zeus.errors import BotArchiveError, BotDeleteError, BotExistsError
 from zeus.hermes_adapter import HermesAdapter
 from zeus.lifecycle import LifecycleEventInput
@@ -126,6 +128,19 @@ class SupervisorCliApiTests(unittest.TestCase):
         with redirect_stdout(stdout):
             self.assertEqual(1, cli_main(argv))
         return stdout.getvalue()
+
+    def _run_cli_result(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = cli_main(argv)
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def _copy_cli_template(self, root: Path, template_id: str = "coding-bot") -> None:
+        templates = root / "templates"
+        templates.mkdir()
+        source = Path(__file__).resolve().parents[1] / "templates" / f"{template_id}.toml"
+        (templates / source.name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
     def _fake_hermes_path(self, root: Path) -> str:
         hermes = root / "bin" / "hermes"
@@ -2069,6 +2084,315 @@ password = "plain-password"
                 self.assertTrue((root / ".zeus" / "hermes" / "profiles" / "coder").exists())
             finally:
                 os.chdir(old_cwd)
+
+    def test_cli_create_help_recommends_env_from_and_warns_legacy_env_is_unsafe(self) -> None:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            build_parser().parse_args(["bot", "create", "--help"])
+
+        self.assertEqual(0, raised.exception.code)
+        help_text = stdout.getvalue()
+        self.assertIn("--env-from", help_text)
+        self.assertIn("process environment", help_text)
+        self.assertIn("unsafe for secrets", help_text)
+
+    def test_cli_env_from_process_value_wins_without_entering_parser_namespace_or_output(
+        self,
+    ) -> None:
+        process_secret = "process-precedence-sentinel"
+        dotenv_secret = "dotenv-precedence-sentinel"
+        parsed = build_parser().parse_args(
+            [
+                "bot",
+                "create",
+                "coder",
+                "--template",
+                "coding-bot",
+                "--env-from",
+                "OPENROUTER_API_KEY",
+            ]
+        )
+        self.assertEqual(["OPENROUTER_API_KEY"], parsed.env_from)
+        self.assertFalse(process_secret in repr(vars(parsed)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._copy_cli_template(root)
+            (root / ".env").write_text(f"OPENROUTER_API_KEY={dotenv_secret}\n", encoding="utf-8")
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(
+                    os.environ,
+                    {
+                        "ZEUS_STATE_DIR": str(root / ".zeus"),
+                        "OPENROUTER_API_KEY": process_secret,
+                    },
+                    clear=True,
+                ):
+                    exit_code, stdout, stderr = self._run_cli_result(
+                        [
+                            "bot",
+                            "create",
+                            "coder",
+                            "--template",
+                            "coding-bot",
+                            "--env-from",
+                            "OPENROUTER_API_KEY",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(0, exit_code)
+            profile_env = (root / ".zeus" / "hermes" / "profiles" / "coder" / ".env").read_text(
+                encoding="utf-8"
+            )
+            parsed_profile_env = parse_env_text(profile_env)
+            self.assertTrue(
+                hmac.compare_digest(parsed_profile_env["OPENROUTER_API_KEY"], process_secret)
+            )
+            self.assertFalse(dotenv_secret in profile_env)
+            self.assertFalse(process_secret in stdout + stderr)
+            self.assertFalse(dotenv_secret in stdout + stderr)
+            audit_text = (root / ".zeus" / "logs" / "audit.jsonl").read_text(encoding="utf-8")
+            self.assertFalse(process_secret in audit_text)
+            self.assertFalse(dotenv_secret in audit_text)
+            database_bytes = (root / ".zeus" / "zeus.db").read_bytes()
+            self.assertFalse(process_secret.encode() in database_bytes)
+            self.assertFalse(dotenv_secret.encode() in database_bytes)
+
+    def test_cli_env_from_uses_trusted_dotenv_fallback_without_echoing_value(self) -> None:
+        dotenv_secret = "trusted-dotenv-fallback-sentinel"
+        unrequested_secret = "unrequested-dotenv-sentinel"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._copy_cli_template(root)
+            (root / ".env").write_text(
+                f"OPENROUTER_API_KEY={dotenv_secret}\nOPENAI_API_KEY={unrequested_secret}\n",
+                encoding="utf-8",
+            )
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(
+                    os.environ,
+                    {"ZEUS_STATE_DIR": str(root / ".zeus")},
+                    clear=True,
+                ):
+                    exit_code, stdout, stderr = self._run_cli_result(
+                        [
+                            "bot",
+                            "create",
+                            "coder",
+                            "--template",
+                            "coding-bot",
+                            "--env-from",
+                            "OPENROUTER_API_KEY",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(0, exit_code)
+            profile_env = (root / ".zeus" / "hermes" / "profiles" / "coder" / ".env").read_text(
+                encoding="utf-8"
+            )
+            parsed_profile_env = parse_env_text(profile_env)
+            self.assertTrue(
+                hmac.compare_digest(parsed_profile_env["OPENROUTER_API_KEY"], dotenv_secret)
+            )
+            self.assertFalse(dotenv_secret in stdout + stderr)
+            self.assertFalse(unrequested_secret in profile_env)
+            self.assertFalse(unrequested_secret in stdout + stderr)
+            profile_env_path = root / ".zeus" / "hermes" / "profiles" / "coder" / ".env"
+            self.assertEqual(0o600, stat.S_IMODE(profile_env_path.stat().st_mode))
+
+    def test_cli_env_from_missing_and_empty_values_fail_before_service_creation(self) -> None:
+        fallback_secret = "must-not-fall-back-sentinel"
+        for value_state in ("missing", "empty"):
+            for as_json in (False, True):
+                with (
+                    self.subTest(value_state=value_state, as_json=as_json),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = Path(tmp)
+                    self._copy_cli_template(root)
+                    if value_state == "empty":
+                        (root / ".env").write_text(
+                            f"OPENROUTER_API_KEY={fallback_secret}\n", encoding="utf-8"
+                        )
+                    env = {"ZEUS_STATE_DIR": str(root / ".zeus")}
+                    if value_state == "empty":
+                        env["OPENROUTER_API_KEY"] = ""
+                    argv = [
+                        "bot",
+                        "create",
+                        "coder",
+                        "--template",
+                        "coding-bot",
+                        "--env-from",
+                        "OPENROUTER_API_KEY",
+                    ]
+                    if as_json:
+                        argv.append("--json")
+                    old_cwd = Path.cwd()
+                    try:
+                        os.chdir(root)
+                        with patch.dict(os.environ, env, clear=True):
+                            exit_code, stdout, stderr = self._run_cli_result(argv)
+                    finally:
+                        os.chdir(old_cwd)
+
+                    self.assertEqual(1, exit_code)
+                    output = stdout + stderr
+                    self.assertIn("OPENROUTER_API_KEY", output)
+                    self.assertIn("missing or empty", output)
+                    self.assertFalse(fallback_secret in output)
+                    self.assertFalse((root / ".zeus").exists())
+                    if as_json:
+                        payload = json.loads(stdout)
+                        self.assertEqual("invalid_request", payload["error"]["code"])
+                        self.assertEqual("", stderr)
+                    else:
+                        self.assertEqual("", stdout)
+
+    def test_cli_env_from_rejects_duplicate_and_invalid_names_without_values(self) -> None:
+        imported_secret = "imported-duplicate-sentinel"
+        legacy_secret = "legacy-duplicate-sentinel"
+        invalid_name = "invalid-name\ninjected-control-text"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._copy_cli_template(root)
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(
+                    os.environ,
+                    {
+                        "ZEUS_STATE_DIR": str(root / ".zeus"),
+                        "OPENROUTER_API_KEY": imported_secret,
+                    },
+                    clear=True,
+                ):
+                    duplicate = self._run_cli_result(
+                        [
+                            "bot",
+                            "create",
+                            "coder",
+                            "--template",
+                            "coding-bot",
+                            "--env",
+                            f"OPENROUTER_API_KEY={legacy_secret}",
+                            "--env-from",
+                            "OPENROUTER_API_KEY",
+                        ]
+                    )
+                    invalid_import = self._run_cli_result(
+                        [
+                            "bot",
+                            "create",
+                            "coder",
+                            "--template",
+                            "coding-bot",
+                            "--env-from",
+                            invalid_name,
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            for exit_code, stdout, stderr in (duplicate, invalid_import):
+                self.assertEqual(1, exit_code)
+                self.assertFalse(imported_secret in stdout + stderr)
+                self.assertFalse(legacy_secret in stdout + stderr)
+            self.assertIn("provided by both --env and --env-from", duplicate[2])
+            self.assertIn("valid environment variable name", invalid_import[2])
+            self.assertFalse(invalid_name in invalid_import[2])
+            self.assertNotIn("injected-control-text", invalid_import[2])
+            self.assertFalse((root / ".zeus").exists())
+
+    def test_cli_env_from_value_is_not_disclosed_when_template_rejects_key(self) -> None:
+        secret = "controlled-failure-sentinel"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._copy_cli_template(root)
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(
+                    os.environ,
+                    {
+                        "ZEUS_STATE_DIR": str(root / ".zeus"),
+                        "OPENAI_API_KEY": secret,
+                    },
+                    clear=True,
+                ):
+                    exit_code, stdout, stderr = self._run_cli_result(
+                        [
+                            "bot",
+                            "create",
+                            "coder",
+                            "--template",
+                            "coding-bot",
+                            "--env-from",
+                            "OPENAI_API_KEY",
+                            "--json",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(1, exit_code)
+            payload = json.loads(stdout)
+            self.assertEqual("invalid_request", payload["error"]["code"])
+            self.assertIn("OPENAI_API_KEY", payload["error"]["message"])
+            self.assertFalse(secret in stdout + stderr)
+            self.assertFalse((root / ".zeus" / "hermes" / "profiles" / "coder").exists())
+
+    def test_cli_legacy_env_syntax_remains_compatible(self) -> None:
+        legacy_value = "legacy-compatible-value"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._copy_cli_template(root)
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(
+                    os.environ,
+                    {"ZEUS_STATE_DIR": str(root / ".zeus")},
+                    clear=True,
+                ):
+                    exit_code, _stdout, _stderr = self._run_cli_result(
+                        [
+                            "bot",
+                            "create",
+                            "coder",
+                            "--template",
+                            "coding-bot",
+                            "--env",
+                            f"OPENROUTER_API_KEY={legacy_value}",
+                        ]
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(0, exit_code)
+            profile_env = (root / ".zeus" / "hermes" / "profiles" / "coder" / ".env").read_text(
+                encoding="utf-8"
+            )
+            parsed_profile_env = parse_env_text(profile_env)
+            self.assertTrue(
+                hmac.compare_digest(parsed_profile_env["OPENROUTER_API_KEY"], legacy_value)
+            )
+
+    def test_cli_legacy_env_parser_keeps_historical_permissive_and_error_contract(self) -> None:
+        self.assertEqual({"legacy-key": "value"}, _parse_env(["legacy-key=value"]))
+
+        malformed = "legacy-key"
+        with self.assertRaises(SystemExit) as raised:
+            _parse_env([malformed])
+        self.assertEqual(f"--env must be NAME=VALUE, got {malformed!r}", str(raised.exception))
 
     def test_cli_lifecycle_failures_return_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
