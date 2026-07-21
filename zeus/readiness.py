@@ -6,7 +6,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    ProxyHandler,
+    build_opener,
+)
+
+MAX_READINESS_RESPONSE_BYTES = 64 * 1024
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+_READINESS_OPENER = build_opener(ProxyHandler({}), _RejectRedirects())
 
 
 @dataclass(frozen=True)
@@ -54,12 +68,36 @@ def probe_once(
     expected_status: str = "ok",
     expected_platform: str = "hermes-agent",
 ) -> ReadinessResult:
-    parsed = urlparse(url)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        _port = parsed.port
+    except ValueError:
+        return ReadinessResult(False, "readiness URL must be loopback HTTP")
+    if (
+        parsed.scheme != "http"
+        or hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
         return ReadinessResult(False, "readiness URL must be loopback HTTP")
     try:
-        with urlopen(url, timeout=timeout_seconds) as response:  # nosec B310
-            payload = json.loads(response.read().decode("utf-8"))
+        with _READINESS_OPENER.open(url, timeout=timeout_seconds) as response:  # nosec B310
+            content_lengths = response.headers.get_all("content-length", [])
+            try:
+                declared_lengths = {int(value) for value in content_lengths}
+            except ValueError:
+                return ReadinessResult(False, "readiness response has invalid content length")
+            if any(length < 0 for length in declared_lengths) or len(declared_lengths) > 1:
+                return ReadinessResult(False, "readiness response has invalid content length")
+            if any(length > MAX_READINESS_RESPONSE_BYTES for length in declared_lengths):
+                return ReadinessResult(False, "readiness response exceeds size limit")
+            body = response.read(MAX_READINESS_RESPONSE_BYTES + 1)
+        if len(body) > MAX_READINESS_RESPONSE_BYTES:
+            return ReadinessResult(False, "readiness response exceeds size limit")
+        payload = json.loads(body.decode("utf-8"))
         if not isinstance(payload, dict):
             return ReadinessResult(False, "health payload must be a JSON object")
         if (
@@ -67,9 +105,14 @@ def probe_once(
             and payload.get("platform") == expected_platform
         ):
             return ReadinessResult(True, "ready", payload)
-        return ReadinessResult(False, f"unexpected health payload: {payload!r}", payload)
-    except (HTTPError, URLError, OSError, json.JSONDecodeError, ValueError) as exc:
-        return ReadinessResult(False, f"{type(exc).__name__}: {exc}")
+        return ReadinessResult(False, "unexpected readiness health payload")
+    except HTTPError as exc:
+        exc.close()
+        return ReadinessResult(False, "readiness endpoint returned an HTTP error")
+    except (URLError, OSError):
+        return ReadinessResult(False, "readiness probe failed")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return ReadinessResult(False, "readiness response is not valid JSON")
 
 
 def wait_until_ready(probe: ReadinessProbe) -> ReadinessResult:
