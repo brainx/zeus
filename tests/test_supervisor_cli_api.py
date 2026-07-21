@@ -23,7 +23,7 @@ from zeus.cli import _services, build_parser
 from zeus.cli import main as cli_main
 from zeus.config import Settings
 from zeus.doctor import _check_runtime_paths, run_doctor
-from zeus.errors import BotArchiveError, BotDeleteError
+from zeus.errors import BotArchiveError, BotDeleteError, BotExistsError
 from zeus.hermes_adapter import HermesAdapter
 from zeus.lifecycle import LifecycleEventInput
 from zeus.logging_utils import redact_secrets
@@ -371,6 +371,86 @@ class SupervisorCliApiTests(unittest.TestCase):
                 str(profile / "logs" / "zeus-gateway.pid.json"),
                 payload["marker_path"],
             )
+
+    def test_strict_runtime_contract_accepts_schema3_and_rejects_compat_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / "hermes"
+            profile = hermes_root / "profiles" / "coder"
+            profile.mkdir(parents=True)
+            hermes_bin = self._fake_hermes_path(root)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile),
+                )
+            )
+            pending = store.begin_lifecycle_intent(
+                "coder",
+                action="start",
+                operation_id="a" * 32,
+                source="cli",
+            )
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                hermes_root,
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
+                proc_start_fingerprint_reader=lambda pid: "test-process-start:4321",
+            )
+            schema3_payload = supervisor.adapter.launcher_payload(
+                "coder",
+                operation_id="a" * 32,
+                desired_revision=pending.desired_revision,
+                readiness_probe=None,
+            )["marker"]
+            assert isinstance(schema3_payload, dict)
+            schema3 = dict(schema3_payload)
+            schema3.update(
+                {
+                    "pid": 4321,
+                    "started_at": 1_780_000_000.0,
+                    "proc_start_fingerprint": "test-process-start:4321",
+                }
+            )
+            schema2 = {
+                "schema": 2,
+                "pid": 4321,
+                "bot_id": "coder",
+                "component": "gateway",
+                "action": "run",
+                "argv": self._gateway_argv(hermes_bin),
+                "resolved_hermes_bin": hermes_bin,
+                "started_at": 1_780_000_000.0,
+                "proc_start_fingerprint": "test-process-start:4321",
+            }
+            legacy = {
+                "pid": 4321,
+                "argv": self._gateway_argv(hermes_bin),
+                "started_at": 1_780_000_000.0,
+                "proc_start_fingerprint": "test-process-start:4321",
+            }
+
+            for name, marker, expected_kind, expected_reason in (
+                ("schema3", schema3, "live", ""),
+                ("schema2", schema2, "untrusted", "marker correlation is invalid"),
+                ("legacy", legacy, "untrusted", "marker correlation is invalid"),
+            ):
+                with self.subTest(name=name):
+                    observed = supervisor._classify_schema3_runtime_marker(
+                        pending,
+                        marker,
+                        expected_operation_id="a" * 32,
+                        expected_revision=pending.desired_revision,
+                        require_live_command=False,
+                    )
+                    self.assertEqual(expected_kind, observed.kind)
+                    self.assertEqual(expected_reason, observed.reason)
 
     def test_linux_cmdline_reader_uses_proc_cmdline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1969,6 +2049,113 @@ password = "plain-password"
 
             self.assertEqual(BotStatus.failed, started["status"])
             self.assertEqual(BotStatus.failed, status["status"])
+
+    def test_cli_create_start_stop_and_reconcile_json_exit_contracts(self) -> None:
+        timestamp = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+        created = BotRecord(
+            bot_id="coder",
+            template_id="coding-bot",
+            display_name="Coder",
+            profile_path="/profiles/coder",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        started = BotStatusResponse(
+            bot_id="start-failed",
+            status=BotStatus.failed,
+            pid=None,
+            profile_path="/profiles/start-failed",
+            message="failed to start gateway: missing hermes",
+        )
+        stopped = BotStatusResponse(
+            bot_id="coder",
+            status=BotStatus.stopped,
+            pid=None,
+            profile_path="/profiles/coder",
+            message="gateway shutdown completed",
+        )
+        pending = BotStatusResponse(
+            bot_id="pending-bot",
+            status=BotStatus.failed,
+            pid=None,
+            profile_path="/profiles/pending-bot",
+            message="restart scheduled: attempt 1/5 in 5s",
+        )
+        terminal = BotStatusResponse(
+            bot_id="broken-bot",
+            status=BotStatus.failed,
+            pid=None,
+            profile_path="/profiles/broken-bot",
+            message="manual policy: not restarting",
+        )
+
+        class CliContractSupervisor:
+            def create_bot(self, request, template, **kwargs):
+                if request.bot_id == "existing":
+                    raise BotExistsError("bot already exists: existing")
+                return created
+
+            def start(self, bot_id: str, **kwargs) -> BotStatusResponse:
+                return started
+
+            def stop(self, bot_id: str, **kwargs) -> BotStatusResponse:
+                return stopped
+
+            def reconcile(self, bot_id: str | None, **kwargs) -> list[BotStatusResponse]:
+                return [pending if bot_id == "pending-bot" else terminal]
+
+        def run(argv: list[str]) -> tuple[int, str]:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli_main(argv)
+            return exit_code, stdout.getvalue()
+
+        cases = (
+            (
+                "create_success",
+                ["bot", "create", "coder", "--template", "coding-bot", "--json"],
+                0,
+                created.to_dict(),
+            ),
+            (
+                "create_conflict",
+                ["bot", "create", "existing", "--template", "coding-bot", "--json"],
+                1,
+                {
+                    "error": {
+                        "code": "bot_exists",
+                        "message": "bot already exists: existing",
+                    }
+                },
+            ),
+            ("start_failure", ["bot", "start", "start-failed"], 1, started.to_dict()),
+            ("stop_success", ["bot", "stop", "coder"], 0, stopped.to_dict()),
+            (
+                "reconcile_pending",
+                ["bot", "reconcile", "pending-bot", "--json"],
+                0,
+                [pending.to_dict()],
+            ),
+            (
+                "reconcile_terminal",
+                ["bot", "reconcile", "broken-bot", "--json"],
+                1,
+                [terminal.to_dict()],
+            ),
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"ZEUS_STATE_DIR": str(Path(tmp) / ".zeus")}),
+            patch("zeus.cli._services", return_value=(object(), CliContractSupervisor())),
+        ):
+            for name, argv, expected_exit, expected_payload in cases:
+                with self.subTest(name=name):
+                    exit_code, output = run(argv)
+                    self.assertEqual(expected_exit, exit_code)
+                    self.assertEqual(
+                        json.dumps(expected_payload, sort_keys=True) + "\n",
+                        output,
+                    )
 
     def test_cli_wait_timeout_returns_nonzero_but_async_starting_is_successful(self) -> None:
         response = BotStatusResponse(

@@ -1566,6 +1566,65 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
         )
         return pending, marker_path
 
+    def test_start_and_stop_effects_observe_committed_lifecycle_intents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, supervisor = self._fixture(Path(tmp))
+            observed: list[tuple[str | None, int, str]] = []
+
+            def spawn_after_intent(*args: object, **kwargs: object) -> _RecoveryPopen:
+                pending = store.get_bot("coder")
+                assert pending is not None
+                event = store.list_lifecycle_events("coder", limit=1, before=None)[0]
+                observed.append((pending.pending_action, pending.desired_revision, event.action))
+                return _RecoveryPopen(*args, **kwargs)
+
+            supervisor.popen_factory = spawn_after_intent
+            _RecoveryPopen.launches.clear()
+
+            started = supervisor.start("coder")
+
+            self.assertEqual(BotStatus.running, started.status)
+            self.assertEqual([("start", 1, "bot.start.intent")], observed)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            alive = True
+            store, supervisor = self._fixture(
+                Path(tmp),
+                desired=DesiredState.running,
+                pid_alive_fn=lambda pid: alive,
+            )
+            record = store.get_bot("coder")
+            assert record is not None
+            running = replace(
+                record,
+                status=BotStatus.running,
+                pid=4321,
+                desired_revision=1,
+            )
+            store.upsert_bot(running)
+            self._write_runtime_marker(
+                supervisor,
+                running.profile_path,
+                self._runtime_marker(supervisor, desired_revision=1),
+            )
+            observed = []
+
+            def signal_after_intent(pid: int, sent_signal: object) -> None:
+                nonlocal alive
+                pending = store.get_bot("coder")
+                assert pending is not None
+                event = store.list_lifecycle_events("coder", limit=1, before=None)[0]
+                observed.append((pending.pending_action, pending.desired_revision, event.action))
+                alive = False
+
+            supervisor.kill_fn = signal_after_intent
+            supervisor.stop_grace_seconds = 0
+
+            stopped = supervisor.stop("coder")
+
+            self.assertEqual(BotStatus.stopped, stopped.status)
+            self.assertEqual([("stop", 2, "bot.stop.intent")], observed)
+
     def test_pending_compat_restart_fails_closed_without_side_effects(self) -> None:
         for schema in (2, None):
             for alive in (True, False):
@@ -1752,13 +1811,35 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
 
     def test_reconcile_crash_before_spawn_reuses_pending_correlation_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store, supervisor = self._fixture(Path(tmp))
+            root = Path(tmp)
+            store, _interrupted_supervisor = self._fixture(root)
             _RecoveryPopen.launches.clear()
             pending = store.begin_lifecycle_intent(
                 "coder",
                 action="start",
                 operation_id="a" * 32,
                 source="cli",
+            )
+
+            hermes = root / "bin" / "hermes"
+            hermes_root = root / "hermes"
+            recovered_store = StateStore(root / "zeus.db")
+            recovered_store.init()
+            supervisor = Supervisor(
+                recovered_store,
+                str(hermes),
+                hermes_root,
+                popen_factory=_RecoveryPopen,
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: [
+                    str(hermes.resolve()),
+                    "-p",
+                    "coder",
+                    "gateway",
+                    "run",
+                ],
+                proc_start_fingerprint_reader=lambda pid: "test-start:4321",
+                startup_grace_seconds=0,
             )
 
             result = supervisor.reconcile("coder")[0]
@@ -1768,7 +1849,7 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
             marker = _RecoveryPopen.launches[0]["marker"]
             self.assertEqual("a" * 32, marker["operation_id"])
             self.assertEqual(pending.desired_revision, marker["desired_revision"])
-            loaded = store.get_bot("coder")
+            loaded = recovered_store.get_bot("coder")
             assert loaded is not None
             self.assertIsNone(loaded.pending_operation_id)
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput, serialize_lifecycle_details
-from zeus.models import BotRecord, BotStatus
+from zeus.models import BotRecord, BotStatus, DesiredState
 from zeus.state import StateStore
 
 
@@ -320,6 +320,73 @@ class LifecycleLedgerTests(unittest.TestCase):
                         limit=50,
                         before=invalid_before,  # type: ignore[arg-type]
                     )
+
+    def test_pending_intent_projection_and_event_are_committed_as_one_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(self._record(root))
+
+            pending = store.begin_lifecycle_intent(
+                "coder",
+                action="start",
+                operation_id="a" * 32,
+                source="api",
+                request_id="b" * 32,
+                reason="gateway start requested",
+            )
+
+            history = store.list_lifecycle_events("coder", limit=10, before=None)
+            self.assertEqual(1, len(history))
+            intent = history[0]
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                last_event_id = conn.execute(
+                    "SELECT last_event_id FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()[0]
+            self.assertEqual(intent.event_id, last_event_id)
+            self.assertEqual(DesiredState.running, pending.desired_state)
+            self.assertEqual(1, pending.desired_revision)
+            self.assertEqual("a" * 32, pending.pending_operation_id)
+            self.assertEqual("start", pending.pending_action)
+            self.assertEqual(
+                {
+                    "bot_id": "coder",
+                    "operation_id": "a" * 32,
+                    "request_id": "b" * 32,
+                    "source": "api",
+                    "action": "bot.start.intent",
+                    "outcome": "pending",
+                    "status_before": "stopped",
+                    "status_after": "stopped",
+                    "pid_before": None,
+                    "pid_after": None,
+                    "reason": "gateway start requested",
+                    "error_code": None,
+                    "error_message": None,
+                    "details": {
+                        "action": "start",
+                        "desired_revision": 1,
+                        "desired_state": "running",
+                    },
+                },
+                {
+                    "bot_id": intent.bot_id,
+                    "operation_id": intent.operation_id,
+                    "request_id": intent.request_id,
+                    "source": intent.source,
+                    "action": intent.action,
+                    "outcome": intent.outcome,
+                    "status_before": intent.status_before,
+                    "status_after": intent.status_after,
+                    "pid_before": intent.pid_before,
+                    "pid_after": intent.pid_after,
+                    "reason": intent.reason,
+                    "error_code": intent.error_code,
+                    "error_message": intent.error_message,
+                    "details": dict(intent.details),
+                },
+            )
 
     def test_event_input_is_frozen_and_recursively_redacts_bounded_details(self) -> None:
         nested_items = [{"visible": "value"}]

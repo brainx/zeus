@@ -22,7 +22,8 @@ from unittest.mock import patch
 from zeus import api as api_module
 from zeus.api import make_handler, serve
 from zeus.config import Settings
-from zeus.models import BotRecord, BotStatus, BotStatusResponse
+from zeus.errors import ZeusConflictError
+from zeus.models import BotRecord, BotStatus, BotStatusResponse, TemplateError
 from zeus.process_lock import LockTimeoutError
 from zeus.rate_limit import TokenBucket
 from zeus.reconciliation import (
@@ -235,6 +236,157 @@ def raw_post_without_content_length(port: int, body: bytes) -> tuple[int, dict[s
 
 
 class ApiBehaviorTests(unittest.TestCase):
+    def test_exception_status_payload_and_header_contracts(self) -> None:
+        cases = (
+            (
+                "unknown_bot",
+                lambda: KeyError("unknown bot: coder"),
+                404,
+                "unknown_bot",
+                "unknown bot: coder",
+            ),
+            (
+                "unknown_template",
+                lambda: KeyError("unknown template: missing"),
+                400,
+                "unknown_template",
+                "unknown template: missing",
+            ),
+            (
+                "missing_field",
+                lambda: KeyError("bot_id"),
+                400,
+                "invalid_request",
+                "missing required field: bot_id",
+            ),
+            (
+                "invalid_bot_id",
+                lambda: TemplateError("bot_id must match ^[a-z][a-z0-9-]{1,62}$"),
+                400,
+                "invalid_bot_id",
+                "bot_id must match ^[a-z][a-z0-9-]{1,62}$",
+            ),
+            (
+                "template_error",
+                lambda: TemplateError("template contract failed"),
+                400,
+                "invalid_request",
+                "template contract failed",
+            ),
+            (
+                "reconcile_lock",
+                lambda: ReconcileLockTimeoutError(Path("/tmp/reconcile.lock"), 0.1),
+                409,
+                "reconcile_locked",
+                "reconciliation is already in progress",
+            ),
+            (
+                "bot_lock",
+                lambda: LockTimeoutError(Path("/tmp/coder.lock"), 0.1),
+                409,
+                "bot_locked",
+                "bot lifecycle operation is already in progress",
+            ),
+            (
+                "conflict",
+                lambda: ZeusConflictError("conflicting lifecycle state"),
+                409,
+                "conflict",
+                "conflicting lifecycle state",
+            ),
+            (
+                "value_error",
+                lambda: ValueError("invalid lifecycle request"),
+                400,
+                "invalid_request",
+                "invalid lifecycle request",
+            ),
+            (
+                "internal_error",
+                lambda: RuntimeError("private failure detail"),
+                500,
+                "internal_error",
+                "internal server error",
+            ),
+        )
+
+        class RaisingSupervisor:
+            failure: Exception
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return
+
+            def status(self, *args: object, **kwargs: object) -> BotStatusResponse:
+                raise self.failure
+
+            def start(self, *args: object, **kwargs: object) -> BotStatusResponse:
+                raise self.failure
+
+        with (
+            patch("zeus.api.Supervisor", RaisingSupervisor),
+            api_server({"ZEUS_API_KEY": "secret"}) as port,
+        ):
+            for name, make_error, expected_status, code, message in cases:
+                expected = {
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "status": expected_status,
+                    }
+                }
+                expected_body = json.dumps(expected, sort_keys=True).encode("utf-8")
+                requests = (
+                    ("GET", "/bots/coder/status", {}),
+                    (
+                        "POST",
+                        "/bots/coder/start",
+                        {"idempotency-key": f"characterization-{name}"},
+                    ),
+                )
+                for method, path, extra_headers in requests:
+                    with self.subTest(name=name, method=method):
+                        RaisingSupervisor.failure = make_error()
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                        try:
+                            conn.request(
+                                method,
+                                path,
+                                headers={
+                                    "x-zeus-api-key": "secret",
+                                    **extra_headers,
+                                },
+                            )
+                            response = conn.getresponse()
+                            body = response.read()
+                            headers = {key.lower(): value for key, value in response.getheaders()}
+                        finally:
+                            conn.close()
+
+                        self.assertEqual(expected_status, response.status)
+                        self.assertEqual(expected_body, body)
+                        self.assertEqual(
+                            {
+                                "cache-control": "no-store",
+                                "content-length": str(len(expected_body)),
+                                "content-type": "application/json",
+                                "cross-origin-resource-policy": "same-origin",
+                                "referrer-policy": "no-referrer",
+                                "x-content-type-options": "nosniff",
+                            },
+                            {
+                                key: headers[key]
+                                for key in (
+                                    "cache-control",
+                                    "content-length",
+                                    "content-type",
+                                    "cross-origin-resource-policy",
+                                    "referrer-policy",
+                                    "x-content-type-options",
+                                )
+                            },
+                        )
+                        self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+
     def test_all_json_responses_include_generated_request_id(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
             for method, path in (("GET", "/health"), ("GET", "/bots"), ("PUT", "/bots")):
@@ -614,6 +766,35 @@ class ApiBehaviorTests(unittest.TestCase):
             status, body = request_json(port, "GET", "/v1/bots")
             self.assertEqual(200, status)
             self.assertEqual("coder", body[0]["bot_id"])
+
+    def test_v1_alias_preserves_queries_and_error_contracts(self) -> None:
+        cases = (
+            ("GET", "/", None),
+            ("GET", "/bots/missing/status", None),
+            ("GET", "/bots/missing/history?limit=1", None),
+            ("POST", "/bots/missing/start?wait=1&timeout=2.5", None),
+            ("POST", "/bots/missing/stop?kill_after_timeout=1", None),
+            ("POST", "/bots/missing/restart?wait=0", None),
+            ("POST", "/bots/missing/reconcile?summary=1", None),
+        )
+        with api_server({"ZEUS_API_KEY": "secret"}) as port:
+            for method, path, body in cases:
+                with self.subTest(method=method, path=path):
+                    rooted = request_json(
+                        port,
+                        method,
+                        path,
+                        body=body,
+                        headers={"x-zeus-api-key": "secret"},
+                    )
+                    aliased = request_json(
+                        port,
+                        method,
+                        "/v1" + path,
+                        body=body,
+                        headers={"x-zeus-api-key": "secret"},
+                    )
+                    self.assertEqual(rooted, aliased)
 
     def test_bot_create_and_list_expose_desired_state_and_convergence(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
