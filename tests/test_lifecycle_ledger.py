@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput, serialize_lifecycle_details
 from zeus.models import BotRecord, BotStatus, DesiredState
+from zeus.sanitization import sanitize_details
 from zeus.state import StateStore
 
 
@@ -498,6 +499,119 @@ class LifecycleLedgerTests(unittest.TestCase):
             stored.to_dict()["details"],
         )
         json.dumps(stored.to_dict(), sort_keys=True)
+
+    def test_sanitizer_bounds_cycles_nonfinite_numbers_and_free_text_secrets(self) -> None:
+        secret = "lifecycle-sentinel-9a21"
+        cycle: list[object] = []
+        cycle.append(cycle)
+        deep: object = "leaf"
+        for _ in range(12):
+            deep = {"next": deep}
+
+        sanitized = sanitize_details(
+            {
+                "api_key": secret,
+                "messages": [
+                    f"API_KEY={secret}",
+                    f"authorization=Bearer {secret}",
+                    f"request failed with Bearer {secret}",
+                ],
+                "cycle": cycle,
+                "deep": deep,
+                "nan": float("nan"),
+                "positive_infinity": float("inf"),
+                "negative_infinity": float("-inf"),
+            }
+        )
+        encoded = json.dumps(
+            sanitized,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+        self.assertFalse(secret.encode("utf-8") in encoded)
+        self.assertLessEqual(len(encoded), 8192)
+        self.assertIsNone(sanitized["nan"])  # type: ignore[index]
+        self.assertIsNone(sanitized["positive_infinity"])  # type: ignore[index]
+        self.assertIsNone(sanitized["negative_infinity"])  # type: ignore[index]
+        self.assertIn(b"[cycle]", encoded)
+        self.assertIn(b"[truncated]", encoded)
+
+        oversized = json.dumps(
+            sanitize_details({"message": "Δ" * 20_000}),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertLessEqual(len(oversized), 8192)
+
+        bounded_collection = sanitize_details({"items": list(range(1_000))})
+        self.assertLessEqual(len(bounded_collection["items"]), 64)  # type: ignore[index]
+
+    def test_sanitizer_redacts_values_for_oversized_sensitive_keys(self) -> None:
+        secret = "long-key-sentinel-cb30"
+        sanitized = sanitize_details({f"{'x' * 256}_api_key": secret})
+        encoded = json.dumps(sanitized, allow_nan=False).encode("utf-8")
+
+        self.assertFalse(secret.encode("utf-8") in encoded)
+
+    def test_sanitizer_never_invokes_hostile_string_or_repr_methods(self) -> None:
+        class Hostile:
+            def __str__(self) -> str:
+                raise AssertionError("string conversion invoked")
+
+            def __repr__(self) -> str:
+                raise AssertionError("representation invoked")
+
+        class HostileString(str):
+            def __str__(self) -> str:
+                raise AssertionError("string conversion invoked")
+
+            def __repr__(self) -> str:
+                raise AssertionError("representation invoked")
+
+        hostile_key = Hostile()
+        hostile_value = Hostile()
+
+        sanitized = sanitize_details(
+            {
+                "value": hostile_value,
+                "text": HostileString("TOKEN=hostile-string-sentinel"),
+                hostile_key: "untrusted key value",
+            }
+        )
+
+        self.assertEqual("[unsupported]", sanitized["value"])  # type: ignore[index]
+        self.assertEqual("[unsupported]", sanitized["text"])  # type: ignore[index]
+        json.dumps(sanitized, allow_nan=False)
+
+    def test_lifecycle_text_fields_are_redacted_before_sqlite_persistence(self) -> None:
+        secret = "event-sentinel-84c2"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            event = LifecycleEventInput(
+                bot_id="coder",
+                operation_id="a" * 32,
+                source="cli",
+                action="bot.start",
+                outcome="failure",
+                reason=f"readiness failed with Bearer {secret}",
+                error_code="readiness_failed",
+                error_message=f"cleanup failed: API_KEY={secret}",
+            )
+
+            store.upsert_bot_with_event(self._record(root), event=event)
+
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                row = conn.execute(
+                    "SELECT reason, error_message, details_json FROM lifecycle_events"
+                ).fetchone()
+            assert row is not None
+            persisted = "\n".join(str(value) for value in row if value is not None)
+            self.assertFalse(secret in persisted)
 
     def test_upsert_bot_with_event_rolls_back_projection_when_event_insert_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

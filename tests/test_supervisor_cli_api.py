@@ -14,7 +14,7 @@ import threading
 import time
 import unittest
 import uuid
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -33,7 +33,12 @@ from zeus.models import BotRecord, BotStatus, BotStatusResponse, DesiredState, R
 from zeus.private_io import UnsafeFileError
 from zeus.process_lock import LockTimeoutError
 from zeus.readiness import ReadinessResult
-from zeus.reconciliation import BotReconcileResult, ReconcileOutcome, ReconcileRunSummary
+from zeus.reconciliation import (
+    BotReconcileResult,
+    ReconcileOutcome,
+    ReconcileRunStart,
+    ReconcileRunSummary,
+)
 from zeus.state import StateStore
 from zeus.supervisor import (
     Supervisor,
@@ -2979,6 +2984,123 @@ password = "plain-password"
             self.assertIn("bot.reconcile.restart_scheduled", events)
             self.assertNotIn("plain-secret", store.audit_log_path().read_text(encoding="utf-8"))
             self.assertIn("[redacted]", store.audit_log_path().read_text(encoding="utf-8"))
+
+    def test_audit_sanitization_is_bounded_recursive_and_best_effort(self) -> None:
+        secret = "audit-sentinel-71b4"
+
+        class Hostile:
+            def __str__(self) -> str:
+                raise AssertionError("string conversion invoked")
+
+            def __repr__(self) -> str:
+                raise AssertionError("representation invoked")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "zeus.db")
+            store.append_audit_event(
+                "bot.start_registration_failed",
+                cleanup_errors=[
+                    f"cleanup failed: API_KEY={secret}",
+                    {"message": f"authorization=Bearer {secret}"},
+                ],
+                readiness_message=f"probe returned Bearer {secret}",
+                nonfinite=float("nan"),
+                hostile=Hostile(),
+            )
+            store.append_audit_event("bot.oversized", oversized="Δ" * 20_000)
+            store.append_audit_event(
+                "e" * 2_048,
+                first="x" * 1_800,
+                second="x" * 1_800,
+                third="x" * 1_800,
+                fourth="x" * 1_800,
+            )
+
+            raw = store.audit_log_path().read_bytes()
+            lines = raw.splitlines()
+            payload = json.loads(lines[0])
+            self.assertFalse(secret.encode("utf-8") in raw)
+            self.assertNotIn(b"NaN", raw)
+            self.assertTrue(all(len(line) <= 8192 for line in lines))
+            self.assertEqual("bot.start_registration_failed", payload["event"])
+            self.assertEqual("[unsupported]", payload["hostile"])
+            self.assertIsNone(payload["nonfinite"])
+            self.assertTrue(json.loads(lines[1])["truncated"])
+            self.assertTrue(json.loads(lines[2])["truncated"])
+
+    def test_projection_and_reconcile_messages_are_sanitized_before_persistence(self) -> None:
+        secret = "projection-sentinel-2f96"
+        started_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / "profiles" / "coder"),
+                    last_error=f"readiness API_KEY={secret}",
+                    last_transition_reason=f"cleanup Bearer {secret}",
+                )
+            )
+            initial_record = store.get_bot("coder")
+            assert initial_record is not None
+            self.assertFalse(secret in (initial_record.last_error or ""))
+            self.assertFalse(secret in (initial_record.last_transition_reason or ""))
+            store.update_lifecycle_state(
+                "coder",
+                BotStatus.failed,
+                last_error=f"updated readiness API_KEY={secret}",
+                last_transition_reason=f"updated cleanup Bearer {secret}",
+            )
+            run = ReconcileRunStart(
+                run_id="security-sanitization",
+                scope="fleet",
+                requested_bot_id=None,
+                source="cli",
+                force=False,
+                reset_restart=False,
+                started_at=started_at,
+            )
+            result = BotReconcileResult(
+                bot_id="coder",
+                outcome=ReconcileOutcome.error,
+                desired_state="running",
+                observed_status="failed",
+                pid=None,
+                action="inspect",
+                message=f"readiness API_KEY={secret}; cleanup Bearer {secret}",
+                error_code="readiness_failed",
+                event_id=None,
+                started_at=started_at,
+                finished_at=started_at + timedelta(seconds=1),
+            )
+            store.begin_reconcile_run(run)
+            store.append_reconcile_result(run.run_id, result)
+
+            loaded_record = store.get_bot("coder")
+            loaded_run = store.get_reconcile_run(run.run_id)
+            assert loaded_record is not None
+            assert loaded_run is not None
+            self.assertFalse(secret in (loaded_record.last_error or ""))
+            self.assertFalse(secret in (loaded_record.last_transition_reason or ""))
+            self.assertFalse(secret in result.message)
+            self.assertFalse(secret in loaded_run.results[0].message)
+            self.assertEqual(result, loaded_run.results[0])
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                bot_row = conn.execute(
+                    "SELECT last_error, last_transition_reason FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()
+                reconcile_row = conn.execute(
+                    "SELECT message FROM reconcile_results WHERE run_id = ?",
+                    (run.run_id,),
+                ).fetchone()
+            assert bot_row is not None
+            assert reconcile_row is not None
+            persisted = "\n".join((*bot_row, *reconcile_row))
+            self.assertFalse(secret in persisted)
 
     def test_audit_write_failure_does_not_break_lifecycle_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,6 +11,7 @@ from typing import Protocol
 
 from zeus.models import BotRecord, BotStatus, BotStatusResponse, DesiredState
 from zeus.process_lock import BotProcessLock, LockTimeoutError
+from zeus.sanitization import sanitize_text
 
 MAX_RECONCILE_ID_LENGTH = 128
 MAX_RECONCILE_TEXT_LENGTH = 2048
@@ -48,7 +49,7 @@ def _validate_required_text(value: str, name: str, *, maximum: int) -> str:
 
 
 def _bound_text(value: str, name: str) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise ValueError(f"{name} must be a string")
     return value[:MAX_RECONCILE_TEXT_LENGTH]
 
@@ -56,7 +57,7 @@ def _bound_text(value: str, name: str) -> str:
 def _bound_optional_text(value: str | None, name: str) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ValueError(f"{name} must be a non-empty string when provided")
     return value[:MAX_RECONCILE_TEXT_LENGTH]
 
@@ -144,7 +145,14 @@ class BotReconcileResult:
             object.__setattr__(self, "observed_status", observed_status)
         object.__setattr__(self, "pid", _validate_positive_optional_int(self.pid, "pid"))
         object.__setattr__(self, "action", _bound_text(self.action, "action"))
-        object.__setattr__(self, "message", _bound_text(self.message, "message"))
+        object.__setattr__(
+            self,
+            "message",
+            sanitize_text(
+                _bound_text(self.message, "message"),
+                max_length=MAX_RECONCILE_TEXT_LENGTH,
+            ),
+        )
         object.__setattr__(
             self,
             "error_code",

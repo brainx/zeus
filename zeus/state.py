@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,9 +25,9 @@ from zeus.reconciliation import (
     ReconcileRunStart,
     ReconcileRunSummary,
 )
+from zeus.sanitization import MAX_SANITIZED_JSON_BYTES, sanitize_details, sanitize_text
 
 SCHEMA_VERSION = 6
-AUDIT_SECRET_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)$")
 LIFECYCLE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 LIFECYCLE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 IDEMPOTENCY_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -46,21 +45,10 @@ RECONCILE_COUNTER_COLUMNS = {
 }
 
 
-def _safe_audit_value(key: str, value: object) -> object:
-    if AUDIT_SECRET_RE.search(key.upper()):
-        return "[redacted]"
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {
-            str(child_key): _safe_audit_value(str(child_key), child_value)
-            for child_key, child_value in value.items()
-        }
-    if isinstance(value, list):
-        return [_safe_audit_value(key, child_value) for child_value in value]
-    return str(value)
+def _sanitize_optional_persisted_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return sanitize_text(value)
 
 
 def _validate_idempotency_hash(value: str, label: str) -> str:
@@ -1754,16 +1742,33 @@ class StateStore:
         return self.database_path.parent / "logs" / "audit.jsonl"
 
     def append_audit_event(self, event: str, **fields: object) -> None:
-        payload: dict[str, object] = {
-            "ts": datetime.now(UTC).isoformat(),
-            "event": event,
-        }
-        for key, value in fields.items():
-            payload[key] = _safe_audit_value(key, value)
         try:
-            line = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+            safe_fields = sanitize_details(fields)
+            if type(safe_fields) is not dict:
+                return
+            timestamp = datetime.now(UTC).isoformat()
+            safe_event = sanitize_text(event)
+            payload = {
+                "ts": timestamp,
+                "event": safe_event,
+                **safe_fields,
+            }
+            line = (json.dumps(payload, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+            if len(line) > MAX_SANITIZED_JSON_BYTES:
+                line = (
+                    json.dumps(
+                        {
+                            "ts": timestamp,
+                            "event": safe_event,
+                            "truncated": True,
+                        },
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
             append_private_bytes(nofollow_absolute_path(self.audit_log_path()), line)
-        except (OSError, TypeError, ValueError):
+        except Exception:
             return
 
     def upsert_bot(self, record: BotRecord) -> None:
@@ -1843,8 +1848,8 @@ class StateStore:
                 record.ready_at.isoformat() if record.ready_at else None,
                 record.stopped_at.isoformat() if record.stopped_at else None,
                 record.last_exit_code,
-                record.last_error,
-                record.last_transition_reason,
+                _sanitize_optional_persisted_text(record.last_error),
+                _sanitize_optional_persisted_text(record.last_transition_reason),
                 record.desired_state.value,
                 record.desired_revision,
                 record.desired_updated_at.isoformat() if record.desired_updated_at else None,
@@ -2010,8 +2015,8 @@ class StateStore:
                 int(clear_stopped_at),
                 stopped_at.isoformat() if stopped_at else None,
                 last_exit_code,
-                last_error,
-                last_transition_reason,
+                _sanitize_optional_persisted_text(last_error),
+                _sanitize_optional_persisted_text(last_transition_reason),
                 now,
                 int(reset_restart),
                 int(reset_restart),
