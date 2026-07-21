@@ -227,7 +227,10 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         settings.state_dir / "logs" / "api.jsonl",
         enabled=settings.api_log_enabled,
     )
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        synchronous=settings.sqlite_synchronous,
+    )
     store.init()
     supervisor = Supervisor(
         store,

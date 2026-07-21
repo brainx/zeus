@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import MagicMock, call, patch
 
+from zeus.config import SQLiteSynchronous
 from zeus.idempotency_store import IdempotencyStore
 from zeus.reconcile_store import RECONCILE_COUNTER_COLUMNS, ReconcileStore
 from zeus.reconciliation import (
@@ -487,7 +488,15 @@ class ReconcileStoreTests(unittest.TestCase):
             )
             actual_loaded = facade.get_reconcile_run(run.run_id)
 
-        self.assertEqual([call(database_path)], database_type.call_args_list)
+        self.assertEqual(
+            [
+                call(
+                    database_path,
+                    synchronous=SQLiteSynchronous.NORMAL,
+                )
+            ],
+            database_type.call_args_list,
+        )
         self.assertEqual([call(database)], schema_type.call_args_list)
         self.assertEqual([call(database)], idempotency_type.call_args_list)
         self.assertEqual([call(database)], reconcile_type.call_args_list)

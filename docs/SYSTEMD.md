@@ -28,6 +28,7 @@ ZEUS_HERMES_BIN=/usr/local/bin/hermes
 ZEUS_HOST=127.0.0.1
 ZEUS_PORT=4311
 ZEUS_STATE_DIR=/var/lib/zeus
+ZEUS_SQLITE_SYNCHRONOUS=FULL
 ```
 
 Protect the file:
@@ -38,6 +39,20 @@ sudo chmod 0640 /etc/zeus/zeus.env
 ```
 
 Provider keys such as `DEEPSEEK_API_KEY` can also live in this env file. Do not commit real keys.
+
+Both bundled writer units, `zeus-api.service` and
+`zeus-reconcile.service`, select `ZEUS_SQLITE_SYNCHRONOUS=FULL`. Keep the
+setting consistent for every process that writes `/var/lib/zeus/zeus.db`,
+including manual CLI and doctor commands. After changing the mode, restart both
+writer units so newly opened connections receive it:
+
+```bash
+sudo systemctl restart zeus-api zeus-reconcile.service
+```
+
+FULL applies to SQLite commits only and can add commit latency. It does not make
+rendered profiles, PID markers, locks, or audit JSONL writes power-loss atomic;
+retain the backup plan in [Operations](OPERATIONS.md).
 
 Leave `ZEUS_ENV_PASSTHROUGH` unset unless Hermes needs selected proxy or
 certificate variables from the service environment. Profile `.env` files remain

@@ -32,7 +32,12 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.models`: Template, bot, and status validation.
 - `zeus.templates`: Bundled plus local TOML template discovery with duplicate ID checks.
 - `zeus.renderer`: Hermes profile rendering.
-- `zeus.state`: SQLite bot projection and authoritative lifecycle ledger.
+- `zeus.sqlite_db`: Shared SQLite connection factory and per-connection durability policy.
+- `zeus.schema`: Schema-v6 initialization, compatibility guards, and forward migrations.
+- `zeus.idempotency_store`: Durable API mutation claims and replay responses.
+- `zeus.reconcile_store`: Persisted fleet reconciliation runs and ordered results.
+- `zeus.bot_lifecycle_store`: Bot projection, intent, lifecycle ledger, history, and audit mirror.
+- `zeus.state`: Compatibility facade composing the shared database and persistence stores.
 - `zeus.lifecycle`: Bounded lifecycle event types and recursively redacted details.
 - `zeus.request_context`: Locally generated request IDs and normalized route templates.
 - `zeus.api_errors`: Transport-neutral API exception classification.
@@ -46,6 +51,25 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.api`: Local HTTP routes and compatibility facade.
 - `zeus.cli`: Operator CLI.
 - `zeus.doctor`: Readiness diagnostics.
+
+## SQLite Durability
+
+Zeus uses persistent SQLite WAL mode. `SQLiteDatabase` installs the selected
+`ZEUS_SQLITE_SYNCHRONOUS` policy on every returned operational connection after
+both newer-schema guards, foreign-key enforcement, and WAL setup. The raw
+read-only schema preflight cannot commit and is intentionally not configured.
+
+Committed transactions survive an application or Zeus process crash under both
+NORMAL and FULL. With NORMAL, SQLite omits a WAL sync on most commits, so a host
+OS crash, hard reset, or power loss can roll back recently reported commits
+after recovery while retaining WAL consistency. With FULL, SQLite syncs the WAL
+at each commit to provide durability across OS crash or power loss, at the cost
+of commit latency.
+
+The setting is per connection: every process that writes the same database must
+select the intended mode. It covers SQLite only. Rendered profile files, PID
+markers, locks, and the best-effort audit JSONL remain separate filesystem
+state, and neither mode replaces backup and restore procedures.
 
 ## Process Lifecycle
 

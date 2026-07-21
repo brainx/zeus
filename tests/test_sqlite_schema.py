@@ -6,9 +6,10 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar, cast
 from unittest.mock import MagicMock, call, patch
 
+from zeus.config import SQLiteSynchronous
 from zeus.schema import SCHEMA_VERSION, SchemaManager, _preflight_schema_compatibility
 from zeus.sqlite_db import SQLiteDatabase
 from zeus.state import StateStore
@@ -662,7 +663,15 @@ class SQLiteSchemaTests(unittest.TestCase):
             store.init()
             store.migrate()
 
-        self.assertEqual([call(database_path)], database_type.call_args_list)
+        self.assertEqual(
+            [
+                call(
+                    database_path,
+                    synchronous=SQLiteSynchronous.NORMAL,
+                )
+            ],
+            database_type.call_args_list,
+        )
         self.assertEqual([call(database)], schema_type.call_args_list)
         database.connect.assert_called_once_with()
         schema.init.assert_called_once_with()
@@ -826,6 +835,158 @@ class SQLiteSchemaTests(unittest.TestCase):
             self.assertFalse(any(sql.lstrip().upper().startswith("PRAGMA") for sql in traces))
             self.assertFalse(any(sql.lstrip().upper().startswith("BEGIN") for sql in traces))
             self.assertFalse(any(sql.lstrip().upper().startswith("UPDATE") for sql in traces))
+
+
+class SQLiteDurabilityTests(unittest.TestCase):
+    def test_database_default_is_normal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = SQLiteDatabase(Path(tmp) / "zeus.db")
+            self.assertIs(SQLiteSynchronous.NORMAL, database.synchronous)
+            SchemaManager(database).init()
+            with closing(database.connect()) as conn:
+                synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+
+        self.assertEqual(1, synchronous)
+
+    def test_database_full_is_applied_to_every_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = SQLiteDatabase(
+                Path(tmp) / "zeus.db",
+                synchronous="FULL",
+            )
+            self.assertIs(SQLiteSynchronous.FULL, database.synchronous)
+            SchemaManager(database).init()
+            with (
+                closing(database.connect()) as first,
+                closing(database.connect()) as second,
+                database.immediate() as immediate,
+            ):
+                observed = [
+                    conn.execute("PRAGMA synchronous").fetchone()[0]
+                    for conn in (first, second, immediate)
+                ]
+
+        self.assertEqual([2, 2, 2], observed)
+
+    def test_operational_connection_installs_full_in_guarded_order(self) -> None:
+        events: list[str] = []
+        connection = MagicMock(spec=sqlite3.Connection)
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "nested" / "zeus.db"
+            database = SQLiteDatabase(database_path, synchronous=SQLiteSynchronous.FULL)
+
+            def preflight(path: Path) -> None:
+                self.assertTrue(path.parent.is_dir())
+                events.append("preflight")
+
+            def open_connection(path: Path) -> sqlite3.Connection:
+                self.assertEqual(database_path, path)
+                events.append("open")
+                return connection
+
+            def guard(conn: sqlite3.Connection) -> None:
+                self.assertIs(connection, conn)
+                events.append("guard")
+
+            def execute(sql: str) -> MagicMock:
+                events.append(sql)
+                return MagicMock()
+
+            connection.execute.side_effect = execute
+            with (
+                patch("zeus.sqlite_db._preflight_schema_compatibility", side_effect=preflight),
+                patch("zeus.sqlite_db.sqlite3.connect", side_effect=open_connection),
+                patch("zeus.sqlite_db._assert_schema_compatible", side_effect=guard),
+            ):
+                actual = database.connect()
+
+        self.assertIs(connection, actual)
+        self.assertIs(sqlite3.Row, connection.row_factory)
+        self.assertEqual(
+            [
+                "preflight",
+                "open",
+                "guard",
+                "PRAGMA foreign_keys=ON",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+                "PRAGMA busy_timeout=5000",
+            ],
+            events,
+        )
+
+    def test_connections_keep_independent_synchronous_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "zeus.db"
+            normal = SQLiteDatabase(database_path, synchronous=SQLiteSynchronous.NORMAL)
+            full = SQLiteDatabase(database_path, synchronous=SQLiteSynchronous.FULL)
+            SchemaManager(normal).init()
+            with closing(normal.connect()) as normal_conn, closing(full.connect()) as full_conn:
+                normal_value = normal_conn.execute("PRAGMA synchronous").fetchone()[0]
+                full_value = full_conn.execute("PRAGMA synchronous").fetchone()[0]
+
+        self.assertEqual(1, normal_value)
+        self.assertEqual(2, full_value)
+
+    def test_state_store_default_remains_normal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "zeus.db")
+            store.init()
+            with closing(store.connect()) as conn:
+                synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+
+        self.assertEqual(1, synchronous)
+
+    def test_state_store_rejects_invalid_mode_before_parent_creation(self) -> None:
+        invalid_values: tuple[object, ...] = (
+            "OFF",
+            "EXTRA",
+            "full",
+            "FULL ",
+            "1",
+            "FULL; VACUUM",
+            1,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index, value in enumerate(invalid_values):
+                with self.subTest(value=value):
+                    database_path = root / str(index) / "zeus.db"
+                    with self.assertRaises(ValueError):
+                        StateStore(database_path, synchronous=cast(Any, value))
+                    self.assertFalse(database_path.parent.exists())
+
+    def test_state_store_passes_one_configured_database_to_every_delegate(self) -> None:
+        database_path = Path("state") / "zeus.db"
+        database = MagicMock(spec=SQLiteDatabase)
+        with (
+            patch("zeus.state.SQLiteDatabase", return_value=database) as database_type,
+            patch("zeus.state.SchemaManager") as schema_type,
+            patch("zeus.state.IdempotencyStore") as idempotency_type,
+            patch("zeus.state.ReconcileStore") as reconcile_type,
+            patch("zeus.state.BotLifecycleStore") as lifecycle_type,
+        ):
+            StateStore(database_path, synchronous=SQLiteSynchronous.FULL)
+
+        database_type.assert_called_once_with(
+            database_path,
+            synchronous=SQLiteSynchronous.FULL,
+        )
+        for child_type in (
+            schema_type,
+            idempotency_type,
+            reconcile_type,
+            lifecycle_type,
+        ):
+            child_type.assert_called_once_with(database)
+
+    def test_durability_configuration_does_not_change_schema_version(self) -> None:
+        self.assertEqual(6, SCHEMA_VERSION)
+        for mode in (SQLiteSynchronous.NORMAL, SQLiteSynchronous.FULL):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                database_path = Path(tmp) / "zeus.db"
+                StateStore(database_path, synchronous=mode).init()
+                self.assertEqual(EXPECTED_DDL_CATALOGS["fresh"], _ddl_catalog(database_path))
 
 
 if __name__ == "__main__":

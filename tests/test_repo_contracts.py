@@ -1241,6 +1241,40 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("https://github.com/brainx", architecture)
         self.assertIn('Maintainer = "https://github.com/brainx"', pyproject)
 
+    def test_sqlite_durability_policy_is_consistent_across_runtime_and_docs(self) -> None:
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+        api_service = Path("systemd/zeus-api.service").read_text(encoding="utf-8")
+        reconcile_service = Path("systemd/zeus-reconcile.service").read_text(encoding="utf-8")
+        timer = Path("systemd/zeus-reconcile.timer").read_text(encoding="utf-8")
+        systemd_docs = Path("docs/SYSTEMD.md").read_text(encoding="utf-8")
+        compatibility = Path("docs/COMPATIBILITY.md").read_text(encoding="utf-8").lower()
+        architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8").lower()
+        operations = Path("docs/OPERATIONS.md").read_text(encoding="utf-8").lower()
+
+        self.assertEqual(1, env_example.count("ZEUS_SQLITE_SYNCHRONOUS=NORMAL"))
+        self.assertNotIn("ZEUS_SQLITE_SYNCHRONOUS=FULL", env_example)
+        for service in (api_service, reconcile_service):
+            with self.subTest(service=service[:32]):
+                self.assertEqual(
+                    1,
+                    service.count("Environment=ZEUS_SQLITE_SYNCHRONOUS=FULL"),
+                )
+                self.assertIn("EnvironmentFile=/etc/zeus/zeus.env", service)
+        self.assertNotIn("ZEUS_SQLITE_SYNCHRONOUS", timer)
+        self.assertIn("ZEUS_SQLITE_SYNCHRONOUS=FULL", systemd_docs)
+        self.assertIn("normal", compatibility)
+        self.assertIn("unset", compatibility)
+        self.assertIn("empty", compatibility)
+        self.assertIn("schema v6", compatibility)
+        for text in (architecture, operations):
+            self.assertIn("process crash", text)
+            self.assertIn("power loss", text)
+        self.assertIn("every process that writes the same database", operations)
+        self.assertIn("sqlite only", operations)
+        self.assertIn("rendered profile files", operations)
+        self.assertIn("audit jsonl", operations)
+        self.assertIn("backup", operations)
+
     def test_root_scripts_credit_repo_maintainers(self) -> None:
         script_paths = [Path("Makefile"), *sorted(Path("scripts").glob("*.sh"))]
 

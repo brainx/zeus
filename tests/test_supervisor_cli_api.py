@@ -18,15 +18,15 @@ import uuid
 from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from zeus import __version__
 from zeus.api import main as api_main
 from zeus.api import make_handler
-from zeus.cli import _parse_env, _services, build_parser
+from zeus.cli import _demo_services, _parse_env, _services, build_parser
 from zeus.cli import main as cli_main
-from zeus.config import Settings
-from zeus.doctor import _check_runtime_paths, run_doctor
+from zeus.config import Settings, SQLiteSynchronous
+from zeus.doctor import _check_bots, _check_runtime_paths, run_doctor
 from zeus.envfile import parse_env_text
 from zeus.errors import BotArchiveError, BotDeleteError, BotExistsError
 from zeus.hermes_adapter import HermesAdapter
@@ -5118,6 +5118,100 @@ raise SystemExit(0)
             finally:
                 server.shutdown()
                 server.server_close()
+
+
+class SQLiteDurabilityConfigurationTests(unittest.TestCase):
+    def test_settings_accept_exact_modes_and_default_missing_or_empty_to_normal(self) -> None:
+        cases = (
+            (None, SQLiteSynchronous.NORMAL),
+            ("", SQLiteSynchronous.NORMAL),
+            ("NORMAL", SQLiteSynchronous.NORMAL),
+            ("FULL", SQLiteSynchronous.FULL),
+        )
+        for raw_value, expected in cases:
+            with self.subTest(raw_value=raw_value):
+                env: dict[str, str] = {}
+                if raw_value is not None:
+                    env["ZEUS_SQLITE_SYNCHRONOUS"] = raw_value
+                with patch("zeus.config.load_dotenv", return_value={}):
+                    settings = Settings.from_env(env)
+                self.assertIs(expected, settings.sqlite_synchronous)
+
+    def test_invalid_modes_fail_exactly_before_creating_state(self) -> None:
+        invalid_values = ("OFF", "EXTRA", "full", "FULL ", "1", "FULL; VACUUM")
+        for value in invalid_values:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                state_dir = Path(tmp) / "missing-state"
+                with (
+                    patch("zeus.config.load_dotenv", return_value={}),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        r"^ZEUS_SQLITE_SYNCHRONOUS must be NORMAL or FULL$",
+                    ),
+                ):
+                    Settings.from_env(
+                        {
+                            "ZEUS_STATE_DIR": str(state_dir),
+                            "ZEUS_SQLITE_SYNCHRONOUS": value,
+                        }
+                    )
+                self.assertFalse(state_dir.exists())
+
+    def test_cli_demo_and_doctor_forward_full_by_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings.from_env(
+                {
+                    "ZEUS_STATE_DIR": str(Path(tmp) / "state"),
+                    "ZEUS_SQLITE_SYNCHRONOUS": "FULL",
+                }
+            )
+            with (
+                patch.object(Settings, "ensure_dirs"),
+                patch("zeus.cli.StateStore") as cli_store_type,
+                patch("zeus.cli._demo_hermes_bin", return_value="fake-hermes"),
+                patch("zeus.cli._demo_cmdline_reader", return_value=lambda _pid: []),
+            ):
+                _services(settings)
+                _demo_services(settings, "coder")
+
+            with patch("zeus.doctor.StateStore") as doctor_store_type:
+                _check_bots(settings)
+
+        expected = call(
+            settings.database_path,
+            synchronous=SQLiteSynchronous.FULL,
+        )
+        self.assertEqual([expected, expected], cli_store_type.call_args_list)
+        self.assertEqual([expected], doctor_store_type.call_args_list)
+
+    def test_cli_main_rejects_invalid_mode_before_runtime_state_or_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "missing-state"
+            stderr = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ZEUS_STATE_DIR": str(state_dir),
+                        "ZEUS_SQLITE_SYNCHRONOUS": "OFF",
+                    },
+                    clear=True,
+                ),
+                patch("zeus.config.load_dotenv", return_value={}),
+                patch("zeus.cli.StateStore") as store_type,
+                patch.object(Settings, "ensure_dirs") as ensure_dirs,
+                redirect_stderr(stderr),
+            ):
+                result = cli_main(["bot", "list"])
+
+            self.assertEqual(1, result)
+            self.assertEqual(
+                "Invalid Zeus configuration: ZEUS_SQLITE_SYNCHRONOUS must be NORMAL or FULL\n",
+                stderr.getvalue(),
+            )
+            store_type.assert_not_called()
+            ensure_dirs.assert_not_called()
+            self.assertFalse(state_dir.exists())
 
 
 if __name__ == "__main__":

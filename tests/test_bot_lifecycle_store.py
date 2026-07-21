@@ -21,6 +21,7 @@ from zeus.bot_lifecycle_store import (
     LIFECYCLE_SOURCES,
     BotLifecycleStore,
 )
+from zeus.config import SQLiteSynchronous
 from zeus.idempotency_store import IdempotencyStore
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput
 from zeus.models import BotRecord, BotStatus
@@ -1083,7 +1084,15 @@ class BotLifecycleStoreTests(unittest.TestCase):
             actual_events = facade.list_lifecycle_events("coder", 10, 20)
             actual_history = facade.history_payload("coder", 10, 20)
 
-        self.assertEqual([call(database_path)], database_type.call_args_list)
+        self.assertEqual(
+            [
+                call(
+                    database_path,
+                    synchronous=SQLiteSynchronous.NORMAL,
+                )
+            ],
+            database_type.call_args_list,
+        )
         self.assertEqual([call(database)], schema_type.call_args_list)
         self.assertEqual([call(database)], idempotency_type.call_args_list)
         self.assertEqual([call(database)], reconcile_type.call_args_list)

@@ -5,12 +5,24 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from zeus.config import SQLiteSynchronous
 from zeus.schema import _assert_schema_compatible, _preflight_schema_compatibility
+
+_SYNCHRONOUS_PRAGMA = {
+    SQLiteSynchronous.NORMAL: "PRAGMA synchronous=NORMAL",
+    SQLiteSynchronous.FULL: "PRAGMA synchronous=FULL",
+}
 
 
 class SQLiteDatabase:
-    def __init__(self, database_path: Path | str) -> None:
+    def __init__(
+        self,
+        database_path: Path | str,
+        *,
+        synchronous: SQLiteSynchronous | str = SQLiteSynchronous.NORMAL,
+    ) -> None:
         self.database_path = Path(database_path)
+        self.synchronous = SQLiteSynchronous(synchronous)
 
     def connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,7 +33,7 @@ class SQLiteDatabase:
             _assert_schema_compatible(conn)
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(_SYNCHRONOUS_PRAGMA[self.synchronous])
             conn.execute("PRAGMA busy_timeout=5000")
             return conn
         except Exception:

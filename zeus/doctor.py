@@ -315,7 +315,10 @@ def _check_api_auth(settings: Settings) -> DoctorCheck:
 
 
 def _check_bots(settings: Settings) -> list[DoctorCheck]:
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        synchronous=settings.sqlite_synchronous,
+    )
     if not settings.database_path.exists():
         return [DoctorCheck("bots", "pass", "No bot registry exists yet")]
     try:

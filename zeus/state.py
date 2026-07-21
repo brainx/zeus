@@ -10,6 +10,7 @@ from zeus.bot_lifecycle_store import LIFECYCLE_ID_RE as LIFECYCLE_ID_RE
 from zeus.bot_lifecycle_store import LIFECYCLE_INTENT_ACTIONS as LIFECYCLE_INTENT_ACTIONS
 from zeus.bot_lifecycle_store import LIFECYCLE_SOURCES as LIFECYCLE_SOURCES
 from zeus.bot_lifecycle_store import BotLifecycleStore
+from zeus.config import SQLiteSynchronous
 from zeus.idempotency import IdempotencyClaim
 from zeus.idempotency_store import IDEMPOTENCY_HASH_RE as IDEMPOTENCY_HASH_RE
 from zeus.idempotency_store import IDEMPOTENCY_OWNER_RE as IDEMPOTENCY_OWNER_RE
@@ -34,8 +35,13 @@ from zeus.sqlite_db import SQLiteDatabase
 
 
 class StateStore:
-    def __init__(self, database_path: Path | str) -> None:
-        self._database = SQLiteDatabase(database_path)
+    def __init__(
+        self,
+        database_path: Path | str,
+        *,
+        synchronous: SQLiteSynchronous | str = SQLiteSynchronous.NORMAL,
+    ) -> None:
+        self._database = SQLiteDatabase(database_path, synchronous=synchronous)
         self._schema = SchemaManager(self._database)
         self._idempotency = IdempotencyStore(self._database)
         self._reconcile = ReconcileStore(self._database)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 import socket
@@ -12,7 +13,7 @@ import threading
 import time
 import unittest
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, redirect_stderr
 from datetime import UTC, datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -21,7 +22,7 @@ from unittest.mock import patch
 
 from zeus import api as api_module
 from zeus.api import make_handler, serve
-from zeus.config import Settings
+from zeus.config import Settings, SQLiteSynchronous
 from zeus.errors import ZeusConflictError
 from zeus.models import BotRecord, BotStatus, BotStatusResponse, TemplateError
 from zeus.process_lock import LockTimeoutError
@@ -2520,6 +2521,63 @@ class ApiRateLimitTests(unittest.TestCase):
         self.assertEqual(404, first_status)
         self.assertEqual(429, limited_status)
         self.assertEqual(404, refilled_status)
+
+
+class ApiSQLiteDurabilityTests(unittest.TestCase):
+    def test_make_handler_forwards_full_to_state_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings.from_env(
+                {
+                    "ZEUS_STATE_DIR": str(Path(tmp) / "state"),
+                    "ZEUS_SQLITE_SYNCHRONOUS": "FULL",
+                }
+            )
+            with (
+                patch.object(Settings, "ensure_dirs"),
+                patch("zeus.api.StateStore") as store_type,
+                patch("zeus.api.ApiLogWriter"),
+            ):
+                make_handler(settings)
+
+        store_type.assert_called_once_with(
+            settings.database_path,
+            synchronous=SQLiteSynchronous.FULL,
+        )
+
+    def test_api_main_rejects_invalid_mode_before_runtime_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "missing-state"
+            stderr = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ZEUS_STATE_DIR": str(state_dir),
+                        "ZEUS_SQLITE_SYNCHRONOUS": "FULL; VACUUM",
+                    },
+                    clear=True,
+                ),
+                patch("zeus.config.load_dotenv", return_value={}),
+                patch("zeus.api.serve") as serve_entrypoint,
+                patch("zeus.api.StateStore") as store_type,
+                patch("zeus.api.make_handler") as handler_factory,
+                patch("zeus.api.ThreadingHTTPServer") as server_type,
+                patch.object(Settings, "ensure_dirs") as ensure_dirs,
+                redirect_stderr(stderr),
+            ):
+                result = api_module.main([])
+
+            self.assertEqual(1, result)
+            self.assertEqual(
+                "Invalid Zeus configuration: ZEUS_SQLITE_SYNCHRONOUS must be NORMAL or FULL\n",
+                stderr.getvalue(),
+            )
+            serve_entrypoint.assert_not_called()
+            store_type.assert_not_called()
+            handler_factory.assert_not_called()
+            server_type.assert_not_called()
+            ensure_dirs.assert_not_called()
+            self.assertFalse(state_dir.exists())
 
 
 if __name__ == "__main__":

@@ -1,5 +1,40 @@
 # Operations
 
+## SQLite Durability
+
+Zeus uses SQLite WAL mode and applies `ZEUS_SQLITE_SYNCHRONOUS` to every
+operational connection. Unset or empty configuration defaults to NORMAL for
+upgrade compatibility. The bundled API and reconcile services select FULL.
+
+Committed transactions survive an application or Zeus process crash under both
+NORMAL and FULL. With NORMAL, SQLite omits a WAL sync on most commits; a host OS
+crash, hard reset, or power loss can roll back recently reported commits after
+recovery while WAL consistency is retained. With FULL, SQLite syncs the WAL at
+each commit to provide durability across OS crash or power loss, at the cost of
+commit latency.
+
+The policy is per connection. Every process that writes the same database,
+including manual CLI and doctor commands capable of migration, must select the
+intended mode. A NORMAL writer does not change an existing FULL connection, but
+its own commits retain NORMAL power-loss semantics. For hosted manual work where
+FULL durability is expected, carry the setting explicitly:
+
+```bash
+sudo -u zeus env \
+  ZEUS_STATE_DIR=/var/lib/zeus \
+  ZEUS_SQLITE_SYNCHRONOUS=FULL \
+  /opt/zeus/.venv/bin/zeus bot reconcile
+sudo -u zeus env \
+  ZEUS_STATE_DIR=/var/lib/zeus \
+  ZEUS_SQLITE_SYNCHRONOUS=FULL \
+  /opt/zeus/.venv/bin/zeus doctor --strict
+```
+
+The setting covers SQLite only. It does not make rendered profile files, PID
+markers, locks, or the best-effort audit JSONL atomic with the database, replace
+backups, or overcome storage that lies about flushes. Continue the backup and
+restore procedures below under either mode.
+
 ## Backup
 
 Back up `ZEUS_STATE_DIR` regularly. For the sample systemd deployment, that is
@@ -59,7 +94,7 @@ Start services and verify the restored host:
 ```bash
 sudo systemctl start zeus-api
 sudo systemctl start zeus-reconcile.timer
-sudo -u zeus env ZEUS_STATE_DIR=/var/lib/zeus \
+sudo -u zeus env ZEUS_STATE_DIR=/var/lib/zeus ZEUS_SQLITE_SYNCHRONOUS=FULL \
   /opt/zeus/.venv/bin/zeus doctor --strict
 ```
 

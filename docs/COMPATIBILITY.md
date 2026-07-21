@@ -31,6 +31,17 @@ The package metadata declares `requires-python = ">=3.11"`, while committed CI
 currently tests the versions listed above. A version absent from that matrix is
 not covered by the current automated compatibility claim.
 
+## SQLite durability compatibility
+
+Unset or empty `ZEUS_SQLITE_SYNCHRONOUS` configuration remains NORMAL, as do
+direct `StateStore(path)` and `SQLiteDatabase(path)` calls. Upgrading therefore
+does not silently change local commit latency. FULL is an explicit
+higher-durability option for deployments that accept its additional commit
+latency.
+
+This policy does not change database structure or require a migration: the
+schema remains schema v6 and every existing v6 database stays compatible.
+
 ## Manual clean-host evidence
 
 [`scripts/fresh_vps_verify.sh`](../scripts/fresh_vps_verify.sh) provides a manual

@@ -11,6 +11,7 @@ from typing import ClassVar
 from unittest.mock import MagicMock, call, patch
 
 from zeus import api as api_module
+from zeus.config import SQLiteSynchronous
 from zeus.idempotency import IdempotencyClaim
 from zeus.idempotency_store import (
     IDEMPOTENCY_HASH_RE,
@@ -397,7 +398,15 @@ class IdempotencyStoreTests(unittest.TestCase):
                     expires_at=expires_at,
                 )
 
-        self.assertEqual([call(database_path)], database_type.call_args_list)
+        self.assertEqual(
+            [
+                call(
+                    database_path,
+                    synchronous=SQLiteSynchronous.NORMAL,
+                )
+            ],
+            database_type.call_args_list,
+        )
         self.assertEqual([call(database)], schema_type.call_args_list)
         self.assertEqual([call(database)], store_type.call_args_list)
         database.connect.assert_not_called()

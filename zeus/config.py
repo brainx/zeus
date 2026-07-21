@@ -3,11 +3,17 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path
 
 from zeus.envfile import parse_env_text
 from zeus.private_io import ensure_private_directory, nofollow_absolute_path
+
+
+class SQLiteSynchronous(StrEnum):
+    NORMAL = "NORMAL"
+    FULL = "FULL"
 
 
 def load_dotenv(path: Path = Path(".env")) -> dict[str, str]:
@@ -41,11 +47,13 @@ class Settings:
     api_idempotency_retention_seconds: int
     api_idempotency_max_records: int
     api_log_enabled: bool = True
+    sqlite_synchronous: SQLiteSynchronous = SQLiteSynchronous.NORMAL
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         merged: dict[str, str] = load_dotenv()
         merged.update(dict(os.environ if env is None else env))
+        sqlite_synchronous = _sqlite_synchronous_env(merged)
         state_dir = nofollow_absolute_path(Path(merged.get("ZEUS_STATE_DIR") or ".zeus"))
         port = _port_env(merged, "ZEUS_PORT", default=4311)
         return cls(
@@ -140,6 +148,7 @@ class Settings:
                 maximum=1_000_000,
             ),
             api_log_enabled=merged.get("ZEUS_API_LOG_ENABLED", "1") == "1",
+            sqlite_synchronous=sqlite_synchronous,
         )
 
     def ensure_dirs(self) -> None:
@@ -171,6 +180,15 @@ def validate_api_exposure(host: str, api_key: str | None, allow_unauth_reads: bo
         raise ValueError("non-loopback API bind requires ZEUS_API_KEY")
     if len(api_key) < 16:
         raise ValueError("non-loopback API bind requires ZEUS_API_KEY with at least 16 characters")
+
+
+def _sqlite_synchronous_env(env: Mapping[str, str]) -> SQLiteSynchronous:
+    raw_value = env.get("ZEUS_SQLITE_SYNCHRONOUS")
+    value = SQLiteSynchronous.NORMAL.value if raw_value is None or raw_value == "" else raw_value
+    try:
+        return SQLiteSynchronous(value)
+    except ValueError as exc:
+        raise ValueError("ZEUS_SQLITE_SYNCHRONOUS must be NORMAL or FULL") from exc
 
 
 def _port_env(env: Mapping[str, str], name: str, *, default: int) -> int:

@@ -386,7 +386,10 @@ def _positive_event_id(value: str) -> int:
 
 def _services(settings: Settings) -> tuple[StateStore, Supervisor]:
     settings.ensure_dirs()
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        synchronous=settings.sqlite_synchronous,
+    )
     store.init()
     return store, Supervisor(
         store,
@@ -403,7 +406,10 @@ def _services(settings: Settings) -> tuple[StateStore, Supervisor]:
 def _demo_services(settings: Settings, bot_id: str) -> tuple[StateStore, Supervisor, str]:
     settings.ensure_dirs()
     fake_hermes = _demo_hermes_bin(settings)
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        synchronous=settings.sqlite_synchronous,
+    )
     store.init()
     return (
         store,
