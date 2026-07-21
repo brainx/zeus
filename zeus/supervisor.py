@@ -8,7 +8,6 @@ import os
 import platform
 import re
 import select
-import shlex
 import shutil
 import signal
 import stat
@@ -24,6 +23,7 @@ from pathlib import Path
 from typing import Protocol, TypeGuard
 from urllib.parse import urlparse
 
+from zeus import process_identity as _process_identity
 from zeus.errors import (
     BotArchiveError,
     BotDeleteError,
@@ -86,9 +86,20 @@ class PopenLike(Protocol):
 
 PopenFactory = Callable[..., PopenLike]
 KillFn = Callable[[int, signal.Signals], None]
-PidAliveFn = Callable[[int], bool]
-CmdlineReader = Callable[[int], list[str] | None]
-ProcStartFingerprintReader = Callable[[int], str | None]
+PidAliveFn = _process_identity.PidAliveFn
+CmdlineReader = _process_identity.CmdlineReader
+ProcStartFingerprintReader = _process_identity.ProcStartFingerprintReader
+
+_CommandCheck = _process_identity.CommandCheck
+_PidState = _process_identity.PidState
+_looks_like_python_interpreter = _process_identity.looks_like_python_interpreter
+_read_linux_cmdline = _process_identity.read_linux_cmdline
+_read_linux_process_start_fingerprint = _process_identity.read_linux_process_start_fingerprint
+_resolve_executable = _process_identity.resolve_executable
+_resolve_launcher_exec_target = _process_identity.resolve_launcher_exec_target
+_safe_command_shape = _process_identity.safe_command_shape
+_trusted_hermes_paths = _process_identity.trusted_hermes_paths
+_verify_gateway_command = _process_identity.verify_gateway_command
 
 
 @dataclass(frozen=True)
@@ -96,19 +107,6 @@ class OwnershipCheck:
     verified: bool
     reason: str
     classification: str | None = None
-
-
-@dataclass(frozen=True)
-class _CommandCheck:
-    verified: bool
-    reason: str
-    classification: str | None = None
-
-
-class _PidState(Enum):
-    alive = "alive"
-    dead = "dead"
-    unknown = "unknown"
 
 
 class _SignalResult(Enum):
@@ -121,7 +119,6 @@ class _ReadinessProbeUnset:
     pass
 
 
-_PYTHON_INTERPRETER_RE = re.compile(r"^python(?:\d+(?:\.\d+)?)?$")
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _LIFECYCLE_SOURCES = frozenset({"api", "cli", "reconcile", "recovery", "system"})
 _READINESS_PROBE_UNSET = _ReadinessProbeUnset()
@@ -1396,28 +1393,19 @@ class Supervisor:
         return _MarkerObservation("live", payload=payload)
 
     def _process_start_identity_error(self, payload: dict[str, object], pid: int) -> str | None:
-        marker_start = payload.get("proc_start_fingerprint")
-        live_start = self.proc_start_fingerprint_reader(pid)
-        if self._process_start_fingerprint_required():
-            if not self._valid_marker_start(marker_start) or not self._valid_marker_start(
-                live_start
-            ):
-                return "process start fingerprint is unavailable"
-            if marker_start != live_start:
-                return "process start fingerprint does not match"
-        elif live_start and marker_start != live_start:
-            return "process start fingerprint does not match"
-        elif marker_start and live_start != marker_start:
-            return "process start fingerprint is unavailable"
-        return None
+        return _process_identity.process_start_identity_error(
+            payload.get("proc_start_fingerprint"),
+            self.proc_start_fingerprint_reader(pid),
+            fingerprint_required=self._process_start_fingerprint_required(),
+        )
 
     @staticmethod
     def _valid_marker_start(value: object) -> bool:
-        return type(value) is str and bool(value) and len(value) <= 512
+        return _process_identity.valid_process_start_fingerprint(value)
 
     @staticmethod
     def _process_start_fingerprint_required() -> bool:
-        return platform.system() in {"Darwin", "Linux"}
+        return _process_identity.process_start_fingerprint_required(platform.system())
 
     def _classify_existing_runtime_marker(
         self,
@@ -3302,17 +3290,14 @@ class Supervisor:
         return record
 
     def _pid_state(self, pid: int) -> _PidState:
-        try:
-            if self.pid_alive_fn is not None:
-                return _PidState.alive if self.pid_alive_fn(pid) else _PidState.dead
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return _PidState.dead
-        except PermissionError:
-            return _PidState.unknown
-        except OSError as exc:
-            return _PidState.dead if exc.errno == errno.ESRCH else _PidState.unknown
-        return _PidState.alive
+        if self.pid_alive_fn is not None:
+            return _process_identity.pid_state(pid, pid_alive_fn=self.pid_alive_fn)
+
+        def probe_with_current_kill(probe_pid: int) -> bool:
+            os.kill(probe_pid, 0)
+            return True
+
+        return _process_identity.pid_state(pid, pid_alive_fn=probe_with_current_kill)
 
     def _unknown_pid_response(
         self,
@@ -3892,12 +3877,11 @@ class Supervisor:
 
 
 def _read_process_cmdline(pid: int) -> list[str] | None:
-    system = platform.system()
-    if system == "Linux":
-        return _read_linux_cmdline(pid)
-    if system == "Darwin":
-        return _read_darwin_cmdline(pid)
-    return None
+    return _process_identity.read_process_cmdline(
+        pid,
+        system=platform.system(),
+        run_process=subprocess.run,
+    )
 
 
 def _readiness_probe_marker_payload(probe: ReadinessProbe | None) -> dict[str, object] | None:
@@ -3958,175 +3942,20 @@ def _valid_probe_number(value: object) -> TypeGuard[int | float]:
     )
 
 
-def _read_linux_cmdline(pid: int, proc_root: Path = Path("/proc")) -> list[str]:
-    try:
-        raw = (proc_root / str(pid) / "cmdline").read_bytes()
-    except FileNotFoundError:
-        return []
-    except OSError:
-        return []
-    return [part.decode("utf-8", errors="surrogateescape") for part in raw.split(b"\0") if part]
-
-
 def _read_darwin_cmdline(pid: int) -> list[str] | None:
-    try:
-        completed = subprocess.run(  # nosec B603
-            ["/bin/ps", "-p", str(pid), "-o", "command="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return []
-    command = completed.stdout.strip()
-    if not command:
-        return []
-    try:
-        return shlex.split(command)
-    except ValueError:
-        return None
+    return _process_identity.read_darwin_cmdline(pid, run_process=subprocess.run)
 
 
 def _read_process_start_fingerprint(pid: int) -> str | None:
-    system = platform.system()
-    if system == "Darwin":
-        return _read_darwin_process_start_fingerprint(pid)
-    if system != "Linux":
-        return None
-    return _read_linux_process_start_fingerprint(pid)
+    return _process_identity.read_process_start_fingerprint(
+        pid,
+        system=platform.system(),
+        run_process=subprocess.run,
+    )
 
 
 def _read_darwin_process_start_fingerprint(pid: int) -> str | None:
-    try:
-        completed = subprocess.run(  # nosec B603
-            ["/bin/ps", "-p", str(pid), "-o", "lstart="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return None
-    started = " ".join(completed.stdout.split())
-    return f"darwin:ps-lstart:{started}" if started else None
-
-
-def _read_linux_process_start_fingerprint(pid: int, proc_root: Path = Path("/proc")) -> str | None:
-    try:
-        stat = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError, UnicodeDecodeError):
-        return None
-    try:
-        fields = stat.rsplit(") ", 1)[1].split()
-    except IndexError:
-        return None
-    if len(fields) < 20:
-        return None
-    return f"linux:/proc-starttime:{fields[19]}"
-
-
-def _verify_gateway_command(
-    argv: list[str],
-    bot_id: str,
-    trusted_hermes_bin: str | set[str] | None,
-    *,
-    require_trusted_path: bool,
-) -> _CommandCheck:
-    if not argv:
-        return _CommandCheck(False, "live-cmdline-missing")
-    classification = "direct-hermes"
-    hermes_command = argv[0]
-    args = argv[1:]
-    if len(argv) >= 2 and _looks_like_python_interpreter(argv[0]):
-        classification = "python-script-wrapper"
-        hermes_command = argv[1]
-        args = argv[2:]
-    if len(args) != 4 or args.count("-p") != 1 or args[0] != "-p":
-        return _CommandCheck(False, "wrong-command-intent", classification)
-    if args[1] != bot_id:
-        return _CommandCheck(False, "wrong-bot-id", classification)
-    if args[2:] != ["gateway", "run"]:
-        return _CommandCheck(False, "wrong-command-intent", classification)
-    if require_trusted_path:
-        resolved_command = _resolve_executable(hermes_command)
-        if isinstance(trusted_hermes_bin, str):
-            trusted_hermes_bins = {trusted_hermes_bin}
-        else:
-            trusted_hermes_bins = trusted_hermes_bin or set()
-        if not trusted_hermes_bins or resolved_command not in trusted_hermes_bins:
-            return _CommandCheck(False, "untrusted-executable", classification)
-    return _CommandCheck(True, "ok", classification)
-
-
-def _looks_like_python_interpreter(command: str) -> bool:
-    return bool(_PYTHON_INTERPRETER_RE.fullmatch(Path(command).name.lower()))
-
-
-def _resolve_executable(command: str, path: str | None = None) -> str | None:
-    if not command:
-        return None
-    candidate = command if "/" in command else shutil.which(command, path=path)
-    if candidate is None:
-        return None
-    try:
-        return str(Path(candidate).expanduser().resolve())
-    except (OSError, RuntimeError):
-        return str(Path(candidate).expanduser().absolute())
-
-
-def _trusted_hermes_paths(command: str) -> set[str]:
-    resolved = _resolve_executable(command)
-    if resolved is None:
-        return set()
-    paths = {resolved}
-    delegated = _resolve_launcher_exec_target(resolved)
-    if delegated is not None:
-        paths.add(delegated)
-    return paths
-
-
-def _resolve_launcher_exec_target(command: str) -> str | None:
-    path = Path(command)
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except (OSError, UnicodeDecodeError):
-        return None
-    if not text.startswith("#!"):
-        return None
-    for line in text.splitlines()[1:20]:
-        stripped = line.strip()
-        if not stripped.startswith("exec "):
-            continue
-        try:
-            parts = shlex.split(stripped)
-        except ValueError:
-            continue
-        if len(parts) < 2 or parts[0] != "exec":
-            continue
-        target = parts[1]
-        if "/" not in target:
-            continue
-        resolved = _resolve_executable(target)
-        if resolved and Path(resolved).name == "hermes":
-            return resolved
-    return None
-
-
-def _safe_command_shape(argv: list[str]) -> str:
-    if not argv:
-        return "empty"
-    classification = "direct-hermes"
-    args = argv[1:]
-    if len(argv) >= 2 and _looks_like_python_interpreter(argv[0]):
-        classification = "python-script-wrapper"
-        args = argv[2:]
-    if len(args) == 4 and args[0] == "-p" and args[2:] == ["gateway", "run"]:
-        return f"{classification} hermes -p <bot> gateway run"
-    return f"{classification} unrecognized"
+    return _process_identity.read_darwin_process_start_fingerprint(
+        pid,
+        run_process=subprocess.run,
+    )
