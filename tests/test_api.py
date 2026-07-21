@@ -767,34 +767,134 @@ class ApiBehaviorTests(unittest.TestCase):
             self.assertEqual(200, status)
             self.assertEqual("coder", body[0]["bot_id"])
 
-    def test_v1_alias_preserves_queries_and_error_contracts(self) -> None:
-        cases = (
-            ("GET", "/", None),
-            ("GET", "/bots/missing/status", None),
-            ("GET", "/bots/missing/history?limit=1", None),
-            ("POST", "/bots/missing/start?wait=1&timeout=2.5", None),
-            ("POST", "/bots/missing/stop?kill_after_timeout=1", None),
-            ("POST", "/bots/missing/restart?wait=0", None),
-            ("POST", "/bots/missing/reconcile?summary=1", None),
-        )
-        with api_server({"ZEUS_API_KEY": "secret"}) as port:
-            for method, path, body in cases:
-                with self.subTest(method=method, path=path):
-                    rooted = request_json(
-                        port,
-                        method,
-                        path,
-                        body=body,
-                        headers={"x-zeus-api-key": "secret"},
+    def test_v1_alias_normalizes_roots_and_forwards_lifecycle_queries(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class CapturingSupervisor:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return
+
+            def start(
+                self,
+                bot_id: str,
+                *,
+                wait: bool = False,
+                timeout_seconds: float | None = None,
+                source: str = "cli",
+                request_id: str | None = None,
+            ) -> BotStatusResponse:
+                calls.append(("start", bot_id, wait, timeout_seconds, source, request_id))
+                return BotStatusResponse(bot_id, BotStatus.starting, 123, "/profiles/coder")
+
+            def stop(
+                self,
+                bot_id: str,
+                *,
+                kill_after_timeout: bool | None = None,
+                source: str = "cli",
+                request_id: str | None = None,
+            ) -> BotStatusResponse:
+                calls.append(("stop", bot_id, kill_after_timeout, source, request_id))
+                return BotStatusResponse(bot_id, BotStatus.stopped, None, "/profiles/coder")
+
+            def restart(
+                self,
+                bot_id: str,
+                *,
+                wait: bool = False,
+                timeout_seconds: float | None = None,
+                source: str = "cli",
+                request_id: str | None = None,
+            ) -> BotStatusResponse:
+                calls.append(("restart", bot_id, wait, timeout_seconds, source, request_id))
+                return BotStatusResponse(bot_id, BotStatus.running, 456, "/profiles/coder")
+
+            def reconcile_summary(
+                self,
+                bot_id: str | None = None,
+                *,
+                source: str = "cli",
+                request_id: str | None = None,
+                **kwargs: object,
+            ) -> object:
+                calls.append(("reconcile_summary", bot_id, source, request_id))
+
+                class Summary:
+                    def to_dict(self) -> dict[str, object]:
+                        return {"ok": True, "scope": "bot"}
+
+                return Summary()
+
+        headers = {"x-zeus-api-key": "secret"}
+        with (
+            patch("zeus.api.Supervisor", CapturingSupervisor),
+            api_server({"ZEUS_API_KEY": "secret"}) as port,
+        ):
+            for root in ("/v1", "/v1/"):
+                with self.subTest(root=root):
+                    status, body = request_json(port, "GET", root, headers=headers)
+                    self.assertEqual(404, status)
+                    self.assertEqual(
+                        {
+                            "error": {
+                                "code": "invalid_request",
+                                "message": "not found",
+                                "status": 404,
+                            }
+                        },
+                        body,
                     )
-                    aliased = request_json(
-                        port,
-                        method,
-                        "/v1" + path,
-                        body=body,
-                        headers={"x-zeus-api-key": "secret"},
-                    )
-                    self.assertEqual(rooted, aliased)
+
+            requests = (
+                (
+                    "/v1/bots/coder/start?wait=1&timeout=2.5",
+                    {
+                        "bot_id": "coder",
+                        "message": "",
+                        "pid": 123,
+                        "profile_path": "/profiles/coder",
+                        "status": "starting",
+                    },
+                    ("start", "coder", True, 2.5, "api"),
+                ),
+                (
+                    "/v1/bots/coder/stop?kill_after_timeout=1",
+                    {
+                        "bot_id": "coder",
+                        "message": "",
+                        "pid": None,
+                        "profile_path": "/profiles/coder",
+                        "status": "stopped",
+                    },
+                    ("stop", "coder", True, "api"),
+                ),
+                (
+                    "/v1/bots/coder/restart?wait=0&timeout=3.5",
+                    {
+                        "bot_id": "coder",
+                        "message": "",
+                        "pid": 456,
+                        "profile_path": "/profiles/coder",
+                        "status": "running",
+                    },
+                    ("restart", "coder", False, 3.5, "api"),
+                ),
+                (
+                    "/v1/bots/coder/reconcile?summary=1",
+                    {"ok": True, "scope": "bot"},
+                    ("reconcile_summary", "coder", "api"),
+                ),
+            )
+            for path, expected_body, expected_call in requests:
+                with self.subTest(path=path):
+                    status, body = request_json(port, "POST", path, headers=headers)
+                    self.assertEqual(200, status)
+                    self.assertEqual(expected_body, body)
+                    call = calls.pop(0)
+                    self.assertEqual(expected_call, call[:-1])
+                    self.assertRegex(str(call[-1]), r"^[0-9a-f]{32}$")
+
+        self.assertEqual([], calls)
 
     def test_bot_create_and_list_expose_desired_state_and_convergence(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:

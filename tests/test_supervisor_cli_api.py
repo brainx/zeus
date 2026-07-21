@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import http.client
 import io
 import json
@@ -381,20 +382,18 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
-            store.upsert_bot(
-                BotRecord(
-                    bot_id="coder",
-                    template_id="coding-bot",
-                    display_name="Coder",
-                    profile_path=str(profile),
-                )
+            running = BotRecord(
+                bot_id="coder",
+                template_id="coding-bot",
+                display_name="Coder",
+                profile_path=str(profile),
+                status=BotStatus.running,
+                pid=4321,
+                desired_state=DesiredState.running,
+                desired_revision=1,
             )
-            pending = store.begin_lifecycle_intent(
-                "coder",
-                action="start",
-                operation_id="a" * 32,
-                source="cli",
-            )
+            store.upsert_bot(running)
+            signals: list[tuple[int, object]] = []
             supervisor = Supervisor(
                 store,
                 hermes_bin,
@@ -402,22 +401,27 @@ class SupervisorCliApiTests(unittest.TestCase):
                 pid_alive_fn=lambda pid: True,
                 cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
                 proc_start_fingerprint_reader=lambda pid: "test-process-start:4321",
+                kill_fn=lambda pid, sent_signal: signals.append((pid, sent_signal)),
             )
-            schema3_payload = supervisor.adapter.launcher_payload(
-                "coder",
-                operation_id="a" * 32,
-                desired_revision=pending.desired_revision,
-                readiness_probe=None,
-            )["marker"]
-            assert isinstance(schema3_payload, dict)
-            schema3 = dict(schema3_payload)
-            schema3.update(
-                {
-                    "pid": 4321,
-                    "started_at": 1_780_000_000.0,
-                    "proc_start_fingerprint": "test-process-start:4321",
-                }
-            )
+            argv = self._gateway_argv(hermes_bin)
+            command_fingerprint = hashlib.sha256(
+                json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            schema3 = {
+                "schema": 3,
+                "bot_id": "coder",
+                "component": "gateway",
+                "action": "run",
+                "operation_id": "a" * 32,
+                "desired_revision": 1,
+                "argv": argv,
+                "resolved_hermes_bin": hermes_bin,
+                "command_fingerprint": command_fingerprint,
+                "readiness_probe": None,
+                "pid": 4321,
+                "started_at": 1_780_000_000.0,
+                "proc_start_fingerprint": "test-process-start:4321",
+            }
             schema2 = {
                 "schema": 2,
                 "pid": 4321,
@@ -435,22 +439,46 @@ class SupervisorCliApiTests(unittest.TestCase):
                 "started_at": 1_780_000_000.0,
                 "proc_start_fingerprint": "test-process-start:4321",
             }
+            marker_path = supervisor.pid_marker_path(str(profile))
+            marker_path.parent.mkdir(parents=True)
 
-            for name, marker, expected_kind, expected_reason in (
-                ("schema3", schema3, "live", ""),
-                ("schema2", schema2, "untrusted", "marker correlation is invalid"),
-                ("legacy", legacy, "untrusted", "marker correlation is invalid"),
-            ):
+            self.assertEqual(3, schema3["schema"])
+            marker_path.write_text(json.dumps(schema3, sort_keys=True), encoding="utf-8")
+            inspected = supervisor.inspect("coder")
+
+            self.assertEqual(3, inspected["pid_marker"]["schema"])
+            self.assertIs(True, inspected["live_cmdline_verified"])
+            self.assertEqual(
+                {
+                    "verified": True,
+                    "reason": "ok",
+                    "classification": "direct-hermes",
+                    "expected": {
+                        "bot_id": "coder",
+                        "component": "gateway",
+                        "action": "run",
+                    },
+                },
+                inspected["ownership"],
+            )
+
+            for name, marker in (("schema2", schema2), ("legacy", legacy)):
                 with self.subTest(name=name):
-                    observed = supervisor._classify_schema3_runtime_marker(
-                        pending,
-                        marker,
-                        expected_operation_id="a" * 32,
-                        expected_revision=pending.desired_revision,
-                        require_live_command=False,
+                    store.upsert_bot(running)
+                    marker_path.write_text(
+                        json.dumps(marker, sort_keys=True),
+                        encoding="utf-8",
                     )
-                    self.assertEqual(expected_kind, observed.kind)
-                    self.assertEqual(expected_reason, observed.reason)
+                    result = supervisor.stop("coder")
+
+                    self.assertEqual(BotStatus.failed, result.status)
+                    self.assertEqual(
+                        "action required: schema-v2 or legacy gateway stop "
+                        "requires manual process resolution",
+                        result.message,
+                    )
+                    self.assertEqual(marker, json.loads(marker_path.read_text(encoding="utf-8")))
+                    self.assertEqual([], signals)
 
     def test_linux_cmdline_reader_uses_proc_cmdline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2104,18 +2132,71 @@ password = "plain-password"
             def reconcile(self, bot_id: str | None, **kwargs) -> list[BotStatusResponse]:
                 return [pending if bot_id == "pending-bot" else terminal]
 
-        def run(argv: list[str]) -> tuple[int, str]:
+        def run(argv: list[str]) -> tuple[int, str, str]:
             stdout = io.StringIO()
-            with redirect_stdout(stdout):
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
                 exit_code = cli_main(argv)
-            return exit_code, stdout.getvalue()
+            return exit_code, stdout.getvalue(), stderr.getvalue()
+
+        created_json = {
+            "bot_id": "coder",
+            "template_id": "coding-bot",
+            "display_name": "Coder",
+            "profile_path": "/profiles/coder",
+            "status": "stopped",
+            "pid": None,
+            "restart_policy": "manual",
+            "restart_backoff_seconds": 5.0,
+            "restart_max_attempts": 5,
+            "restart_attempts": 0,
+            "next_restart_at": None,
+            "started_at": None,
+            "ready_at": None,
+            "stopped_at": None,
+            "last_exit_code": None,
+            "last_error": None,
+            "last_transition_reason": None,
+            "desired_state": "stopped",
+            "converged": True,
+            "created_at": "2026-07-21T12:00:00+00:00",
+            "updated_at": "2026-07-21T12:00:00+00:00",
+        }
+        start_json = {
+            "bot_id": "start-failed",
+            "status": "failed",
+            "pid": None,
+            "profile_path": "/profiles/start-failed",
+            "message": "failed to start gateway: missing hermes",
+        }
+        stop_json = {
+            "bot_id": "coder",
+            "status": "stopped",
+            "pid": None,
+            "profile_path": "/profiles/coder",
+            "message": "gateway shutdown completed",
+        }
+        pending_json = {
+            "bot_id": "pending-bot",
+            "status": "failed",
+            "pid": None,
+            "profile_path": "/profiles/pending-bot",
+            "message": "restart scheduled: attempt 1/5 in 5s",
+        }
+        terminal_json = {
+            "bot_id": "broken-bot",
+            "status": "failed",
+            "pid": None,
+            "profile_path": "/profiles/broken-bot",
+            "message": "manual policy: not restarting",
+        }
 
         cases = (
             (
                 "create_success",
                 ["bot", "create", "coder", "--template", "coding-bot", "--json"],
                 0,
-                created.to_dict(),
+                created_json,
             ),
             (
                 "create_conflict",
@@ -2128,19 +2209,19 @@ password = "plain-password"
                     }
                 },
             ),
-            ("start_failure", ["bot", "start", "start-failed"], 1, started.to_dict()),
-            ("stop_success", ["bot", "stop", "coder"], 0, stopped.to_dict()),
+            ("start_failure", ["bot", "start", "start-failed"], 1, start_json),
+            ("stop_success", ["bot", "stop", "coder"], 0, stop_json),
             (
                 "reconcile_pending",
                 ["bot", "reconcile", "pending-bot", "--json"],
                 0,
-                [pending.to_dict()],
+                [pending_json],
             ),
             (
                 "reconcile_terminal",
                 ["bot", "reconcile", "broken-bot", "--json"],
                 1,
-                [terminal.to_dict()],
+                [terminal_json],
             ),
         )
         with (
@@ -2150,12 +2231,13 @@ password = "plain-password"
         ):
             for name, argv, expected_exit, expected_payload in cases:
                 with self.subTest(name=name):
-                    exit_code, output = run(argv)
+                    exit_code, output, error_output = run(argv)
                     self.assertEqual(expected_exit, exit_code)
                     self.assertEqual(
                         json.dumps(expected_payload, sort_keys=True) + "\n",
                         output,
                     )
+                    self.assertEqual("", error_output)
 
     def test_cli_wait_timeout_returns_nonzero_but_async_starting_is_successful(self) -> None:
         response = BotStatusResponse(
