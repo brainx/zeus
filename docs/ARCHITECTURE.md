@@ -35,12 +35,15 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.state`: SQLite bot projection and authoritative lifecycle ledger.
 - `zeus.lifecycle`: Bounded lifecycle event types and recursively redacted details.
 - `zeus.request_context`: Locally generated request IDs and normalized route templates.
+- `zeus.api_errors`: Transport-neutral API exception classification.
+- `zeus.api_request`: Strict path, query, and JSON request parsing.
+- `zeus.api_server`: Bounded HTTP concurrency and graceful server lifecycle.
 - `zeus.api_logging`: Locked, fail-open, secret-safe API JSONL output.
 - `zeus.idempotency`: Key validation and canonical request hashing.
 - `zeus.hermes_adapter`: Subprocess command construction for Hermes.
 - `zeus.gateway_launcher`: Descriptor-only marker-before-exec helper.
 - `zeus.supervisor`: Gateway lifecycle, PID ownership markers, logs, and status.
-- `zeus.api`: Local HTTP API.
+- `zeus.api`: Local HTTP routes and compatibility facade.
 - `zeus.cli`: Operator CLI.
 - `zeus.doctor`: Readiness diagnostics.
 
