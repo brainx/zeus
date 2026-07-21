@@ -20,8 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, TypeGuard
-from urllib.parse import urlparse
+from typing import Protocol
 
 from zeus import process_identity as _process_identity
 from zeus.errors import (
@@ -37,7 +36,6 @@ from zeus.gateway_launcher import (
     LaunchPayloadError,
     _confirm_marker_missing,
     _ConfirmedMissing,
-    _is_owned_runtime_marker,
     _open_logs,
     _open_profile_chain,
     _open_regular_marker,
@@ -47,6 +45,15 @@ from zeus.gateway_launcher import (
     _validate_marker_bindings,
     marker_publication_lock,
     remove_marker_if_owned,
+)
+from zeus.gateway_marker import (
+    GatewayGeneration,
+    is_compat_runtime_marker,
+    readiness_probe_from_payload,
+    readiness_probe_to_payload,
+)
+from zeus.gateway_marker import (
+    is_owned_runtime_marker as _is_owned_runtime_marker,
 )
 from zeus.hermes_adapter import HermesAdapter
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput
@@ -138,13 +145,7 @@ class _MarkerObservation:
     reason: str = ""
 
 
-@dataclass(frozen=True)
-class _GatewayGeneration:
-    operation_id: str
-    desired_revision: int
-    pid: int
-    command_fingerprint: str
-    proc_start_fingerprint: str | None
+_GatewayGeneration = GatewayGeneration
 
 
 @dataclass(frozen=True)
@@ -2364,8 +2365,7 @@ class Supervisor:
 
     @staticmethod
     def _is_compat_runtime_marker(payload: dict[str, object]) -> bool:
-        schema = payload.get("schema")
-        return (type(schema) is int and schema == 2) or schema is None
+        return is_compat_runtime_marker(payload)
 
     def _recover_pending_intent(
         self,
@@ -3885,61 +3885,11 @@ def _read_process_cmdline(pid: int) -> list[str] | None:
 
 
 def _readiness_probe_marker_payload(probe: ReadinessProbe | None) -> dict[str, object] | None:
-    if probe is None:
-        return None
-    return {
-        "url": probe.url,
-        "expected_status": probe.expected_status,
-        "expected_platform": probe.expected_platform,
-        "timeout_seconds": probe.timeout_seconds,
-        "interval_seconds": probe.interval_seconds,
-    }
+    return readiness_probe_to_payload(probe)
 
 
 def _readiness_probe_from_marker(value: object) -> ReadinessProbe | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("readiness_probe must be an object or null")
-    url = value.get("url")
-    expected_status = value.get("expected_status")
-    expected_platform = value.get("expected_platform")
-    timeout_seconds = value.get("timeout_seconds")
-    interval_seconds = value.get("interval_seconds")
-    if not isinstance(url, str):
-        raise ValueError("url must be a string")
-    parsed = urlparse(url)
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("url must be loopback HTTP without credentials or query data")
-    if not isinstance(expected_status, str) or not expected_status:
-        raise ValueError("expected_status must be a non-empty string")
-    if not isinstance(expected_platform, str) or not expected_platform:
-        raise ValueError("expected_platform must be a non-empty string")
-    if not _valid_probe_number(timeout_seconds) or not _valid_probe_number(interval_seconds):
-        raise ValueError("probe timing values must be finite positive numbers")
-    return ReadinessProbe(
-        url=url,
-        expected_status=expected_status,
-        expected_platform=expected_platform,
-        timeout_seconds=float(timeout_seconds),
-        interval_seconds=float(interval_seconds),
-    )
-
-
-def _valid_probe_number(value: object) -> TypeGuard[int | float]:
-    return (
-        isinstance(value, int | float)
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-        and 0 < float(value) <= 3600
-    )
+    return readiness_probe_from_payload(value)
 
 
 def _read_darwin_cmdline(pid: int) -> list[str] | None:

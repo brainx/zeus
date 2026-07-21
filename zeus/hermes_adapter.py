@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from zeus.envfile import parse_env_text
-from zeus.gateway_launcher import command_fingerprint
+from zeus.gateway_marker import command_fingerprint, readiness_probe_to_payload
 from zeus.models import ID_RE
 from zeus.readiness import ReadinessProbe
 
@@ -88,15 +88,6 @@ class HermesAdapter:
         exec_argv = [resolved_hermes, *argv[1:]]
         profile_path = self.hermes_root / "profiles" / bot_id
         marker_path = profile_path / "logs" / "zeus-gateway.pid.json"
-        probe_payload: dict[str, object] | None = None
-        if readiness_probe is not None:
-            probe_payload = {
-                "url": readiness_probe.url,
-                "expected_status": readiness_probe.expected_status,
-                "expected_platform": readiness_probe.expected_platform,
-                "timeout_seconds": readiness_probe.timeout_seconds,
-                "interval_seconds": readiness_probe.interval_seconds,
-            }
         marker: dict[str, object] = {
             "schema": 3,
             "bot_id": bot_id,
@@ -107,7 +98,7 @@ class HermesAdapter:
             "argv": exec_argv,
             "resolved_hermes_bin": resolved_hermes,
             "command_fingerprint": command_fingerprint(exec_argv),
-            "readiness_probe": probe_payload,
+            "readiness_probe": readiness_probe_to_payload(readiness_probe),
         }
         return {
             "profile_path": str(profile_path),
