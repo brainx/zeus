@@ -163,7 +163,7 @@ def _tighten_directory(
     _validate_directory_snapshots(final_snapshots, description)
     if not all(snapshot.st_uid == platform.euid for snapshot in final_snapshots):
         raise UnsafeFileError(f"{description} has an unexpected owner")
-    if stat.S_IMODE(tightened.st_mode) != _DIRECTORY_MODE:
+    if any(stat.S_IMODE(snapshot.st_mode) != _DIRECTORY_MODE for snapshot in (tightened, current)):
         raise UnsafeFileError(f"{description} does not have private permissions")
 
 
@@ -353,7 +353,7 @@ def _open_private_file_at(
             _validate_file_snapshot(snapshot, platform)
         if not _same_files(final_snapshots):
             raise UnsafeFileError("private file changed while it was opened")
-        if stat.S_IMODE(tightened.st_mode) != _FILE_MODE:
+        if any(stat.S_IMODE(snapshot.st_mode) != _FILE_MODE for snapshot in (tightened, final)):
             raise UnsafeFileError("private file does not have private permissions")
         return file_fd
     except UnsafeFileError:

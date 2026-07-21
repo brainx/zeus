@@ -143,6 +143,30 @@ class PrivateIOTests(unittest.TestCase):
 
         self.assertEqual(0o700, stat.S_IMODE(private_dir.stat().st_mode))
 
+    def test_validate_directory_rejects_mode_drift_before_final_lstat(self) -> None:
+        private_dir = self.root / "mode-drift-dir"
+        private_dir.mkdir(mode=0o755)
+        private_dir.chmod(0o755)
+        real_lstat = os.lstat
+        directory_lstats = 0
+
+        def racing_lstat(name: str | bytes, *, dir_fd: int | None = None) -> os.stat_result:
+            nonlocal directory_lstats
+            if name == private_dir.name and dir_fd is not None:
+                directory_lstats += 1
+                if directory_lstats == 3:
+                    private_dir.chmod(0o777)
+            return real_lstat(name, dir_fd=dir_fd)
+
+        with (
+            patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+            self.assertRaises(UnsafeFileError),
+        ):
+            validate_private_directory(private_dir)
+
+        self.assertEqual(3, directory_lstats)
+        self.assertEqual(0o777, stat.S_IMODE(private_dir.stat().st_mode))
+
     def test_existing_file_and_parent_modes_are_tightened_before_append(self) -> None:
         private_dir = self.root / "logs"
         private_dir.mkdir(mode=0o755)
@@ -167,6 +191,33 @@ class PrivateIOTests(unittest.TestCase):
         self.assertEqual(b"event", read_private_tail(path, 10))
 
         self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+
+    def test_append_rejects_mode_drift_before_final_lstat(self) -> None:
+        private_dir = self.root / "logs"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "mode-drift.log"
+        path.write_bytes(b"original")
+        path.chmod(0o644)
+        real_lstat = os.lstat
+        file_lstats = 0
+
+        def racing_lstat(name: str | bytes, *, dir_fd: int | None = None) -> os.stat_result:
+            nonlocal file_lstats
+            if name == path.name and dir_fd is not None:
+                file_lstats += 1
+                if file_lstats == 3:
+                    path.chmod(0o644)
+            return real_lstat(name, dir_fd=dir_fd)
+
+        with (
+            patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+            self.assertRaises(UnsafeFileError),
+        ):
+            append_private_bytes(path, b"event")
+
+        self.assertEqual(3, file_lstats)
+        self.assertEqual(b"original", path.read_bytes())
+        self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
 
     def test_leaf_symlink_is_rejected_without_touching_target(self) -> None:
         target = self.root / "target.log"
