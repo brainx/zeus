@@ -242,13 +242,13 @@ class RepoContractTests(unittest.TestCase):
 
     def test_architecture_terminal_schema_compatibility_matches_runtime(self) -> None:
         architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
-        compatibility_statement = re.search(
+        compatibility_statements = re.findall(
             r"Databases newer than\s+schema v(?P<version>\d+) are rejected rather than downgraded\.",
             architecture,
         )
 
-        self.assertIsNotNone(compatibility_statement)
-        self.assertEqual(str(SCHEMA_VERSION), compatibility_statement["version"])
+        self.assertEqual(1, len(compatibility_statements))
+        self.assertEqual(str(SCHEMA_VERSION), compatibility_statements[0])
 
     def test_every_openapi_response_documents_request_id_header(self) -> None:
         document = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
