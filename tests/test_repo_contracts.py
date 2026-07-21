@@ -115,6 +115,13 @@ class RepoContractTests(unittest.TestCase):
     def test_wheel_smoke_exercises_installed_demo_entrypoint(self) -> None:
         script = Path("scripts/wheel_smoke.sh").read_text(encoding="utf-8")
 
+        canonical_root = 'repo_root="$(pwd -P)"'
+        tmp_dir = 'tmp_dir="$repo_root/.tmp/wheel-smoke"'
+        self.assertIn(canonical_root, script)
+        self.assertIn(tmp_dir, script)
+        self.assertLess(script.index(canonical_root), script.index(tmp_dir))
+        self.assertNotIn('repo_root="$(pwd)"', script)
+
         trap_index = script.index("trap cleanup EXIT INT TERM")
         for initialization in ('venv_zeus=""', 'state_dir="$tmp_dir/state"', "demo_started=0"):
             self.assertIn(initialization, script)

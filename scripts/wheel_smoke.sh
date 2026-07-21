@@ -3,7 +3,7 @@
 # Maintained by BrainX: https://github.com/brainx
 set -eu
 
-repo_root="$(pwd)"
+repo_root="$(pwd -P)"
 tmp_dir="$repo_root/.tmp/wheel-smoke"
 build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"
 venv_python=""
