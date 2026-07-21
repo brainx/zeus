@@ -29,6 +29,7 @@ from zeus.hermes_adapter import HermesAdapter
 from zeus.lifecycle import LifecycleEventInput
 from zeus.logging_utils import redact_secrets
 from zeus.models import BotRecord, BotStatus, BotStatusResponse, DesiredState, RestartPolicy
+from zeus.private_io import UnsafeFileError
 from zeus.process_lock import LockTimeoutError
 from zeus.readiness import ReadinessResult
 from zeus.reconciliation import BotReconcileResult, ReconcileOutcome, ReconcileRunSummary
@@ -3015,6 +3016,149 @@ password = "plain-password"
             self.assertEqual(2, len(events))
             self.assertEqual(["running", "stopped"], [event.status_after for event in events])
 
+    def test_audit_append_delegates_exact_utf8_json_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            store = StateStore(root / "state" / "zeus.db")
+            fixed_now = datetime(2026, 7, 21, 12, 34, 56, tzinfo=UTC)
+
+            with (
+                patch("zeus.state.datetime") as clock,
+                patch("zeus.state.append_private_bytes") as append,
+            ):
+                clock.now.return_value = fixed_now
+                store.append_audit_event(
+                    "bot.test",
+                    label="Δ",
+                    api_key="secret",
+                )
+
+            append.assert_called_once_with(
+                root / "state" / "logs" / "audit.jsonl",
+                b'{"api_key": "[redacted]", "event": "bot.test", "label": "\\u0394", '
+                b'"ts": "2026-07-21T12:34:56+00:00"}\n',
+            )
+
+    def test_audit_parent_symlink_is_fail_open_without_mutating_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            store = StateStore(state_dir / "zeus.db")
+            store.init()
+            external_logs = root / "external-audit-target"
+            external_logs.mkdir(mode=0o755)
+            sentinel = external_logs / "sentinel.txt"
+            sentinel.write_text("external audit target\n", encoding="utf-8")
+            external_mode = external_logs.stat().st_mode & 0o777
+            (state_dir / "logs").symlink_to(external_logs, target_is_directory=True)
+
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            profile_path.mkdir(parents=True)
+            hermes_bin = self._fake_hermes_path(root)
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                root / ".zeus" / "hermes",
+                popen_factory=FakePopen,
+                pid_alive_fn=lambda pid: bool(FakePopen.launch_count),
+                cmdline_reader=lambda pid: self._gateway_argv(hermes_bin),
+                proc_start_fingerprint_reader=lambda pid: f"test-process-start:{pid}",
+            )
+
+            status = supervisor.start("coder")
+
+            self.assertEqual(BotStatus.running, status.status)
+            self.assertEqual("external audit target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(external_mode, external_logs.stat().st_mode & 0o777)
+            self.assertEqual(
+                ["sentinel.txt"], sorted(path.name for path in external_logs.iterdir())
+            )
+
+    def test_unsafe_gateway_log_prevents_pipe_and_process_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs_path = profile_path / "logs"
+            logs_path.mkdir(parents=True, mode=0o700)
+            target_log = root / "external-gateway-target.log"
+            target_log.write_text("external gateway target\n", encoding="utf-8")
+            target_mode = target_log.stat().st_mode & 0o777
+            (logs_path / "zeus-gateway.log").symlink_to(target_log)
+            hermes_bin = self._fake_hermes_path(root)
+            store = StateStore(root / "state" / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+
+            def forbidden_popen(*args: object, **kwargs: object) -> FakePopen:
+                self.fail("process factory must not be called for an unsafe gateway log")
+
+            supervisor = Supervisor(
+                store,
+                hermes_bin,
+                root / ".zeus" / "hermes",
+                popen_factory=forbidden_popen,
+                startup_grace_seconds=0,
+            )
+
+            with patch(
+                "zeus.supervisor.os.pipe",
+                side_effect=AssertionError("pipe allocated before gateway log validation"),
+            ) as pipe:
+                status = supervisor.start("coder")
+
+            pipe.assert_not_called()
+            self.assertEqual(BotStatus.failed, status.status)
+            self.assertIsNone(status.pid)
+            self.assertEqual("external gateway target\n", target_log.read_text(encoding="utf-8"))
+            self.assertEqual(target_mode, target_log.stat().st_mode & 0o777)
+
+    def test_direct_logs_and_inspect_reject_gateway_log_parent_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            profile_path.mkdir(parents=True)
+            external_logs = root / "external-log-target"
+            external_logs.mkdir(mode=0o755)
+            target_log = external_logs / "zeus-gateway.log"
+            target_log.write_text("TARGET-SENTINEL\n", encoding="utf-8")
+            target_mode = target_log.stat().st_mode & 0o777
+            (profile_path / "logs").symlink_to(external_logs, target_is_directory=True)
+            store = StateStore(root / "state" / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            supervisor = Supervisor(store, "hermes", root / ".zeus" / "hermes")
+
+            for operation in (supervisor.logs, supervisor.inspect):
+                with self.subTest(operation=operation.__name__):
+                    with self.assertRaises(UnsafeFileError) as raised:
+                        operation("coder")
+                    self.assertNotIn("TARGET-SENTINEL", str(raised.exception))
+
+            self.assertEqual("TARGET-SENTINEL\n", target_log.read_text(encoding="utf-8"))
+            self.assertEqual(target_mode, target_log.stat().st_mode & 0o777)
+
     def test_supervisor_inspect_reports_metadata_without_env_contents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3308,11 +3452,97 @@ password = "plain-password"
             try:
                 os.chdir(root)
                 check = _check_runtime_paths(settings)
+                mode_after = state_dir.stat().st_mode & 0o777
             finally:
                 os.chdir(old_cwd)
 
         self.assertEqual("fail", check.status)
         self.assertIn("must not be accessible to other users", check.message)
+        self.assertEqual(0o755, mode_after)
+
+    def test_doctor_rejects_real_and_broken_logs_symlinks_without_target_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            state_dir.chmod(0o700)
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+            external_logs = root / "external-doctor-target"
+            external_logs.mkdir(mode=0o755)
+            sentinel = external_logs / "sentinel.txt"
+            sentinel.write_text("doctor target\n", encoding="utf-8")
+            target_mode = external_logs.stat().st_mode & 0o777
+            logs_link = state_dir / "logs"
+
+            logs_link.symlink_to(external_logs, target_is_directory=True)
+            real_check = _check_runtime_paths(settings)
+            logs_link.unlink()
+            logs_link.symlink_to(root / "missing-doctor-target", target_is_directory=True)
+            broken_check = _check_runtime_paths(settings)
+
+            self.assertEqual("fail", real_check.status)
+            self.assertEqual("fail", broken_check.status)
+            self.assertIn("logs", real_check.message.lower())
+            self.assertIn("logs", broken_check.message.lower())
+            self.assertNotIn(str(external_logs), real_check.message)
+            self.assertEqual("doctor target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(target_mode, external_logs.stat().st_mode & 0o777)
+
+    def test_doctor_rejects_permissive_logs_directory_without_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            logs_dir = state_dir / "logs"
+            logs_dir.mkdir(parents=True, mode=0o755)
+            state_dir.chmod(0o700)
+            logs_dir.chmod(0o755)
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+
+            check = _check_runtime_paths(settings)
+
+            self.assertEqual("fail", check.status)
+            self.assertIn("logs", check.message.lower())
+            self.assertEqual(0o755, logs_dir.stat().st_mode & 0o777)
+
+    def test_doctor_rejects_runtime_directory_owned_by_another_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+            real_lstat = os.lstat
+
+            def foreign_owner(path: Path) -> os.stat_result:
+                metadata = real_lstat(path)
+                fields = list(metadata)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+
+            with patch("zeus.doctor.os.lstat", side_effect=foreign_owner):
+                check = _check_runtime_paths(settings)
+
+            self.assertEqual("fail", check.status)
+            self.assertIn("owned by the current user", check.message)
+            self.assertEqual(0o700, state_dir.stat().st_mode & 0o777)
+
+    def test_doctor_rejects_state_symlink_without_target_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+            external_state = root / "external-state-target"
+            external_state.mkdir(mode=0o755)
+            sentinel = external_state / "sentinel.txt"
+            sentinel.write_text("state target\n", encoding="utf-8")
+            target_mode = external_state.stat().st_mode & 0o777
+            state_dir.symlink_to(external_state, target_is_directory=True)
+
+            check = _check_runtime_paths(settings)
+
+            self.assertEqual("fail", check.status)
+            self.assertNotIn(str(external_state), check.message)
+            self.assertEqual("state target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(target_mode, external_state.stat().st_mode & 0o777)
 
     def test_api_health_and_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

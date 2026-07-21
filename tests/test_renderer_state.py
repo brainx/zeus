@@ -716,12 +716,16 @@ class RendererStateTests(unittest.TestCase):
             request = BotCreateRequest(bot_id="coder", template_id="coding-bot")
             renderer.render(request, template)
             profile = hermes_root / "profiles" / "coder"
-            (profile / "logs" / "gateway.log").write_text("existing log\n", encoding="utf-8")
+            logs = profile / "logs"
+            (logs / "gateway.log").write_text("existing log\n", encoding="utf-8")
+            logs.chmod(0o755)
 
             renderer.render(request, replace(template, soul="replacement soul"))
 
             self.assertEqual("replacement soul\n", (profile / "SOUL.md").read_text())
-            self.assertEqual("existing log\n", (profile / "logs" / "gateway.log").read_text())
+            self.assertEqual("existing log\n", (logs / "gateway.log").read_text())
+            self.assertEqual(os.geteuid(), logs.stat().st_uid)
+            self.assertEqual(0o700, logs.stat().st_mode & 0o777)
             self.assertEqual(["coder"], sorted(path.name for path in profile.parent.iterdir()))
 
     def test_renderer_replacement_preserves_complete_existing_profile_tree(self) -> None:
@@ -764,7 +768,7 @@ class RendererStateTests(unittest.TestCase):
                 (profile / "runtime" / "nested" / "state.json").read_text(),
             )
 
-    def test_renderer_replacement_preserves_symlinks_without_following_managed_links(self) -> None:
+    def test_renderer_replacement_handles_managed_links_without_following_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             hermes_root = root / ".zeus" / "hermes"
@@ -785,7 +789,9 @@ class RendererStateTests(unittest.TestCase):
             (external_skills / "SKILL.md").write_text("linked skill\n", encoding="utf-8")
             external_logs = root / "external-logs"
             external_logs.mkdir()
+            external_logs.chmod(0o755)
             (external_logs / "gateway.log").write_text("linked log\n", encoding="utf-8")
+            external_logs_mode = external_logs.stat().st_mode & 0o777
 
             try:
                 (profile / "operator-link").symlink_to(external)
@@ -816,8 +822,89 @@ class RendererStateTests(unittest.TestCase):
             )
             self.assertTrue((profile / "skills").is_symlink())
             self.assertEqual("linked skill\n", (profile / "skills" / "SKILL.md").read_text())
-            self.assertTrue((profile / "logs").is_symlink())
-            self.assertEqual("linked log\n", (profile / "logs" / "gateway.log").read_text())
+            self.assertFalse((profile / "logs").is_symlink())
+            self.assertTrue((profile / "logs").is_dir())
+            self.assertEqual(0o700, (profile / "logs").stat().st_mode & 0o777)
+            self.assertEqual([], list((profile / "logs").iterdir()))
+            self.assertEqual("linked log\n", (external_logs / "gateway.log").read_text())
+            self.assertEqual(external_logs_mode, external_logs.stat().st_mode & 0o777)
+
+    def test_renderer_replacement_replaces_dangling_logs_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            renderer = ProfileRenderer(hermes_root)
+            template = TemplateStore().get("coding-bot")
+            request = BotCreateRequest(bot_id="coder", template_id="coding-bot")
+            renderer.render(request, template)
+            profile = hermes_root / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.rmdir()
+            missing_target = root / "missing-external-logs"
+            logs.symlink_to(missing_target, target_is_directory=True)
+
+            renderer.render(request, replace(template, soul="replacement soul"))
+
+            self.assertFalse(logs.is_symlink())
+            self.assertTrue(logs.is_dir())
+            self.assertEqual(0o700, logs.stat().st_mode & 0o777)
+            self.assertFalse(missing_target.exists())
+
+    def test_renderer_replacement_rejects_regular_logs_file_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            renderer = ProfileRenderer(hermes_root)
+            template = TemplateStore().get("coding-bot")
+            request = BotCreateRequest(bot_id="coder", template_id="coding-bot")
+            renderer.render(request, template)
+            profile = hermes_root / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.rmdir()
+            logs.write_text("operator-owned logs entry\n", encoding="utf-8")
+            original_soul = (profile / "SOUL.md").read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(TemplateError, "profile path must be a directory: logs"):
+                renderer.render(request, replace(template, soul="must not be installed"))
+
+            self.assertTrue(logs.is_file())
+            self.assertEqual("operator-owned logs entry\n", logs.read_text(encoding="utf-8"))
+            self.assertEqual(original_soul, (profile / "SOUL.md").read_text(encoding="utf-8"))
+
+    def test_renderer_transaction_rollback_restores_logs_symlink_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            renderer = ProfileRenderer(hermes_root)
+            template = TemplateStore().get("coding-bot")
+            request = BotCreateRequest(bot_id="coder", template_id="coding-bot")
+            renderer.render(request, template)
+            profile = hermes_root / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.rmdir()
+            external_logs = root / "external-rollback-logs"
+            external_logs.mkdir(mode=0o755)
+            external_logs.chmod(0o755)
+            sentinel = external_logs / "gateway.log"
+            sentinel.write_text("rollback target\n", encoding="utf-8")
+            external_mode = external_logs.stat().st_mode & 0o777
+            logs.symlink_to(external_logs, target_is_directory=True)
+            original_link = os.readlink(logs)
+
+            with (
+                self.assertRaisesRegex(RuntimeError, "injected database failure"),
+                renderer.transaction(request, replace(template, soul="replacement soul")),
+            ):
+                self.assertFalse(logs.is_symlink())
+                self.assertTrue(logs.is_dir())
+                self.assertEqual(0o700, logs.stat().st_mode & 0o777)
+                self.assertEqual("rollback target\n", sentinel.read_text(encoding="utf-8"))
+                raise RuntimeError("injected database failure")
+
+            self.assertTrue(logs.is_symlink())
+            self.assertEqual(original_link, os.readlink(logs))
+            self.assertEqual("rollback target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(external_mode, external_logs.stat().st_mode & 0o777)
 
     def test_renderer_transaction_commits_replacement_and_cleans_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

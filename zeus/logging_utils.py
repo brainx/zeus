@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from zeus.private_io import read_private_tail
+
 SECRET_KV_RE = re.compile(
     r"""(?ix)
     (?P<prefix>["']?)
@@ -31,10 +33,5 @@ def redact_secrets(text: str) -> str:
 
 
 def tail_file(path: Path, max_bytes: int = 20_000) -> str:
-    if not path.exists():
-        return ""
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        handle.seek(max(0, size - max_bytes))
-        return redact_secrets(handle.read().decode("utf-8", errors="replace"))
+    data = read_private_tail(path, max_bytes)
+    return redact_secrets(data.decode("utf-8", errors="replace"))

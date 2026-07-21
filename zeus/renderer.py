@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -133,8 +134,8 @@ def _write_staged_profile(
         )
 
     _ensure_staged_directory(staging / "cron")
-    for relative_path in ("logs", "skills"):
-        _ensure_preserved_directory(staging / relative_path)
+    _ensure_private_logs_directory(staging / "logs")
+    _ensure_preserved_directory(staging / "skills")
 
     for relative_path, content in rendered_files.items():
         _write_staged_file(staging / relative_path, content)
@@ -155,6 +156,29 @@ def _ensure_preserved_directory(path: Path) -> None:
         return
     if not path.is_dir():
         raise TemplateError(f"profile path must be a directory: {path.name}")
+
+
+def _ensure_private_logs_directory(path: Path) -> None:
+    if _path_exists(path):
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            path.unlink()
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise TemplateError(f"profile path must be a directory: {path.name}")
+    if not _path_exists(path):
+        path.mkdir(mode=0o700)
+
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise TemplateError("profile logs directory must be owned by the current user")
+    path.chmod(0o700)
+    validated = os.lstat(path)
+    if (
+        not stat.S_ISDIR(validated.st_mode)
+        or validated.st_uid != os.geteuid()
+        or stat.S_IMODE(validated.st_mode) != 0o700
+    ):
+        raise TemplateError("profile logs directory could not be made private")
 
 
 def _write_staged_file(path: Path, content: str) -> None:

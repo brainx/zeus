@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
@@ -30,6 +31,10 @@ _LSTAT_DIR_FD_PROBE = os.lstat
 
 
 class UnsafeFileError(OSError):
+    pass
+
+
+class _PrivatePathMissing(Exception):
     pass
 
 
@@ -87,6 +92,18 @@ def _require_platform() -> _Platform:
         read_flags=o_rdonly | common_leaf,
         create_exclusive_flags=o_creat | o_excl,
     )
+
+
+def nofollow_absolute_path(path: Path) -> Path:
+    """Return an absolute lexical path without resolving supplied components."""
+    absolute = Path(os.path.abspath(path.expanduser()))
+    if (
+        sys.platform == "darwin"
+        and len(absolute.parts) > 1
+        and absolute.parts[1] in {"etc", "tmp", "var"}
+    ):
+        return Path("/private", *absolute.parts[1:])
+    return absolute
 
 
 def _validate_path(path: Path, *, file_path: bool) -> tuple[str, ...]:
@@ -196,6 +213,7 @@ def _open_directory_at(
     name: str,
     *,
     create: bool,
+    missing_ok: bool,
     private: bool,
     platform: _Platform,
 ) -> int:
@@ -205,6 +223,8 @@ def _open_directory_at(
         before = os.lstat(name, dir_fd=parent_fd)
     except FileNotFoundError as exc:
         if not create:
+            if missing_ok:
+                raise _PrivatePathMissing from exc
             raise UnsafeFileError(f"{description} is unavailable") from exc
         try:
             os.mkdir(name, mode=_DIRECTORY_MODE, dir_fd=parent_fd)
@@ -260,6 +280,7 @@ def _open_directory_path(
     parts: tuple[str, ...],
     *,
     create: bool,
+    missing_ok: bool = False,
     platform: _Platform,
 ) -> Iterator[int]:
     current_fd = _open_root(platform)
@@ -269,6 +290,7 @@ def _open_directory_path(
                 current_fd,
                 component,
                 create=create,
+                missing_ok=missing_ok,
                 private=index == len(parts) - 1,
                 platform=platform,
             )
@@ -437,38 +459,43 @@ def read_private_tail(path: Path, max_bytes: int) -> bytes:
         raise TypeError("max_bytes must be non-negative")
     parts = _validate_path(path, file_path=True)
     platform = _require_platform()
-    with _open_directory_path(parts[:-1], create=False, platform=platform) as parent_fd:
-        file_fd = _open_private_file_at(
-            parent_fd,
-            parts[-1],
-            append=False,
-            create=False,
-            platform=platform,
-        )
-        if file_fd is None:
-            return b""
-        try:
+    try:
+        with _open_directory_path(
+            parts[:-1], create=False, missing_ok=True, platform=platform
+        ) as parent_fd:
+            file_fd = _open_private_file_at(
+                parent_fd,
+                parts[-1],
+                append=False,
+                create=False,
+                platform=platform,
+            )
+            if file_fd is None:
+                return b""
             try:
-                end = os.lseek(file_fd, 0, os.SEEK_END)
-                start = max(0, end - max_bytes)
-                os.lseek(file_fd, start, os.SEEK_SET)
-                chunks: list[bytes] = []
-                remaining = min(max_bytes, end - start)
-                while remaining:
-                    chunk = os.read(file_fd, min(65536, remaining))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                result = b"".join(chunks)
-            except OSError as exc:
-                raise UnsafeFileError("private file tail could not be read") from exc
-        except BaseException:
-            _close_suppressing_error(file_fd)
-            raise
-        else:
-            _close_descriptor(file_fd, "private file")
-            return result
+                try:
+                    end = os.lseek(file_fd, 0, os.SEEK_END)
+                    start = max(0, end - max_bytes)
+                    os.lseek(file_fd, start, os.SEEK_SET)
+                    chunks: list[bytes] = []
+                    remaining = min(max_bytes, end - start)
+                    while remaining:
+                        chunk = os.read(file_fd, min(65536, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    result = b"".join(chunks)
+                except OSError as exc:
+                    raise UnsafeFileError("private file tail could not be read") from exc
+            except BaseException:
+                _close_suppressing_error(file_fd)
+                raise
+            else:
+                _close_descriptor(file_fd, "private file")
+                return result
+    except _PrivatePathMissing:
+        return b""
 
 
 def validate_private_directory(path: Path) -> None:

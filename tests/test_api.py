@@ -1767,6 +1767,44 @@ class ApiBehaviorTests(unittest.TestCase):
             self.assertEqual(404, status)
             self.assertEqual("unknown_bot", body["error"]["code"])
 
+    def test_bot_logs_and_inspect_hide_unsafe_gateway_log_path(self) -> None:
+        with api_server({"ZEUS_API_KEY": "secret"}) as port:
+            status, created = request_json(
+                port,
+                "POST",
+                "/bots",
+                body=json_request_body({"bot_id": "coder", "template_id": "coding-bot"}),
+                headers=auth_json_headers(),
+            )
+            self.assertEqual(200, status)
+            profile_path = Path(created["profile_path"])
+            logs_path = profile_path / "logs"
+            logs_path.rmdir()
+            external_logs = profile_path.parent / "external-api-logs"
+            external_logs.mkdir(mode=0o755)
+            target_log = external_logs / "zeus-gateway.log"
+            target_log.write_text("API-TARGET-SENTINEL\n", encoding="utf-8")
+            target_mode = target_log.stat().st_mode & 0o777
+            logs_path.symlink_to(external_logs, target_is_directory=True)
+
+            for endpoint in ("logs", "inspect"):
+                with self.subTest(endpoint=endpoint):
+                    status, body = request_json(
+                        port,
+                        "GET",
+                        f"/bots/coder/{endpoint}",
+                        headers={"x-zeus-api-key": "secret"},
+                    )
+                    self.assertEqual(500, status)
+                    self.assertEqual("internal_error", body["error"]["code"])
+                    self.assertEqual("internal server error", body["error"]["message"])
+                    serialized = json.dumps(body)
+                    self.assertNotIn("API-TARGET-SENTINEL", serialized)
+                    self.assertNotIn(str(external_logs), serialized)
+
+            self.assertEqual("API-TARGET-SENTINEL\n", target_log.read_text(encoding="utf-8"))
+            self.assertEqual(target_mode, target_log.stat().st_mode & 0o777)
+
     def test_rejects_malformed_json(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
             status, body = request_json(

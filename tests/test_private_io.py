@@ -69,6 +69,13 @@ class PrivateIOTests(unittest.TestCase):
 
         self.assertFalse(path.exists())
 
+    def test_read_missing_ancestor_returns_empty_without_creating_it(self) -> None:
+        path = self.root / "missing" / "nested" / "events.log"
+
+        self.assertEqual(b"", read_private_tail(path, 128))
+
+        self.assertFalse(self.root.joinpath("missing").exists())
+
     def test_tail_size_validation_happens_before_filesystem_mutation(self) -> None:
         path = self.root / "missing" / "events.log"
 

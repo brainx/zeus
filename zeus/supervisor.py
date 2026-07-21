@@ -13,7 +13,6 @@ import shutil
 import signal
 import stat
 import subprocess  # nosec B404
-import sys
 import threading
 import time
 import uuid
@@ -60,6 +59,7 @@ from zeus.models import (
     TemplateError,
     validate_id,
 )
+from zeus.private_io import nofollow_absolute_path, open_private_append
 from zeus.process_lock import BotProcessLock, LockTimeoutError
 from zeus.readiness import ReadinessProbe, ReadinessResult, probe_once, readiness_probe_from_env
 from zeus.reconciliation import (
@@ -163,19 +163,7 @@ def _gateway_process_launch_kwargs() -> dict[str, object]:
 
 
 def _nofollow_absolute_path(path: Path) -> Path:
-    absolute = Path(os.path.abspath(path.expanduser()))
-    if (
-        sys.platform == "darwin"
-        and len(absolute.parts) > 1
-        and absolute.parts[1]
-        in {
-            "etc",
-            "tmp",
-            "var",
-        }
-    ):
-        return Path("/private", *absolute.parts[1:])
-    return absolute
+    return nofollow_absolute_path(path)
 
 
 class Supervisor:
@@ -753,7 +741,6 @@ class Supervisor:
             raise RuntimeError("launcher produced an invalid marker payload")
         expected_fingerprint = str(marker_data["command_fingerprint"])
         log_path = self.log_path(record.profile_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         process: PopenLike | None = None
         payload_read = payload_write = ack_read = ack_write = -1
         try:
@@ -765,10 +752,10 @@ class Supervisor:
             ).encode("utf-8")
             if not encoded_payload or len(encoded_payload) > MAX_PAYLOAD_BYTES:
                 raise ValueError("launcher payload is too large")
-            payload_read, payload_write = os.pipe()
-            ack_read, ack_write = os.pipe()
-            launcher_argv = self.adapter.launcher_command(payload_read, ack_write)
-            with log_path.open("ab") as log_file:
+            with open_private_append(log_path) as log_file:
+                payload_read, payload_write = os.pipe()
+                ack_read, ack_write = os.pipe()
+                launcher_argv = self.adapter.launcher_command(payload_read, ack_write)
                 process = self.popen_factory(
                     launcher_argv,
                     env=dict(os.environ),
@@ -3256,7 +3243,7 @@ class Supervisor:
         return ReadinessResult(False, f"readiness timeout: {last.message}", last.payload)
 
     def log_path(self, profile_path: str) -> Path:
-        return Path(profile_path) / "logs" / "zeus-gateway.log"
+        return _nofollow_absolute_path(Path(profile_path) / "logs" / "zeus-gateway.log")
 
     def pid_marker_path(self, profile_path: str) -> Path:
         return Path(profile_path) / "logs" / "zeus-gateway.pid.json"

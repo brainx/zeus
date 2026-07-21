@@ -18,6 +18,7 @@ from zeus.lifecycle import (
     serialize_lifecycle_details,
 )
 from zeus.models import BotRecord, BotStatus, DesiredState, RestartPolicy
+from zeus.private_io import append_private_bytes, nofollow_absolute_path
 from zeus.reconciliation import (
     BotReconcileResult,
     PersistedReconcileRun,
@@ -1760,10 +1761,8 @@ class StateStore:
         for key, value in fields.items():
             payload[key] = _safe_audit_value(key, value)
         try:
-            path = self.audit_log_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            line = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+            append_private_bytes(nofollow_absolute_path(self.audit_log_path()), line)
         except (OSError, TypeError, ValueError):
             return
 
