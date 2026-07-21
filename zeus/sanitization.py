@@ -65,14 +65,15 @@ _SECRET_KV_RE = re.compile(
 _AUTHORIZATION_RE = re.compile(
     r"""(?ix)
     (?P<prefix>["']?)
-    (?P<name>AUTHORIZATION)
+    (?P<name>AUTHORIZATION(?:[^A-Z0-9\r\n:=]*HEADERS?)?)
     (?P=prefix)
-    (?P<sep>\s*[:=]\s*)
+    (?P<sep>[ \t]*[:=][ \t]*)
     (?P<value>
         "(?:[^"\\\r\n]|\\.)*" |
         '(?:[^'\\\r\n]|\\.)*' |
         [^\r\n]+
     )
+    (?P<continuations>(?:(?:\r\n|[\r\n])[ \t]+[^\r\n]*)*)
     """
 )
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]+)")

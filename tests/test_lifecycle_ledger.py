@@ -709,6 +709,108 @@ class LifecycleLedgerTests(unittest.TestCase):
                     any(credential in value for value in observed if isinstance(value, str))
                 )
 
+    def test_authorization_label_variants_and_folded_credentials_are_redacted(self) -> None:
+        credentials = tuple(f"authorization-variant-sentinel-{index:02d}" for index in range(12))
+        messages = (
+            f"Authorization Header: Basic {credentials[0]}",
+            f'authorization_header=Digest response="{credentials[1]}"',
+            f"Authorization Headers: CustomScheme {credentials[2]}",
+            f"authorizationHeaders=Bearer {credentials[3]}",
+            f"authorization-header: Basic {credentials[4]}",
+            f'authorization.headers=Digest response="{credentials[5]}"',
+            f"authorizationHeader=CustomScheme {credentials[6]}",
+            f"authorization/header: Basic {credentials[7]}",
+            f"Authorization: Basic\r\n  {credentials[8]}",
+            f'Authorization Header: Digest\n\tresponse="{credentials[9]}"',
+            f"authorization_headers=CustomScheme\r\n  {credentials[10]}",
+            f"authorizationHeaders: Bearer\n\t{credentials[11]}",
+        )
+        combined = "\nnext authorization case\n".join(messages)
+        started_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            event = LifecycleEventInput(
+                bot_id="coder",
+                operation_id="b" * 32,
+                source="cli",
+                action="bot.start",
+                outcome="failure",
+                reason=combined,
+                error_code="authorization_failed",
+                error_message=combined,
+                details={"message": combined},
+            )
+            store.upsert_bot_with_event(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / "profiles" / "coder"),
+                    last_error=combined,
+                    last_transition_reason=combined,
+                ),
+                event=event,
+            )
+            store.append_audit_event(
+                "bot.authorization_failed",
+                cleanup_errors=list(messages),
+            )
+            run = ReconcileRunStart(
+                run_id="authorization-variant-sanitization",
+                scope="fleet",
+                requested_bot_id=None,
+                source="cli",
+                force=False,
+                reset_restart=False,
+                started_at=started_at,
+            )
+            result = BotReconcileResult(
+                bot_id="coder",
+                outcome=ReconcileOutcome.error,
+                desired_state="running",
+                observed_status="failed",
+                pid=None,
+                action="inspect",
+                message=combined,
+                error_code="authorization_failed",
+                event_id=None,
+                started_at=started_at,
+                finished_at=started_at + timedelta(seconds=1),
+            )
+            store.begin_reconcile_run(run)
+            store.append_reconcile_result(run.run_id, result)
+
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                lifecycle_row = conn.execute(
+                    "SELECT reason, error_message, details_json FROM lifecycle_events"
+                ).fetchone()
+                bot_row = conn.execute(
+                    "SELECT last_error, last_transition_reason FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()
+                reconcile_row = conn.execute(
+                    "SELECT message FROM reconcile_results WHERE run_id = ?",
+                    (run.run_id,),
+                ).fetchone()
+            assert lifecycle_row is not None
+            assert bot_row is not None
+            assert reconcile_row is not None
+            observed_by_sink = {
+                "direct": tuple(sanitize_text(message) for message in messages),
+                "lifecycle": lifecycle_row,
+                "bot_projection": bot_row,
+                "reconciliation": (*reconcile_row, result.message),
+                "audit": (store.audit_log_path().read_text(encoding="utf-8"),),
+            }
+            for case_index, credential in enumerate(credentials):
+                for sink_name, observed in observed_by_sink.items():
+                    with self.subTest(case=case_index, sink=sink_name):
+                        self.assertFalse(
+                            any(credential in value for value in observed if isinstance(value, str))
+                        )
+
     def test_audit_non_bmp_event_fallback_is_strictly_byte_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(Path(tmp) / "zeus.db")
