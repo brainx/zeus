@@ -96,7 +96,9 @@ class RepoContractTests(unittest.TestCase):
         self.assertNotIn("coverage report --fail-under", workflow)
         self.assertIn("python -m build", workflow)
         self.assertIn("twine check dist/*", workflow)
-        self.assertIn("sh scripts/wheel_smoke.sh", workflow)
+        self.assertIn("- name: Verify installed wheel behavior", workflow)
+        self.assertIn("ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh", workflow)
+        self.assertNotIn("- name: Smoke test built wheel", workflow)
 
     def test_test_script_runs_compile_unittest_and_doctor(self) -> None:
         script = Path("scripts/test.sh").read_text(encoding="utf-8")
@@ -113,9 +115,60 @@ class RepoContractTests(unittest.TestCase):
     def test_wheel_smoke_exercises_installed_demo_entrypoint(self) -> None:
         script = Path("scripts/wheel_smoke.sh").read_text(encoding="utf-8")
 
-        self.assertIn('"$venv_zeus" demo up --json', script)
-        self.assertIn('"$venv_zeus" demo status --json', script)
-        self.assertIn('"$venv_zeus" demo down --json', script)
+        trap_index = script.index("trap cleanup EXIT INT TERM")
+        for initialization in ('venv_zeus=""', 'state_dir="$tmp_dir/state"', "demo_started=0"):
+            self.assertIn(initialization, script)
+            self.assertLess(script.index(initialization), trap_index)
+
+        cleanup = script[script.index("cleanup() {") : trap_index]
+        self.assertIn('[ "$demo_started" = "1" ]', cleanup)
+        self.assertIn('ZEUS_STATE_DIR="$state_dir" "$venv_zeus" demo down --json', cleanup)
+        self.assertLess(cleanup.index("demo down --json"), cleanup.index('rm -rf "$tmp_dir"'))
+
+        help_command = '"$venv_zeus" --help'
+        pip_check_command = '"$venv_python" -m pip check'
+        self.assertIn(help_command, script)
+        self.assertIn(pip_check_command, script)
+        cd_index = script.index('cd "$tmp_dir"')
+        help_index = script.index(help_command)
+        pip_check_index = script.index(pip_check_command)
+        self.assertLess(cd_index, help_index)
+        self.assertLess(cd_index, pip_check_index)
+        self.assertIn("unset PYTHONPATH PYTHONHOME", script)
+        self.assertIn("export PYTHONNOUSERSITE=1", script)
+        self.assertIn('export PATH="$tmp_dir/venv/bin:$PATH"', script)
+        self.assertIn("command -v zeus-fake-hermes", script)
+        self.assertIn('"$venv_zeus" --help >zeus-help.txt', script)
+        self.assertIn('grep -F "usage: zeus" zeus-help.txt', script)
+
+        self.assertIn('version("zeus-hermes-orchestrator")', script)
+        self.assertIn("import zeus; print(zeus.__version__)", script)
+        self.assertIn('cli_version=$("$venv_zeus" --version)', script)
+        self.assertIn('[ "$metadata_version" = "$module_version" ]', script)
+        self.assertIn('[ "$cli_version" = "zeus $metadata_version" ]', script)
+        self.assertIn("zeus.__file__", script)
+        self.assertGreaterEqual(script.count('[ ! -e "$state_dir" ]'), 2)
+
+        for template_id in (
+            "coding-bot",
+            "deepseek-coding-bot",
+            "docs-writer-bot",
+            "gateway-operator",
+            "log-triage-bot",
+            "research-bot",
+            "support-gateway",
+        ):
+            self.assertIn(template_id, script)
+
+        self.assertIn('export ZEUS_STATE_DIR="$state_dir"', script)
+        self.assertIn('"$venv_zeus" doctor --json', script)
+        up_index = script.index('"$venv_zeus" demo up --json')
+        status_index = script.index('"$venv_zeus" demo status --json')
+        down_index = script.index('"$venv_zeus" demo down --json', up_index)
+        self.assertLess(up_index, status_index)
+        self.assertLess(status_index, down_index)
+        self.assertNotEqual(-1, script.rfind("demo_started=1", 0, up_index))
+        self.assertNotEqual(-1, script.find("demo_started=0", down_index))
         self.assertIn('"fake_hermes_bin"', script)
         self.assertIn('"status": "running"', script)
         self.assertIn('"status": "stopped"', script)

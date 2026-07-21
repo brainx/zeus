@@ -111,7 +111,7 @@ jobs:
         run: |
           rm -rf dist
           python -m build
-      - name: Smoke test built wheel
+      - name: Verify installed wheel behavior
         run: ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh
       - name: Check package metadata
         run: twine check dist/*
