@@ -1,0 +1,478 @@
+from __future__ import annotations
+
+import os
+import stat
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO, cast
+
+_DIRECTORY_MODE = 0o700
+_FILE_MODE = 0o600
+_SECURITY_FLAGS = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK")
+_REQUIRED_FUNCTIONS = (
+    "close",
+    "fchmod",
+    "fdopen",
+    "fstat",
+    "geteuid",
+    "lseek",
+    "lstat",
+    "mkdir",
+    "open",
+    "read",
+    "write",
+)
+_OPEN_DIR_FD_PROBE = os.open
+_MKDIR_DIR_FD_PROBE = os.mkdir
+_LSTAT_DIR_FD_PROBE = os.lstat
+
+
+class UnsafeFileError(OSError):
+    pass
+
+
+@dataclass(frozen=True)
+class _Platform:
+    euid: int
+    directory_flags: int
+    append_flags: int
+    read_flags: int
+    create_exclusive_flags: int
+
+
+def _required_flag(name: str, *, allow_zero: bool = False) -> int:
+    value = getattr(os, name, None)
+    if type(value) is not int or (not allow_zero and value == 0):
+        raise UnsafeFileError(f"required POSIX flag {name} is unavailable")
+    return value
+
+
+def _require_platform() -> _Platform:
+    if os.name != "posix":
+        raise UnsafeFileError("descriptor-safe private file access requires POSIX")
+    for name in _REQUIRED_FUNCTIONS:
+        if not callable(getattr(os, name, None)):
+            raise UnsafeFileError(f"required POSIX primitive os.{name} is unavailable")
+    supported = getattr(os, "supports_dir_fd", ())
+    for function, name in (
+        (_OPEN_DIR_FD_PROBE, "open"),
+        (_MKDIR_DIR_FD_PROBE, "mkdir"),
+        (_LSTAT_DIR_FD_PROBE, "lstat"),
+    ):
+        if function not in supported:
+            raise UnsafeFileError(f"descriptor-relative os.{name} is unavailable")
+    security_flags = {name: _required_flag(name) for name in _SECURITY_FLAGS}
+    o_rdonly = _required_flag("O_RDONLY", allow_zero=True)
+    o_wronly = _required_flag("O_WRONLY")
+    o_append = _required_flag("O_APPEND")
+    o_creat = _required_flag("O_CREAT")
+    o_excl = _required_flag("O_EXCL")
+    euid = os.geteuid()
+    if isinstance(euid, bool) or not isinstance(euid, int) or euid < 0:
+        raise UnsafeFileError("effective UID is unavailable")
+    common_leaf = (
+        security_flags["O_NOFOLLOW"] | security_flags["O_CLOEXEC"] | security_flags["O_NONBLOCK"]
+    )
+    return _Platform(
+        euid=euid,
+        directory_flags=(
+            o_rdonly
+            | security_flags["O_DIRECTORY"]
+            | security_flags["O_NOFOLLOW"]
+            | security_flags["O_CLOEXEC"]
+        ),
+        append_flags=o_wronly | o_append | common_leaf,
+        read_flags=o_rdonly | common_leaf,
+        create_exclusive_flags=o_creat | o_excl,
+    )
+
+
+def _validate_path(path: Path, *, file_path: bool) -> tuple[str, ...]:
+    if not isinstance(path, Path):
+        raise UnsafeFileError("private path must be a pathlib.Path")
+    if not path.is_absolute() or path.anchor != "/":
+        raise UnsafeFileError("private path must be an absolute POSIX path")
+    parts = path.parts[1:]
+    if not parts or (file_path and len(parts) < 2):
+        raise UnsafeFileError("private path cannot use the filesystem root")
+    if any(part in {"", ".", ".."} or "\0" in part for part in parts):
+        raise UnsafeFileError("private path contains an unsupported component")
+    return parts
+
+
+def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _same_files(results: tuple[os.stat_result, ...]) -> bool:
+    return all(_same_file(results[0], result) for result in results[1:])
+
+
+def _close_suppressing_error(fd: int) -> None:
+    with suppress(OSError):
+        os.close(fd)
+
+
+def _close_descriptor(fd: int, description: str) -> None:
+    try:
+        os.close(fd)
+    except OSError as exc:
+        raise UnsafeFileError(f"{description} descriptor could not be closed") from exc
+
+
+def _lstat_at(parent_fd: int, name: str, description: str) -> os.stat_result:
+    try:
+        return os.lstat(name, dir_fd=parent_fd)
+    except OSError as exc:
+        raise UnsafeFileError(f"{description} is unavailable") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError(f"{description} cannot be inspected safely") from exc
+
+
+def _validate_directory_snapshots(
+    snapshots: tuple[os.stat_result, ...],
+    description: str,
+) -> None:
+    if not all(stat.S_ISDIR(snapshot.st_mode) for snapshot in snapshots):
+        raise UnsafeFileError(f"{description} is not a directory")
+    if not _same_files(snapshots):
+        raise UnsafeFileError(f"{description} changed while it was opened")
+
+
+def _tighten_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    snapshots: tuple[os.stat_result, ...],
+    platform: _Platform,
+    description: str,
+) -> None:
+    if not all(snapshot.st_uid == platform.euid for snapshot in snapshots):
+        raise UnsafeFileError(f"{description} has an unexpected owner")
+    try:
+        os.fchmod(directory_fd, _DIRECTORY_MODE)
+        tightened = os.fstat(directory_fd)
+        current = os.lstat(name, dir_fd=parent_fd)
+    except OSError as exc:
+        raise UnsafeFileError(f"{description} permissions could not be tightened") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError(f"{description} cannot be validated safely") from exc
+    final_snapshots = (*snapshots, tightened, current)
+    _validate_directory_snapshots(final_snapshots, description)
+    if not all(snapshot.st_uid == platform.euid for snapshot in final_snapshots):
+        raise UnsafeFileError(f"{description} has an unexpected owner")
+    if stat.S_IMODE(tightened.st_mode) != _DIRECTORY_MODE:
+        raise UnsafeFileError(f"{description} does not have private permissions")
+
+
+def _open_root(platform: _Platform) -> int:
+    try:
+        before = os.lstat("/")
+        root_fd = os.open("/", platform.directory_flags)
+    except OSError as exc:
+        raise UnsafeFileError("filesystem root cannot be opened safely") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError("filesystem root cannot be inspected safely") from exc
+    try:
+        opened = os.fstat(root_fd)
+        after = os.lstat("/")
+        _validate_directory_snapshots((before, opened, after), "filesystem root")
+        return root_fd
+    except UnsafeFileError:
+        _close_suppressing_error(root_fd)
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        _close_suppressing_error(root_fd)
+        raise UnsafeFileError("filesystem root changed while it was opened") from exc
+    except BaseException:
+        _close_suppressing_error(root_fd)
+        raise
+
+
+def _open_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    create: bool,
+    private: bool,
+    platform: _Platform,
+) -> int:
+    description = f"private path component {name!r}"
+    created = False
+    try:
+        before = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        if not create:
+            raise UnsafeFileError(f"{description} is unavailable") from exc
+        try:
+            os.mkdir(name, mode=_DIRECTORY_MODE, dir_fd=parent_fd)
+            created = True
+        except FileExistsError as race:
+            raise UnsafeFileError(f"{description} appeared while it was created") from race
+        except OSError as mkdir_error:
+            raise UnsafeFileError(f"{description} could not be created safely") from mkdir_error
+        except (TypeError, ValueError) as mkdir_error:
+            raise UnsafeFileError(f"{description} cannot be created safely") from mkdir_error
+        before = _lstat_at(parent_fd, name, description)
+    except OSError as exc:
+        raise UnsafeFileError(f"{description} is unavailable") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError(f"{description} cannot be inspected safely") from exc
+
+    if not stat.S_ISDIR(before.st_mode):
+        raise UnsafeFileError(f"{description} is not a directory")
+    try:
+        directory_fd = os.open(name, platform.directory_flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise UnsafeFileError(f"{description} cannot be opened safely") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError(f"{description} cannot be opened safely") from exc
+    try:
+        opened = os.fstat(directory_fd)
+        after = os.lstat(name, dir_fd=parent_fd)
+        snapshots = (before, opened, after)
+        _validate_directory_snapshots(snapshots, description)
+        if created or private:
+            _tighten_directory(
+                parent_fd,
+                name,
+                directory_fd,
+                snapshots,
+                platform,
+                description,
+            )
+        return directory_fd
+    except UnsafeFileError:
+        _close_suppressing_error(directory_fd)
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        _close_suppressing_error(directory_fd)
+        raise UnsafeFileError(f"{description} changed while it was opened") from exc
+    except BaseException:
+        _close_suppressing_error(directory_fd)
+        raise
+
+
+@contextmanager
+def _open_directory_path(
+    parts: tuple[str, ...],
+    *,
+    create: bool,
+    platform: _Platform,
+) -> Iterator[int]:
+    current_fd = _open_root(platform)
+    try:
+        for index, component in enumerate(parts):
+            next_fd = _open_directory_at(
+                current_fd,
+                component,
+                create=create,
+                private=index == len(parts) - 1,
+                platform=platform,
+            )
+            previous_fd = current_fd
+            current_fd = -1
+            try:
+                _close_descriptor(previous_fd, "ancestor directory")
+            except UnsafeFileError:
+                _close_suppressing_error(next_fd)
+                raise
+            current_fd = next_fd
+    except BaseException:
+        if current_fd >= 0:
+            _close_suppressing_error(current_fd)
+        raise
+
+    result_fd = current_fd
+    current_fd = -1
+    try:
+        yield result_fd
+    except BaseException:
+        _close_suppressing_error(result_fd)
+        raise
+    else:
+        _close_descriptor(result_fd, "private directory")
+
+
+def _validate_file_snapshot(snapshot: os.stat_result, platform: _Platform) -> None:
+    if not stat.S_ISREG(snapshot.st_mode):
+        raise UnsafeFileError("private file is not a regular file")
+    if snapshot.st_uid != platform.euid:
+        raise UnsafeFileError("private file has an unexpected owner")
+    if snapshot.st_nlink != 1:
+        raise UnsafeFileError("private file has unexpected links")
+
+
+def _open_private_file_at(
+    parent_fd: int,
+    name: str,
+    *,
+    append: bool,
+    create: bool,
+    platform: _Platform,
+) -> int | None:
+    before: os.stat_result | None
+    try:
+        before = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        before = None
+    except OSError as exc:
+        raise UnsafeFileError("private file is unavailable") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError("private file cannot be inspected safely") from exc
+    if before is None and not create:
+        return None
+    if before is not None:
+        _validate_file_snapshot(before, platform)
+
+    flags = platform.append_flags if append else platform.read_flags
+    if before is None:
+        flags |= platform.create_exclusive_flags
+    try:
+        file_fd = os.open(name, flags, _FILE_MODE, dir_fd=parent_fd)
+    except OSError as exc:
+        raise UnsafeFileError("private file cannot be opened safely") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError("private file cannot be opened safely") from exc
+    try:
+        opened = os.fstat(file_fd)
+        current = os.lstat(name, dir_fd=parent_fd)
+        initial_snapshots = (opened, current) if before is None else (before, opened, current)
+        for snapshot in initial_snapshots:
+            _validate_file_snapshot(snapshot, platform)
+        if not _same_files(initial_snapshots):
+            raise UnsafeFileError("private file changed while it was opened")
+
+        os.fchmod(file_fd, _FILE_MODE)
+        tightened = os.fstat(file_fd)
+        final = os.lstat(name, dir_fd=parent_fd)
+        final_snapshots = (*initial_snapshots, tightened, final)
+        for snapshot in final_snapshots:
+            _validate_file_snapshot(snapshot, platform)
+        if not _same_files(final_snapshots):
+            raise UnsafeFileError("private file changed while it was opened")
+        if stat.S_IMODE(tightened.st_mode) != _FILE_MODE:
+            raise UnsafeFileError("private file does not have private permissions")
+        return file_fd
+    except UnsafeFileError:
+        _close_suppressing_error(file_fd)
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        _close_suppressing_error(file_fd)
+        raise UnsafeFileError("private file could not be validated safely") from exc
+    except BaseException:
+        _close_suppressing_error(file_fd)
+        raise
+
+
+@contextmanager
+def _private_append_context(
+    parent_parts: tuple[str, ...],
+    name: str,
+    platform: _Platform,
+) -> Iterator[BinaryIO]:
+    with _open_directory_path(parent_parts, create=True, platform=platform) as parent_fd:
+        file_fd = _open_private_file_at(
+            parent_fd,
+            name,
+            append=True,
+            create=True,
+            platform=platform,
+        )
+        if file_fd is None:
+            raise UnsafeFileError("private file was not created")
+        try:
+            try:
+                handle = cast(BinaryIO, os.fdopen(file_fd, "ab", buffering=0))
+            except UnsafeFileError:
+                _close_suppressing_error(file_fd)
+                raise
+            except (OSError, TypeError, ValueError) as exc:
+                _close_suppressing_error(file_fd)
+                raise UnsafeFileError("private file descriptor could not be wrapped") from exc
+            file_fd = -1
+            try:
+                yield handle
+            except BaseException:
+                with suppress(OSError):
+                    handle.close()
+                raise
+            else:
+                try:
+                    handle.close()
+                except OSError as exc:
+                    raise UnsafeFileError("private file descriptor could not be closed") from exc
+        finally:
+            if file_fd >= 0:
+                _close_suppressing_error(file_fd)
+
+
+def append_private_bytes(path: Path, data: bytes) -> None:
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    with open_private_append(path) as handle:
+        offset = 0
+        while offset < len(data):
+            try:
+                written = handle.write(data[offset:])
+            except OSError as exc:
+                raise UnsafeFileError("private file write failed") from exc
+            if written is None or written <= 0 or written > len(data) - offset:
+                raise UnsafeFileError("private file write was incomplete")
+            offset += written
+
+
+def open_private_append(path: Path) -> AbstractContextManager[BinaryIO]:
+    parts = _validate_path(path, file_path=True)
+    platform = _require_platform()
+    return _private_append_context(parts[:-1], parts[-1], platform)
+
+
+def read_private_tail(path: Path, max_bytes: int) -> bytes:
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be an integer")
+    if max_bytes < 0:
+        raise TypeError("max_bytes must be non-negative")
+    parts = _validate_path(path, file_path=True)
+    platform = _require_platform()
+    with _open_directory_path(parts[:-1], create=False, platform=platform) as parent_fd:
+        file_fd = _open_private_file_at(
+            parent_fd,
+            parts[-1],
+            append=False,
+            create=False,
+            platform=platform,
+        )
+        if file_fd is None:
+            return b""
+        try:
+            try:
+                end = os.lseek(file_fd, 0, os.SEEK_END)
+                start = max(0, end - max_bytes)
+                os.lseek(file_fd, start, os.SEEK_SET)
+                chunks: list[bytes] = []
+                remaining = min(max_bytes, end - start)
+                while remaining:
+                    chunk = os.read(file_fd, min(65536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                result = b"".join(chunks)
+            except OSError as exc:
+                raise UnsafeFileError("private file tail could not be read") from exc
+        except BaseException:
+            _close_suppressing_error(file_fd)
+            raise
+        else:
+            _close_descriptor(file_fd, "private file")
+            return result
+
+
+def validate_private_directory(path: Path) -> None:
+    parts = _validate_path(path, file_path=False)
+    platform = _require_platform()
+    with _open_directory_path(parts, create=False, platform=platform):
+        pass
