@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from zeus.bot_lifecycle_store import BotLifecycleStore
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput, serialize_lifecycle_details
 from zeus.models import BotRecord, BotStatus, DesiredState
 from zeus.reconciliation import BotReconcileResult, ReconcileOutcome, ReconcileRunStart
@@ -834,7 +835,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -854,7 +855,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -882,7 +883,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -913,7 +914,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -935,7 +936,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
                 with (
                     patch.object(
-                        store,
+                        BotLifecycleStore,
                         "_row_to_lifecycle_event",
                         side_effect=sqlite3.Error("materialization failed"),
                     ),
@@ -970,7 +971,7 @@ class LifecycleLedgerTests(unittest.TestCase):
                     store.upsert_bot(self._record(root))
 
                 with patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_append_lifecycle_audit",
                     side_effect=RuntimeError("audit failed"),
                 ):

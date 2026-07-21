@@ -3628,8 +3628,8 @@ password = "plain-password"
             fixed_now = datetime(2026, 7, 21, 12, 34, 56, tzinfo=UTC)
 
             with (
-                patch("zeus.state.datetime") as clock,
-                patch("zeus.state.append_private_bytes") as append,
+                patch("zeus.bot_lifecycle_store.datetime") as clock,
+                patch("zeus.bot_lifecycle_store.append_private_bytes") as append,
             ):
                 clock.now.return_value = fixed_now
                 store.append_audit_event(

@@ -21,6 +21,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from zeus import models
+from zeus.bot_lifecycle_store import BotLifecycleStore
 from zeus.models import BotRecord, BotStatus, DesiredState, RestartPolicy
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
@@ -1476,7 +1477,9 @@ class CrashRecoveryStateTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store, "_insert_lifecycle_event", side_effect=sqlite3.DatabaseError("boom")
+                    BotLifecycleStore,
+                    "_insert_lifecycle_event",
+                    side_effect=sqlite3.DatabaseError("boom"),
                 ),
                 self.assertRaisesRegex(sqlite3.DatabaseError, "boom"),
             ):
@@ -1504,7 +1507,9 @@ class CrashRecoveryStateTests(unittest.TestCase):
 
                 with (
                     patch.object(
-                        store, "_insert_lifecycle_event", side_effect=sqlite3.DatabaseError("boom")
+                        BotLifecycleStore,
+                        "_insert_lifecycle_event",
+                        side_effect=sqlite3.DatabaseError("boom"),
                     ),
                     self.assertRaisesRegex(sqlite3.DatabaseError, "boom"),
                 ):
