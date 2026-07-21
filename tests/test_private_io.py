@@ -76,6 +76,112 @@ class PrivateIOTests(unittest.TestCase):
 
         self.assertFalse(self.root.joinpath("missing").exists())
 
+    def test_missing_tail_rejects_rebound_open_ancestor_and_closes_descriptors(self) -> None:
+        ancestor = self.root / "safe"
+        ancestor.mkdir(mode=0o700)
+        displaced = self.root / "safe-displaced"
+        external = self.root / "external"
+        (external / "missing").mkdir(parents=True)
+        target = external / "missing" / "events.log"
+        target.write_bytes(b"external target")
+        target_mode = stat.S_IMODE(target.stat().st_mode)
+        path = ancestor / "missing" / "events.log"
+        ancestor_identity = ancestor.stat()
+        opened: set[int] = set()
+        real_lstat = os.lstat
+        real_open = os.open
+        swapped = False
+
+        def racing_lstat(
+            name: str | bytes,
+            *,
+            dir_fd: int | None = None,
+        ) -> os.stat_result:
+            nonlocal swapped
+            if not swapped and name == "missing" and dir_fd is not None:
+                parent = os.fstat(dir_fd)
+                if (
+                    parent.st_dev == ancestor_identity.st_dev
+                    and parent.st_ino == ancestor_identity.st_ino
+                ):
+                    ancestor.rename(displaced)
+                    ancestor.symlink_to(external, target_is_directory=True)
+                    swapped = True
+            return real_lstat(name, dir_fd=dir_fd)
+
+        def tracking_open(
+            name: str | bytes,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            descriptor = real_open(name, flags, mode, dir_fd=dir_fd)
+            opened.add(descriptor)
+            return descriptor
+
+        with (
+            patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+            patch.object(private_io.os, "open", side_effect=tracking_open),
+            self.assertRaises(UnsafeFileError),
+        ):
+            read_private_tail(path, 128)
+
+        self.assertTrue(swapped)
+        self.assertEqual(b"external target", target.read_bytes())
+        self.assertEqual(target_mode, stat.S_IMODE(target.stat().st_mode))
+        self.assert_all_closed(opened)
+
+    def test_missing_tail_rejects_leaf_appearing_after_observation_and_closes_descriptors(
+        self,
+    ) -> None:
+        private_dir = self.root / "logs"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "events.log"
+        opened: set[int] = set()
+        real_lstat = os.lstat
+        real_open = os.open
+        appeared = False
+
+        def racing_lstat(
+            name: str | bytes,
+            *,
+            dir_fd: int | None = None,
+        ) -> os.stat_result:
+            nonlocal appeared
+            if not appeared and name == path.name and dir_fd is not None:
+                try:
+                    return real_lstat(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    path.write_bytes(b"appeared after missing observation")
+                    path.chmod(0o644)
+                    appeared = True
+                    raise
+            return real_lstat(name, dir_fd=dir_fd)
+
+        def tracking_open(
+            name: str | bytes,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            descriptor = real_open(name, flags, mode, dir_fd=dir_fd)
+            opened.add(descriptor)
+            return descriptor
+
+        with (
+            patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+            patch.object(private_io.os, "open", side_effect=tracking_open),
+            self.assertRaises(UnsafeFileError),
+        ):
+            read_private_tail(path, 128)
+
+        self.assertTrue(appeared)
+        self.assertEqual(b"appeared after missing observation", path.read_bytes())
+        self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
+        self.assert_all_closed(opened)
+
     def test_tail_size_validation_happens_before_filesystem_mutation(self) -> None:
         path = self.root / "missing" / "events.log"
 

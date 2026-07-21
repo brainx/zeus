@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3159,6 +3160,144 @@ password = "plain-password"
             self.assertEqual("TARGET-SENTINEL\n", target_log.read_text(encoding="utf-8"))
             self.assertEqual(target_mode, target_log.stat().st_mode & 0o777)
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_direct_inspect_rejects_linked_pid_marker_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            profile_path.mkdir(parents=True)
+            external_logs = root / "external-logs"
+            external_logs.mkdir(mode=0o755)
+            fifo = external_logs / "zeus-gateway.pid.json"
+            os.mkfifo(fifo, mode=0o600)
+            sentinel = external_logs / "sentinel.txt"
+            sentinel.write_text("external marker target\n", encoding="utf-8")
+            (profile_path / "logs").symlink_to(external_logs, target_is_directory=True)
+            store = StateStore(root / "state" / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            script = """
+import sys
+from pathlib import Path
+from zeus.private_io import UnsafeFileError
+from zeus.state import StateStore
+from zeus.supervisor import Supervisor
+
+root = Path(sys.argv[1])
+store = StateStore(root / "state" / "zeus.db")
+supervisor = Supervisor(store, "hermes", root / ".zeus" / "hermes")
+try:
+    supervisor.inspect("coder")
+except UnsafeFileError:
+    raise SystemExit(0)
+raise SystemExit(2)
+"""
+
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", script, str(root)],
+                    check=False,
+                    capture_output=True,
+                    timeout=2,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("direct inspect blocked on a linked PID-marker FIFO")
+
+            self.assertEqual(0, completed.returncode, completed.stderr.decode("utf-8", "replace"))
+            self.assertEqual("external marker target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertTrue(stat.S_ISFIFO(fifo.stat().st_mode))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_api_inspect_returns_generic_500_for_linked_pid_marker_fifo_without_blocking(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            profile_path.mkdir(parents=True)
+            external_logs = root / "external-logs"
+            external_logs.mkdir(mode=0o755)
+            fifo = external_logs / "zeus-gateway.pid.json"
+            os.mkfifo(fifo, mode=0o600)
+            sentinel = external_logs / "sentinel.txt"
+            sentinel.write_text("external API marker target\n", encoding="utf-8")
+            (profile_path / "logs").symlink_to(external_logs, target_is_directory=True)
+            store = StateStore(state_dir / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            script = """
+import http.client
+import json
+import sys
+import threading
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from zeus.api import make_handler
+from zeus.config import Settings
+
+root = Path(sys.argv[1])
+settings = Settings.from_env({
+    "ZEUS_STATE_DIR": str(root / "state"),
+    "ZEUS_API_KEY": "inspect-test-key",
+    "ZEUS_HOST": "127.0.0.1",
+    "ZEUS_PORT": "0",
+})
+server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(settings))
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+try:
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=1)
+    connection.request(
+        "GET",
+        "/bots/coder/inspect",
+        headers={"x-zeus-api-key": "inspect-test-key"},
+    )
+    response = connection.getresponse()
+    body = json.loads(response.read())
+    expected = {
+        "error": {
+            "code": "internal_error",
+            "message": "internal server error",
+            "status": 500,
+        }
+    }
+    if response.status != 500 or body != expected:
+        raise SystemExit(2)
+finally:
+    server.shutdown()
+    server.server_close()
+raise SystemExit(0)
+"""
+
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", script, str(root)],
+                    check=False,
+                    capture_output=True,
+                    timeout=4,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("API inspect blocked on a linked PID-marker FIFO")
+
+            self.assertEqual(0, completed.returncode, completed.stderr.decode("utf-8", "replace"))
+            self.assertEqual("external API marker target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertTrue(stat.S_ISFIFO(fifo.stat().st_mode))
+
     def test_supervisor_inspect_reports_metadata_without_env_contents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3225,6 +3364,35 @@ password = "plain-password"
             self.assertNotIn("plain-log-secret", serialized)
             self.assertNotIn("OPENROUTER_API_KEY", serialized)
             self.assertNotIn(hermes_bin, serialized)
+
+    def test_supervisor_inspect_preserves_invalid_pid_marker_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs_path = profile_path / "logs"
+            logs_path.mkdir(parents=True, mode=0o700)
+            marker = logs_path / "zeus-gateway.pid.json"
+            marker.write_text("{invalid json\n", encoding="utf-8")
+            marker.chmod(0o640)
+            store = StateStore(root / "state" / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile_path),
+                )
+            )
+            supervisor = Supervisor(store, "hermes", root / ".zeus" / "hermes")
+
+            inspected = supervisor.inspect("coder")
+
+            self.assertEqual(True, inspected["pid_marker"]["exists"])
+            self.assertEqual(False, inspected["pid_marker"]["valid"])
+            self.assertEqual("0640", inspected["pid_marker"]["mode"])
+            self.assertIn("error", inspected["pid_marker"])
+            self.assertEqual("", inspected["recent_logs"])
 
     def test_settings_parses_stop_kill_after_timeout_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3529,20 +3697,187 @@ password = "plain-password"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             state_dir = root / "state"
-            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
             external_state = root / "external-state-target"
-            external_state.mkdir(mode=0o755)
+            external_state.mkdir(mode=0o700)
+            external_state.chmod(0o700)
             sentinel = external_state / "sentinel.txt"
             sentinel.write_text("state target\n", encoding="utf-8")
             target_mode = external_state.stat().st_mode & 0o777
             state_dir.symlink_to(external_state, target_is_directory=True)
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
 
             check = _check_runtime_paths(settings)
 
+            self.assertEqual(state_dir, settings.state_dir)
             self.assertEqual("fail", check.status)
             self.assertNotIn(str(external_state), check.message)
             self.assertEqual("state target\n", sentinel.read_text(encoding="utf-8"))
             self.assertEqual(target_mode, external_state.stat().st_mode & 0o777)
+
+    def test_doctor_does_not_repair_state_replaced_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            displaced = root / "state-displaced"
+            replacement = root / "state-replacement"
+            replacement.mkdir(mode=0o777)
+            replacement.chmod(0o777)
+            sentinel = replacement / "sentinel.txt"
+            sentinel.write_text("replacement state\n", encoding="utf-8")
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+            real_lstat = os.lstat
+            swapped = False
+
+            def racing_lstat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> os.stat_result:
+                nonlocal swapped
+                metadata = real_lstat(path, dir_fd=dir_fd)
+                if not swapped and dir_fd is None and Path(path) == state_dir:
+                    state_dir.rename(displaced)
+                    replacement.rename(state_dir)
+                    swapped = True
+                return metadata
+
+            with patch("zeus.doctor.os.lstat", side_effect=racing_lstat):
+                check = _check_runtime_paths(settings)
+
+            self.assertTrue(swapped)
+            self.assertEqual("fail", check.status)
+            self.assertEqual(
+                "replacement state\n",
+                (state_dir / sentinel.name).read_text(encoding="utf-8"),
+            )
+            self.assertEqual(0o777, state_dir.stat().st_mode & 0o777)
+
+    def test_doctor_does_not_repair_logs_replaced_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            logs_dir = state_dir / "logs"
+            logs_dir.mkdir(parents=True, mode=0o700)
+            state_dir.chmod(0o700)
+            logs_dir.chmod(0o700)
+            displaced = state_dir / "logs-displaced"
+            replacement = state_dir / "logs-replacement"
+            replacement.mkdir(mode=0o777)
+            replacement.chmod(0o777)
+            sentinel = replacement / "sentinel.txt"
+            sentinel.write_text("replacement logs\n", encoding="utf-8")
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+            real_lstat = os.lstat
+            swapped = False
+
+            def racing_lstat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> os.stat_result:
+                nonlocal swapped
+                metadata = real_lstat(path, dir_fd=dir_fd)
+                if not swapped and dir_fd is None and Path(path) == logs_dir:
+                    logs_dir.rename(displaced)
+                    replacement.rename(logs_dir)
+                    swapped = True
+                return metadata
+
+            with patch("zeus.doctor.os.lstat", side_effect=racing_lstat):
+                check = _check_runtime_paths(settings)
+
+            self.assertTrue(swapped)
+            self.assertEqual("fail", check.status)
+            self.assertIn("logs", check.message.lower())
+            self.assertEqual(
+                "replacement logs\n",
+                (logs_dir / sentinel.name).read_text(encoding="utf-8"),
+            )
+            self.assertEqual(0o777, logs_dir.stat().st_mode & 0o777)
+
+    def test_settings_ensure_dirs_creates_missing_private_runtime_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(Path(tmp) / "state")})
+
+            settings.ensure_dirs()
+
+            for path in (
+                settings.state_dir,
+                settings.hermes_root,
+                settings.state_dir / "logs",
+                settings.state_dir / "locks",
+                settings.state_dir / "locks" / "bots",
+            ):
+                with self.subTest(path=path):
+                    self.assertTrue(path.is_dir())
+                    self.assertEqual(0o700, path.stat().st_mode & 0o777)
+
+    def test_runtime_entrypoints_reject_real_and_dangling_state_links(self) -> None:
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                state_dir = root / "state"
+                external_state = root / "external-state"
+                if not dangling:
+                    external_state.mkdir(mode=0o755)
+                    external_state.chmod(0o755)
+                    (external_state / "sentinel.txt").write_text(
+                        "external state\n", encoding="utf-8"
+                    )
+                state_dir.symlink_to(external_state, target_is_directory=True)
+                settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+
+                check = _check_runtime_paths(settings)
+                with self.assertRaises(UnsafeFileError):
+                    settings.ensure_dirs()
+                StateStore(settings.database_path).append_audit_event("link.proof")
+                with self.assertRaises(UnsafeFileError):
+                    make_handler(settings)
+
+                self.assertEqual("fail", check.status)
+                self.assertEqual(state_dir, settings.state_dir)
+                if dangling:
+                    self.assertFalse(external_state.exists())
+                else:
+                    self.assertEqual(
+                        ["sentinel.txt"], sorted(path.name for path in external_state.iterdir())
+                    )
+                    self.assertEqual(0o755, external_state.stat().st_mode & 0o777)
+
+    def test_runtime_entrypoints_reject_real_and_dangling_state_ancestor_links(self) -> None:
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                linked_parent = root / "linked-parent"
+                external_parent = root / "external-parent"
+                external_state = external_parent / "state"
+                if not dangling:
+                    external_state.mkdir(parents=True, mode=0o700)
+                    external_state.chmod(0o700)
+                    (external_state / "sentinel.txt").write_text(
+                        "external ancestor state\n", encoding="utf-8"
+                    )
+                linked_parent.symlink_to(external_parent, target_is_directory=True)
+                state_dir = linked_parent / "state"
+                settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+
+                check = _check_runtime_paths(settings)
+                with self.assertRaises(UnsafeFileError):
+                    settings.ensure_dirs()
+                StateStore(settings.database_path).append_audit_event("ancestor-link.proof")
+                with self.assertRaises(UnsafeFileError):
+                    make_handler(settings)
+
+                self.assertEqual("fail", check.status)
+                self.assertEqual(state_dir, settings.state_dir)
+                if dangling:
+                    self.assertFalse(external_parent.exists())
+                else:
+                    self.assertEqual(
+                        ["sentinel.txt"], sorted(path.name for path in external_state.iterdir())
+                    )
+                    self.assertEqual(0o700, external_state.stat().st_mode & 0o777)
 
     def test_api_health_and_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

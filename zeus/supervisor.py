@@ -33,6 +33,7 @@ from zeus.errors import (
 )
 from zeus.fs_utils import atomic_write_json
 from zeus.gateway_launcher import (
+    MARKER_NAME,
     MAX_PAYLOAD_BYTES,
     LaunchPayloadError,
     _is_owned_runtime_marker,
@@ -59,7 +60,7 @@ from zeus.models import (
     TemplateError,
     validate_id,
 )
-from zeus.private_io import nofollow_absolute_path, open_private_append
+from zeus.private_io import UnsafeFileError, nofollow_absolute_path, open_private_append
 from zeus.process_lock import BotProcessLock, LockTimeoutError
 from zeus.readiness import ReadinessProbe, ReadinessResult, probe_once, readiness_probe_from_env
 from zeus.reconciliation import (
@@ -164,6 +165,19 @@ def _gateway_process_launch_kwargs() -> dict[str, object]:
 
 def _nofollow_absolute_path(path: Path) -> Path:
     return nofollow_absolute_path(path)
+
+
+def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _caused_by_missing_path(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, FileNotFoundError):
+            return True
+        current = current.__cause__
+    return False
 
 
 class Supervisor:
@@ -3345,13 +3359,49 @@ class Supervisor:
             return
 
     def _read_pid_marker(self, profile_path: str) -> dict[str, object]:
-        path = self.pid_marker_path(profile_path)
-        if not path.exists():
-            return {"exists": False}
-        marker_mode = _file_mode(path)
+        safe_profile_path = _nofollow_absolute_path(Path(profile_path))
+        profile_fd = logs_fd = marker_fd = -1
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            try:
+                profile_fd = _open_profile(safe_profile_path)
+                logs_fd = _open_logs(profile_fd, create=False)
+                marker_fd, marker_stat = _open_regular_marker(logs_fd)
+            except (LaunchPayloadError, OSError, ValueError) as exc:
+                if _caused_by_missing_path(exc):
+                    return {"exists": False}
+                raise UnsafeFileError("PID marker cannot be opened safely") from exc
+            if marker_stat.st_uid != os.geteuid() or marker_stat.st_nlink != 1:
+                raise UnsafeFileError("PID marker is not a private regular file")
+            marker_mode = f"{stat.S_IMODE(marker_stat.st_mode):04o}"
+            try:
+                raw = _read_bounded_file(marker_fd)
+                current_marker = os.stat(MARKER_NAME, dir_fd=logs_fd, follow_symlinks=False)
+                current_logs = os.stat("logs", dir_fd=profile_fd, follow_symlinks=False)
+                opened_logs = os.fstat(logs_fd)
+            except (LaunchPayloadError, OSError, TypeError, ValueError) as exc:
+                return {
+                    "exists": True,
+                    "valid": False,
+                    "mode": marker_mode,
+                    "error": str(exc),
+                }
+            if (
+                not stat.S_ISREG(current_marker.st_mode)
+                or current_marker.st_uid != os.geteuid()
+                or current_marker.st_nlink != 1
+                or not _same_identity(marker_stat, current_marker)
+                or not stat.S_ISDIR(current_logs.st_mode)
+                or not _same_identity(opened_logs, current_logs)
+            ):
+                raise UnsafeFileError("PID marker changed while it was inspected")
+        finally:
+            for descriptor in (marker_fd, logs_fd, profile_fd):
+                if descriptor >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(descriptor)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             return {"exists": True, "valid": False, "mode": marker_mode, "error": str(exc)}
         if not isinstance(payload, dict):
             return {
@@ -4014,10 +4064,3 @@ def _safe_command_shape(argv: list[str]) -> str:
     if len(args) == 4 and args[0] == "-p" and args[2:] == ["gateway", "run"]:
         return f"{classification} hermes -p <bot> gateway run"
     return f"{classification} unrecognized"
-
-
-def _file_mode(path: Path) -> str | None:
-    try:
-        return f"{stat.S_IMODE(path.stat().st_mode):04o}"
-    except OSError:
-        return None

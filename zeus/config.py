@@ -7,6 +7,7 @@ from ipaddress import ip_address
 from pathlib import Path
 
 from zeus.envfile import parse_env_text
+from zeus.private_io import ensure_private_directory, nofollow_absolute_path
 
 
 def load_dotenv(path: Path = Path(".env")) -> dict[str, str]:
@@ -45,7 +46,7 @@ class Settings:
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
         merged: dict[str, str] = load_dotenv()
         merged.update(dict(os.environ if env is None else env))
-        state_dir = Path(merged.get("ZEUS_STATE_DIR") or ".zeus").resolve()
+        state_dir = nofollow_absolute_path(Path(merged.get("ZEUS_STATE_DIR") or ".zeus"))
         port = _port_env(merged, "ZEUS_PORT", default=4311)
         return cls(
             state_dir=state_dir,
@@ -142,10 +143,13 @@ class Settings:
         )
 
     def ensure_dirs(self) -> None:
-        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.hermes_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (self.state_dir / "logs").mkdir(parents=True, exist_ok=True, mode=0o700)
-        (self.state_dir / "locks" / "bots").mkdir(parents=True, exist_ok=True, mode=0o700)
+        for path in (
+            self.state_dir,
+            self.hermes_root,
+            self.state_dir / "logs",
+            self.state_dir / "locks" / "bots",
+        ):
+            ensure_private_directory(path)
 
 
 def is_loopback_host(host: str) -> bool:

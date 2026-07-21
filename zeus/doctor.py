@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from zeus.config import Settings, is_loopback_host
-from zeus.private_io import nofollow_absolute_path, validate_private_directory
+from zeus.private_io import inspect_private_directory, nofollow_absolute_path
 from zeus.state import StateStore
 from zeus.templates import TemplateStore
 
@@ -111,6 +111,20 @@ def _existing_runtime_directory_check(
     try:
         metadata = os.lstat(path)
     except FileNotFoundError:
+        try:
+            exists = inspect_private_directory(path, missing_ok=True)
+        except OSError:
+            return True, DoctorCheck(
+                "runtime_paths",
+                "fail",
+                f"{label} {path} could not be validated safely",
+            )
+        if exists:
+            return True, DoctorCheck(
+                "runtime_paths",
+                "fail",
+                f"{label} {path} changed while it was inspected",
+            )
         return False, None
     except OSError:
         return True, DoctorCheck(
@@ -137,7 +151,7 @@ def _existing_runtime_directory_check(
             f"{label} {path} must not be accessible to other users or groups",
         )
     try:
-        validate_private_directory(path)
+        inspect_private_directory(path)
     except OSError:
         return True, DoctorCheck(
             "runtime_paths",

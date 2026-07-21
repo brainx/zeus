@@ -535,7 +535,11 @@ def _open_regular_marker(logs_fd: int) -> tuple[int, os.stat_result]:
         raise LaunchPayloadError("marker is unavailable") from exc
     if not stat.S_ISREG(before.st_mode):
         raise LaunchPayloadError("marker is not a regular file")
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if type(nonblocking) is not int or nonblocking == 0:
+        raise LaunchPayloadError("bounded marker reads are unavailable")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= nonblocking
     try:
         marker_fd = os.open(MARKER_NAME, flags, dir_fd=logs_fd)
     except OSError as exc:

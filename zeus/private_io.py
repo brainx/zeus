@@ -47,6 +47,32 @@ class _Platform:
     create_exclusive_flags: int
 
 
+@dataclass(frozen=True)
+class _OpenedDirectoryPath:
+    descriptors: tuple[int, ...]
+    names: tuple[str, ...]
+
+    @property
+    def fd(self) -> int:
+        return self.descriptors[-1]
+
+    def validate_bindings(self) -> None:
+        _validate_directory_bindings(self.descriptors, self.names)
+
+    def confirm_missing(self, name: str) -> None:
+        self.validate_bindings()
+        try:
+            os.lstat(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            self.validate_bindings()
+            return
+        except OSError as exc:
+            raise UnsafeFileError("missing private path could not be confirmed") from exc
+        except (TypeError, ValueError) as exc:
+            raise UnsafeFileError("missing private path cannot be inspected safely") from exc
+        raise UnsafeFileError("private path appeared while absence was confirmed")
+
+
 def _required_flag(name: str, *, allow_zero: bool = False) -> int:
     value = getattr(os, name, None)
     if type(value) is not int or (not allow_zero and value == 0):
@@ -158,6 +184,42 @@ def _validate_directory_snapshots(
         raise UnsafeFileError(f"{description} changed while it was opened")
 
 
+def _validate_directory_bindings(
+    descriptors: tuple[int, ...],
+    names: tuple[str, ...],
+) -> None:
+    if len(descriptors) != len(names) + 1:
+        raise UnsafeFileError("private directory descriptor chain is invalid")
+    try:
+        root_snapshots = (os.fstat(descriptors[0]), os.lstat("/"))
+        _validate_directory_snapshots(root_snapshots, "filesystem root")
+        for parent_fd, name, directory_fd in zip(
+            descriptors[:-1],
+            names,
+            descriptors[1:],
+            strict=True,
+        ):
+            snapshots = (os.fstat(directory_fd), os.lstat(name, dir_fd=parent_fd))
+            _validate_directory_snapshots(snapshots, f"private path component {name!r}")
+    except UnsafeFileError:
+        raise
+    except OSError as exc:
+        raise UnsafeFileError("private directory path binding changed") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnsafeFileError("private directory path cannot be inspected safely") from exc
+
+
+def _inspect_private_directory_snapshots(
+    snapshots: tuple[os.stat_result, ...],
+    platform: _Platform,
+    description: str,
+) -> None:
+    if not all(snapshot.st_uid == platform.euid for snapshot in snapshots):
+        raise UnsafeFileError(f"{description} has an unexpected owner")
+    if any(stat.S_IMODE(snapshot.st_mode) & 0o077 for snapshot in snapshots):
+        raise UnsafeFileError(f"{description} does not have private permissions")
+
+
 def _tighten_directory(
     parent_fd: int,
     name: str,
@@ -215,6 +277,7 @@ def _open_directory_at(
     create: bool,
     missing_ok: bool,
     private: bool,
+    tighten: bool,
     platform: _Platform,
 ) -> int:
     description = f"private path component {name!r}"
@@ -254,7 +317,7 @@ def _open_directory_at(
         after = os.lstat(name, dir_fd=parent_fd)
         snapshots = (before, opened, after)
         _validate_directory_snapshots(snapshots, description)
-        if created or private:
+        if created or (private and tighten):
             _tighten_directory(
                 parent_fd,
                 name,
@@ -263,6 +326,8 @@ def _open_directory_at(
                 platform,
                 description,
             )
+        elif private:
+            _inspect_private_directory_snapshots(snapshots, platform, description)
         return directory_fd
     except UnsafeFileError:
         _close_suppressing_error(directory_fd)
@@ -281,41 +346,56 @@ def _open_directory_path(
     *,
     create: bool,
     missing_ok: bool = False,
+    tighten: bool = True,
     platform: _Platform,
-) -> Iterator[int]:
-    current_fd = _open_root(platform)
+) -> Iterator[_OpenedDirectoryPath]:
+    descriptors = [_open_root(platform)]
+    names: list[str] = []
     try:
         for index, component in enumerate(parts):
-            next_fd = _open_directory_at(
-                current_fd,
-                component,
-                create=create,
-                missing_ok=missing_ok,
-                private=index == len(parts) - 1,
-                platform=platform,
-            )
-            previous_fd = current_fd
-            current_fd = -1
             try:
-                _close_descriptor(previous_fd, "ancestor directory")
-            except UnsafeFileError:
-                _close_suppressing_error(next_fd)
+                next_fd = _open_directory_at(
+                    descriptors[-1],
+                    component,
+                    create=create,
+                    missing_ok=missing_ok,
+                    private=index == len(parts) - 1,
+                    tighten=tighten,
+                    platform=platform,
+                )
+            except _PrivatePathMissing:
+                _OpenedDirectoryPath(tuple(descriptors), tuple(names)).confirm_missing(component)
                 raise
-            current_fd = next_fd
+            descriptors.append(next_fd)
+            names.append(component)
     except BaseException:
-        if current_fd >= 0:
-            _close_suppressing_error(current_fd)
+        for descriptor in reversed(descriptors):
+            _close_suppressing_error(descriptor)
         raise
 
-    result_fd = current_fd
-    current_fd = -1
+    opened = _OpenedDirectoryPath(tuple(descriptors), tuple(names))
     try:
-        yield result_fd
+        yield opened
     except BaseException:
-        _close_suppressing_error(result_fd)
+        for descriptor in reversed(descriptors):
+            _close_suppressing_error(descriptor)
         raise
     else:
-        _close_descriptor(result_fd, "private directory")
+        try:
+            opened.validate_bindings()
+        except BaseException:
+            for descriptor in reversed(descriptors):
+                _close_suppressing_error(descriptor)
+            raise
+        close_error: UnsafeFileError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                _close_descriptor(descriptor, "private directory")
+            except UnsafeFileError as exc:
+                if close_error is None:
+                    close_error = exc
+        if close_error is not None:
+            raise close_error
 
 
 def _validate_file_snapshot(snapshot: os.stat_result, platform: _Platform) -> None:
@@ -395,9 +475,9 @@ def _private_append_context(
     name: str,
     platform: _Platform,
 ) -> Iterator[BinaryIO]:
-    with _open_directory_path(parent_parts, create=True, platform=platform) as parent_fd:
+    with _open_directory_path(parent_parts, create=True, platform=platform) as parent:
         file_fd = _open_private_file_at(
-            parent_fd,
+            parent.fd,
             name,
             append=True,
             create=True,
@@ -462,15 +542,16 @@ def read_private_tail(path: Path, max_bytes: int) -> bytes:
     try:
         with _open_directory_path(
             parts[:-1], create=False, missing_ok=True, platform=platform
-        ) as parent_fd:
+        ) as parent:
             file_fd = _open_private_file_at(
-                parent_fd,
+                parent.fd,
                 parts[-1],
                 append=False,
                 create=False,
                 platform=platform,
             )
             if file_fd is None:
+                parent.confirm_missing(parts[-1])
                 return b""
             try:
                 try:
@@ -503,3 +584,27 @@ def validate_private_directory(path: Path) -> None:
     platform = _require_platform()
     with _open_directory_path(parts, create=False, platform=platform):
         pass
+
+
+def ensure_private_directory(path: Path) -> None:
+    parts = _validate_path(path, file_path=False)
+    platform = _require_platform()
+    with _open_directory_path(parts, create=True, platform=platform):
+        pass
+
+
+def inspect_private_directory(path: Path, *, missing_ok: bool = False) -> bool:
+    parts = _validate_path(path, file_path=False)
+    platform = _require_platform()
+    try:
+        with _open_directory_path(
+            parts,
+            create=False,
+            missing_ok=missing_ok,
+            tighten=False,
+            platform=platform,
+        ):
+            pass
+    except _PrivatePathMissing:
+        return False
+    return True

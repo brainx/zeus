@@ -14,6 +14,7 @@ from typing import Any
 
 from zeus.envfile import dump_env
 from zeus.models import BotCreateRequest, BotRecord, HermesTemplate, TemplateError
+from zeus.private_io import nofollow_absolute_path, validate_private_directory
 
 _LOG = logging.getLogger(__name__)
 
@@ -159,26 +160,24 @@ def _ensure_preserved_directory(path: Path) -> None:
 
 
 def _ensure_private_logs_directory(path: Path) -> None:
-    if _path_exists(path):
+    try:
+        if _path_exists(path):
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode):
+                path.unlink()
+            elif not stat.S_ISDIR(metadata.st_mode):
+                raise TemplateError(f"profile path must be a directory: {path.name}")
+        if not _path_exists(path):
+            path.mkdir(mode=0o700)
         metadata = os.lstat(path)
-        if stat.S_ISLNK(metadata.st_mode):
-            path.unlink()
-        elif not stat.S_ISDIR(metadata.st_mode):
-            raise TemplateError(f"profile path must be a directory: {path.name}")
-    if not _path_exists(path):
-        path.mkdir(mode=0o700)
-
-    metadata = os.lstat(path)
+    except OSError as exc:
+        raise TemplateError("profile logs directory could not be prepared safely") from exc
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
         raise TemplateError("profile logs directory must be owned by the current user")
-    path.chmod(0o700)
-    validated = os.lstat(path)
-    if (
-        not stat.S_ISDIR(validated.st_mode)
-        or validated.st_uid != os.geteuid()
-        or stat.S_IMODE(validated.st_mode) != 0o700
-    ):
-        raise TemplateError("profile logs directory could not be made private")
+    try:
+        validate_private_directory(nofollow_absolute_path(path))
+    except OSError as exc:
+        raise TemplateError("profile logs directory could not be made private") from exc
 
 
 def _write_staged_file(path: Path, content: str) -> None:

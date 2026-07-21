@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from zeus import private_io
 from zeus.hermes_adapter import HermesAdapter
 from zeus.lifecycle import LifecycleEventInput
 from zeus.models import BotCreateRequest, BotRecord, BotStatus, HermesTemplate, TemplateError
@@ -727,6 +728,67 @@ class RendererStateTests(unittest.TestCase):
             self.assertEqual(os.geteuid(), logs.stat().st_uid)
             self.assertEqual(0o700, logs.stat().st_mode & 0o777)
             self.assertEqual(["coder"], sorted(path.name for path in profile.parent.iterdir()))
+
+    def test_renderer_logs_tightening_does_not_follow_staging_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            hermes_root = root / ".zeus" / "hermes"
+            renderer = ProfileRenderer(hermes_root)
+            template = TemplateStore().get("coding-bot")
+            request = BotCreateRequest(bot_id="coder", template_id="coding-bot")
+            renderer.render(request, template)
+            profile = hermes_root / "profiles" / "coder"
+            live_log = profile / "logs" / "gateway.log"
+            live_log.write_text("live log\n", encoding="utf-8")
+            external_logs = root / "external-race-target"
+            external_logs.mkdir(mode=0o755)
+            external_logs.chmod(0o755)
+            sentinel = external_logs / "sentinel.txt"
+            sentinel.write_text("external target\n", encoding="utf-8")
+            external_mode = external_logs.stat().st_mode & 0o777
+            swapped = False
+
+            def swap_staging_logs() -> None:
+                nonlocal swapped
+                if swapped:
+                    return
+                candidates = list(profile.parent.glob(".coder.staging-*/logs"))
+                self.assertEqual(1, len(candidates))
+                staging_logs = candidates[0]
+                staging_logs.rename(staging_logs.with_name("logs-displaced"))
+                staging_logs.symlink_to(external_logs, target_is_directory=True)
+                swapped = True
+
+            real_chmod = Path.chmod
+
+            def racing_chmod(
+                path: Path,
+                mode: int,
+                *,
+                follow_symlinks: bool = True,
+            ) -> None:
+                if path.name == "logs" and path.parent.name.startswith(".coder.staging-"):
+                    swap_staging_logs()
+                real_chmod(path, mode, follow_symlinks=follow_symlinks)
+
+            def racing_validate_private_directory(path: Path) -> None:
+                swap_staging_logs()
+                private_io.validate_private_directory(path)
+
+            with (
+                patch.object(Path, "chmod", new=racing_chmod),
+                patch(
+                    "zeus.renderer.validate_private_directory",
+                    side_effect=racing_validate_private_directory,
+                ),
+                self.assertRaises(TemplateError),
+            ):
+                renderer.render(request, replace(template, soul="must not be installed"))
+
+            self.assertTrue(swapped)
+            self.assertEqual("external target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(external_mode, external_logs.stat().st_mode & 0o777)
+            self.assertEqual("live log\n", live_log.read_text(encoding="utf-8"))
 
     def test_renderer_replacement_preserves_complete_existing_profile_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
