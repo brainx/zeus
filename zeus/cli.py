@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
+from zeus import __version__
 from zeus.api import serve, template_to_dict
 from zeus.config import Settings, load_dotenv
 from zeus.doctor import report_to_json, report_to_text, run_doctor
@@ -28,36 +29,112 @@ DEMO_FAKE_HERMES = "zeus-fake-hermes"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="zeus")
+    parser = argparse.ArgumentParser(
+        prog="zeus",
+        description="Manage local Hermes bot gateways and the Zeus API.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     sub = parser.add_subparsers(dest="resource", required=True)
 
-    serve_cmd = sub.add_parser("serve")
-    serve_cmd.add_argument("--host")
-    serve_cmd.add_argument("--port", type=int)
+    serve_description = "Run the local Zeus HTTP API server."
+    serve_cmd = sub.add_parser(
+        "serve",
+        help=serve_description,
+        description=serve_description,
+    )
+    serve_cmd.add_argument("--host", help="bind host (default: ZEUS_HOST or 127.0.0.1)")
+    serve_cmd.add_argument("--port", type=int, help="listen port (default: ZEUS_PORT or 4311)")
 
-    doctor = sub.add_parser("doctor")
-    doctor.add_argument("--json", action="store_true", dest="as_json")
-    doctor.add_argument("--strict", action="store_true")
+    doctor_description = "Check Zeus configuration, runtime paths, and dependencies."
+    doctor = sub.add_parser(
+        "doctor",
+        help=doctor_description,
+        description=doctor_description,
+    )
+    doctor.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
+    doctor.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat warnings as failures",
+    )
 
-    template = sub.add_parser("template")
+    template_description = "Inspect available Hermes bot templates."
+    template = sub.add_parser(
+        "template",
+        help=template_description,
+        description=template_description,
+    )
     template_sub = template.add_subparsers(dest="action", required=True)
-    template_list = template_sub.add_parser("list")
-    template_list.add_argument("--json", action="store_true", dest="as_json")
+    template_list_description = "List available bot templates."
+    template_list = template_sub.add_parser(
+        "list",
+        help=template_list_description,
+        description=template_list_description,
+    )
+    template_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
 
-    demo = sub.add_parser("demo")
+    demo_description = "Run the bundled fake-Hermes lifecycle demo."
+    demo = sub.add_parser(
+        "demo",
+        help=demo_description,
+        description=demo_description,
+    )
     demo_sub = demo.add_subparsers(dest="action", required=True)
-    for action in ["up", "status", "down"]:
-        command = demo_sub.add_parser(action)
-        command.add_argument("--bot-id", default=DEMO_BOT_ID)
-        command.add_argument("--json", action="store_true", dest="as_json")
+    demo_actions = {
+        "up": "Create and start the demo bot.",
+        "status": "Show the demo bot status.",
+        "down": "Stop the demo bot.",
+    }
+    for action, description in demo_actions.items():
+        command = demo_sub.add_parser(action, help=description, description=description)
+        command.add_argument(
+            "--bot-id",
+            default=DEMO_BOT_ID,
+            help=f"demo bot ID (default: {DEMO_BOT_ID})",
+        )
+        command.add_argument(
+            "--json",
+            action="store_true",
+            dest="as_json",
+            help="emit machine-readable JSON",
+        )
 
-    bot = sub.add_parser("bot")
+    bot_description = "Create, inspect, and manage Hermes bot gateways."
+    bot = sub.add_parser(
+        "bot",
+        help=bot_description,
+        description=bot_description,
+    )
     bot_sub = bot.add_subparsers(dest="action", required=True)
 
-    create = bot_sub.add_parser("create")
-    create.add_argument("bot_id")
-    create.add_argument("--template", required=True, dest="template_id")
-    create.add_argument("--name", dest="display_name")
+    create_description = "Create a bot profile from a template."
+    create = bot_sub.add_parser(
+        "create",
+        help=create_description,
+        description=create_description,
+    )
+    create.add_argument("bot_id", help="unique bot ID")
+    create.add_argument(
+        "--template",
+        required=True,
+        dest="template_id",
+        help="template ID used to render the bot profile",
+    )
+    create.add_argument("--name", dest="display_name", help="display name (defaults to bot ID)")
     create.add_argument(
         "--env",
         action="append",
@@ -74,59 +151,215 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="import NAME from the process environment, then trusted ./.env, without argv values",
     )
-    create.add_argument("--restart-policy", choices=["manual", "on-failure"], default="manual")
-    create.add_argument("--restart-backoff-seconds", type=float, default=5.0)
-    create.add_argument("--restart-max-attempts", type=int, default=5)
-    create.add_argument("--replace", action="store_true", dest="replace_existing")
-    create.add_argument("--stop", action="store_true", dest="stop_if_running")
-    create.add_argument("--json", action="store_true", dest="as_json")
+    create.add_argument(
+        "--restart-policy",
+        choices=["manual", "on-failure"],
+        default="manual",
+        help="automatic restart policy (default: manual)",
+    )
+    create.add_argument(
+        "--restart-backoff-seconds",
+        type=float,
+        default=5.0,
+        help="initial on-failure restart backoff in seconds (default: 5)",
+    )
+    create.add_argument(
+        "--restart-max-attempts",
+        type=int,
+        default=5,
+        help="maximum consecutive restart attempts (default: 5)",
+    )
+    create.add_argument(
+        "--replace",
+        action="store_true",
+        dest="replace_existing",
+        help="replace an existing bot (requires --stop if it is running)",
+    )
+    create.add_argument(
+        "--stop",
+        action="store_true",
+        dest="stop_if_running",
+        help="stop a running bot before replacement",
+    )
+    create.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
 
-    bot_list = bot_sub.add_parser("list")
-    bot_list.add_argument("--json", action="store_true", dest="as_json")
-    delete = bot_sub.add_parser("delete")
-    delete.add_argument("bot_id")
-    delete.add_argument("--stop", action="store_true", dest="stop_if_running")
-    delete.add_argument("--remove-profile", action="store_true")
-    delete.add_argument("--json", action="store_true", dest="as_json")
-    archive = bot_sub.add_parser("archive")
-    archive.add_argument("bot_id")
-    archive.add_argument("--stop", action="store_true", dest="stop_if_running")
-    archive.add_argument("--json", action="store_true", dest="as_json")
-    reconcile = bot_sub.add_parser("reconcile")
-    reconcile.add_argument("bot_id", nargs="?")
-    reconcile.add_argument("--json", action="store_true", dest="as_json")
-    reconcile.add_argument("--summary", action="store_true")
-    reconcile.add_argument("--force", action="store_true")
-    reconcile.add_argument("--reset-restart", action="store_true")
-    inspect = bot_sub.add_parser("inspect")
-    inspect.add_argument("bot_id")
-    inspect.add_argument("--json", action="store_true", dest="as_json")
-    history = bot_sub.add_parser("history")
-    history.add_argument("bot_id")
-    history.add_argument("--limit", type=_history_limit, default=50)
-    history.add_argument("--before", type=_positive_event_id)
-    history.add_argument("--json", action="store_true", dest="as_json")
-    for action in ["start", "stop", "restart", "status", "logs", "doctor"]:
-        command = bot_sub.add_parser(action)
-        command.add_argument("bot_id")
+    list_description = "List registered bots."
+    bot_list = bot_sub.add_parser(
+        "list",
+        help=list_description,
+        description=list_description,
+    )
+    bot_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
+    delete_description = "Delete a bot registration."
+    delete = bot_sub.add_parser(
+        "delete",
+        help=delete_description,
+        description=delete_description,
+    )
+    delete.add_argument("bot_id", help="bot ID")
+    delete.add_argument(
+        "--stop",
+        action="store_true",
+        dest="stop_if_running",
+        help="stop the bot before deletion",
+    )
+    delete.add_argument(
+        "--remove-profile",
+        action="store_true",
+        help="also remove the managed profile directory",
+    )
+    delete.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
+    archive_description = "Archive a bot profile."
+    archive = bot_sub.add_parser(
+        "archive",
+        help=archive_description,
+        description=archive_description,
+    )
+    archive.add_argument("bot_id", help="bot ID")
+    archive.add_argument(
+        "--stop",
+        action="store_true",
+        dest="stop_if_running",
+        help="stop the bot before archiving",
+    )
+    archive.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
+    reconcile_description = "Reconcile desired and observed bot state."
+    reconcile = bot_sub.add_parser(
+        "reconcile",
+        help=reconcile_description,
+        description=reconcile_description,
+    )
+    reconcile.add_argument("bot_id", nargs="?", help="bot ID; omit to reconcile all bots")
+    reconcile.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
+    reconcile.add_argument(
+        "--summary",
+        action="store_true",
+        help="emit persisted run metadata and per-bot results",
+    )
+    reconcile.add_argument(
+        "--force",
+        action="store_true",
+        help="run an eligible restart now instead of waiting for backoff",
+    )
+    reconcile.add_argument(
+        "--reset-restart",
+        action="store_true",
+        help="reset restart backoff and retry budget before reconciling",
+    )
+    inspect_description = "Show bot diagnostics."
+    inspect = bot_sub.add_parser(
+        "inspect",
+        help=inspect_description,
+        description=inspect_description,
+    )
+    inspect.add_argument("bot_id", help="bot ID")
+    inspect.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
+    history_description = "Show immutable lifecycle history."
+    history = bot_sub.add_parser(
+        "history",
+        help=history_description,
+        description=history_description,
+    )
+    history.add_argument("bot_id", help="bot ID")
+    history.add_argument(
+        "--limit",
+        type=_history_limit,
+        default=50,
+        help="maximum events to return, 1-1000 (default: 50)",
+    )
+    history.add_argument(
+        "--before",
+        type=_positive_event_id,
+        help="return events before this exclusive event ID",
+    )
+    history.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable JSON",
+    )
+    lifecycle_descriptions = {
+        "start": "Start a bot gateway.",
+        "stop": "Stop a bot gateway gracefully.",
+        "restart": "Restart a bot gateway.",
+        "status": "Show current bot status.",
+        "logs": "Show redacted bot logs.",
+        "doctor": "Run Hermes doctor for a bot profile.",
+    }
+    for action, description in lifecycle_descriptions.items():
+        command = bot_sub.add_parser(action, help=description, description=description)
+        command.add_argument("bot_id", help="bot ID")
         if action in {"start", "restart"}:
-            command.add_argument("--wait", dest="wait", action="store_true", default=False)
-            command.add_argument("--no-wait", dest="wait", action="store_false")
-            command.add_argument("--timeout", type=float, dest="timeout_seconds")
+            command.add_argument(
+                "--wait",
+                dest="wait",
+                action="store_true",
+                default=False,
+                help="wait for readiness before returning",
+            )
+            command.add_argument(
+                "--no-wait",
+                dest="wait",
+                action="store_false",
+                help="return after launch without waiting for readiness (default)",
+            )
+            command.add_argument(
+                "--timeout",
+                type=float,
+                dest="timeout_seconds",
+                help="readiness timeout in seconds",
+            )
         if action == "stop":
             command.add_argument(
                 "--kill-after-timeout",
                 dest="kill_after_timeout",
                 action="store_true",
                 default=None,
+                help="send SIGKILL if graceful shutdown times out",
             )
             command.add_argument(
                 "--no-kill-after-timeout",
                 dest="kill_after_timeout",
                 action="store_false",
+                help="never escalate a timed-out graceful shutdown",
             )
         if action == "logs":
-            command.add_argument("--json", action="store_true", dest="as_json")
+            command.add_argument(
+                "--json",
+                action="store_true",
+                dest="as_json",
+                help="emit machine-readable JSON",
+            )
 
     return parser
 

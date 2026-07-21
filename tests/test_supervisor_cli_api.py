@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from zeus import __version__
 from zeus.api import main as api_main
 from zeus.api import make_handler
 from zeus.cli import _parse_env, _services, build_parser
@@ -2084,6 +2085,163 @@ password = "plain-password"
                 self.assertTrue((root / ".zeus" / "hermes" / "profiles" / "coder").exists())
             finally:
                 os.chdir(old_cwd)
+
+    def test_cli_version_is_single_sourced_and_has_no_runtime_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_cwd = Path.cwd()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                os.chdir(root)
+                with (
+                    patch("zeus.cli.Settings.from_env") as from_env,
+                    patch("zeus.cli._services") as services,
+                    patch("zeus.cli._demo_services") as demo_services,
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    cli_main(["--version"])
+
+                self.assertEqual(0, raised.exception.code)
+                self.assertEqual(f"zeus {__version__}\n", stdout.getvalue())
+                self.assertEqual("", stderr.getvalue())
+                from_env.assert_not_called()
+                services.assert_not_called()
+                demo_services.assert_not_called()
+                self.assertFalse((root / ".zeus").exists())
+            finally:
+                os.chdir(old_cwd)
+
+    def test_cli_help_is_descriptive_and_has_no_runtime_side_effects(self) -> None:
+        help_cases = (
+            (
+                ["--help"],
+                (
+                    "Manage local Hermes bot gateways and the Zeus API.",
+                    "Run the local Zeus HTTP API server.",
+                    "Check Zeus configuration, runtime paths, and dependencies.",
+                    "Inspect available Hermes bot templates.",
+                    "Run the bundled fake-Hermes lifecycle demo.",
+                    "Create, inspect, and manage Hermes bot gateways.",
+                ),
+            ),
+            (
+                ["serve", "--help"],
+                ("Run the local Zeus HTTP API server.", "bind host", "listen port", "4311"),
+            ),
+            (
+                ["doctor", "--help"],
+                (
+                    "Check Zeus configuration, runtime paths, and dependencies.",
+                    "machine-readable JSON",
+                    "treat warnings as failures",
+                ),
+            ),
+            (
+                ["template", "--help"],
+                ("Inspect available Hermes bot templates.", "List available bot templates."),
+            ),
+            (
+                ["demo", "--help"],
+                (
+                    "Run the bundled fake-Hermes lifecycle demo.",
+                    "Create and start the demo bot.",
+                    "Show the demo bot status.",
+                    "Stop the demo bot.",
+                ),
+            ),
+            (
+                ["bot", "--help"],
+                (
+                    "Create, inspect, and manage Hermes bot gateways.",
+                    "Create a bot profile from a template.",
+                    "List registered bots.",
+                    "Delete a bot registration.",
+                    "Archive a bot profile.",
+                    "Reconcile desired and observed bot state.",
+                    "Show bot diagnostics.",
+                    "Show immutable lifecycle history.",
+                    "Start a bot gateway.",
+                    "Stop a bot gateway gracefully.",
+                    "Restart a bot gateway.",
+                    "Show current bot status.",
+                    "Show redacted bot logs.",
+                    "Run Hermes doctor for a bot profile.",
+                ),
+            ),
+            (
+                ["bot", "create", "--help"],
+                (
+                    "Create a bot profile from a template.",
+                    "--replace",
+                    "replace an existing bot",
+                    "stop a running bot before replacement",
+                ),
+            ),
+            (
+                ["bot", "start", "--help"],
+                ("Start a bot gateway.", "--wait", "wait for readiness", "--no-wait"),
+            ),
+            (
+                ["bot", "reconcile", "--help"],
+                (
+                    "Reconcile desired and observed bot state.",
+                    "--force",
+                    "eligible restart now",
+                    "--reset-restart",
+                    "reset restart backoff",
+                ),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with (
+                    patch("zeus.cli.Settings.from_env") as from_env,
+                    patch("zeus.cli._services") as services,
+                    patch("zeus.cli._demo_services") as demo_services,
+                ):
+                    for argv, expected_fragments in help_cases:
+                        with self.subTest(argv=argv):
+                            stdout = io.StringIO()
+                            stderr = io.StringIO()
+                            with (
+                                redirect_stdout(stdout),
+                                redirect_stderr(stderr),
+                                self.assertRaises(SystemExit) as raised,
+                            ):
+                                cli_main(argv)
+
+                            self.assertEqual(0, raised.exception.code)
+                            self.assertEqual("", stderr.getvalue())
+                            help_text = " ".join(stdout.getvalue().split())
+                            for fragment in expected_fragments:
+                                self.assertIn(fragment, help_text)
+
+                    from_env.assert_not_called()
+                    services.assert_not_called()
+                    demo_services.assert_not_called()
+                    self.assertFalse((root / ".zeus").exists())
+            finally:
+                os.chdir(old_cwd)
+
+    def test_bug_report_version_command_and_changelog_are_current(self) -> None:
+        bug_template = Path(".github/ISSUE_TEMPLATE/bug_report.yml").read_text(encoding="utf-8")
+        changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## 0.3.0", 1)[0]
+
+        self.assertIn(
+            "description: Run `zeus --version` and paste the complete output.",
+            bug_template,
+        )
+        self.assertNotIn("or the installed package version", bug_template)
+        self.assertIn("descriptive CLI help", unreleased)
+        self.assertIn("`zeus --version`", unreleased)
 
     def test_cli_create_help_recommends_env_from_and_warns_legacy_env_is_unsafe(self) -> None:
         stdout = io.StringIO()
