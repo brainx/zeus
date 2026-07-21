@@ -4,13 +4,18 @@ import contextlib
 import json
 import os
 import socket
+import socketserver
 import threading
 import unittest
+from email.message import Message
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 from unittest.mock import patch
 
+import zeus.readiness as readiness_module
 from zeus.readiness import (
+    MAX_READINESS_RESPONSE_BYTES,
     ReadinessProbe,
     probe_once,
     readiness_probe_from_env,
@@ -47,6 +52,18 @@ class ReadinessTests(unittest.TestCase):
         server_class = _IPv6ThreadingHTTPServer if ipv6 else ThreadingHTTPServer
         host = "::1" if ipv6 else "127.0.0.1"
         server = server_class((host, 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 1)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, thread
+
+    def _run_raw_server(
+        self,
+        handler: type[socketserver.BaseRequestHandler],
+    ) -> tuple[socketserver.ThreadingTCPServer, threading.Thread]:
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(thread.join, 1)
@@ -105,6 +122,48 @@ class ReadinessTests(unittest.TestCase):
             self.skipTest(f"IPv6 loopback is unavailable: {exc}")
 
         result = probe_once(f"http://[::1]:{server.server_port}/health")
+
+        self.assertTrue(result.ready)
+        self.assertEqual("ready", result.message)
+        self.assertEqual(_HealthHandler.payload, result.payload)
+
+    def test_probe_once_accepts_health_payload_without_content_length(self) -> None:
+        class NoContentLengthHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                data = json.dumps(_HealthHandler.payload).encode("utf-8")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        server, _thread = self._run_server(NoContentLengthHandler)
+
+        result = probe_once(f"http://127.0.0.1:{server.server_port}/health")
+
+        self.assertTrue(result.ready)
+        self.assertEqual("ready", result.message)
+        self.assertEqual(_HealthHandler.payload, result.payload)
+
+    def test_probe_once_accepts_chunked_health_payload(self) -> None:
+        class ChunkedHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                data = json.dumps(_HealthHandler.payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("transfer-encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(f"{len(data):x}\r\n".encode("ascii"))
+                self.wfile.write(data + b"\r\n0\r\n\r\n")
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        server, _thread = self._run_server(ChunkedHandler)
+
+        result = probe_once(f"http://127.0.0.1:{server.server_port}/health")
 
         self.assertTrue(result.ready)
         self.assertEqual("ready", result.message)
@@ -177,7 +236,14 @@ class ReadinessTests(unittest.TestCase):
             "no_proxy": "",
         }
 
-        with patch.dict(os.environ, proxy_env, clear=True), patch("urllib.request._opener", None):
+        with (
+            patch.dict(os.environ, proxy_env, clear=True),
+            patch.object(
+                readiness_module,
+                "build_opener",
+                wraps=readiness_module.build_opener,
+            ) as build_opener,
+        ):
             result = probe_once(f"http://127.0.0.1:{target.server_port}/health")
 
         self.assertFalse(result.ready)
@@ -186,6 +252,7 @@ class ReadinessTests(unittest.TestCase):
         self.assertNotIn(secret, repr(result))
         self.assertEqual(1, TargetHandler.requests)
         self.assertEqual(0, ProxyHandler.requests)
+        build_opener.assert_called_once()
 
     def test_probe_once_rejects_oversized_responses_with_bounded_failures(self) -> None:
         max_response_bytes = 64 * 1024
@@ -215,6 +282,91 @@ class ReadinessTests(unittest.TestCase):
                 self.assertFalse(result.ready)
                 self.assertEqual("readiness response exceeds size limit", result.message)
                 self.assertIsNone(result.payload)
+
+    def test_probe_once_rejects_trailing_data_after_false_low_content_length(self) -> None:
+        health_payload = json.dumps(_HealthHandler.payload).encode("utf-8")
+        oversized_body = health_payload + b" " * MAX_READINESS_RESPONSE_BYTES
+
+        class FalseLowContentLengthHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("content-length", str(len(health_payload)))
+                self.end_headers()
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    self.wfile.write(oversized_body)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        server, _thread = self._run_server(FalseLowContentLengthHandler)
+
+        result = probe_once(f"http://127.0.0.1:{server.server_port}/health")
+
+        self.assertFalse(result.ready)
+        self.assertEqual("readiness response exceeds size limit", result.message)
+        self.assertIsNone(result.payload)
+
+    def test_probe_once_requests_exactly_one_max_plus_one_bounded_read(self) -> None:
+        class TrackingResponse:
+            def __init__(self) -> None:
+                self.headers = Message()
+                self.length: int | None = None
+                self.read_amounts: list[int] = []
+
+            def __enter__(self) -> TrackingResponse:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self, amount: int) -> bytes:
+                self.read_amounts.append(amount)
+                return b"x" * amount
+
+        class TrackingOpener:
+            def __init__(self, response: TrackingResponse) -> None:
+                self.response = response
+                self.requests: list[object] = []
+
+            def open(self, *args: object, **kwargs: object) -> TrackingResponse:
+                self.requests.append(args[0])
+                return self.response
+
+        response = TrackingResponse()
+        opener = TrackingOpener(response)
+
+        with patch.object(readiness_module, "_build_readiness_opener", return_value=opener):
+            result = probe_once("http://127.0.0.1:4312/health")
+
+        self.assertEqual([MAX_READINESS_RESPONSE_BYTES + 1], response.read_amounts)
+        request = opener.requests[0]
+        get_header = getattr(request, "get_header", lambda _name: None)
+        self.assertEqual("close", get_header("Connection"))
+        self.assertFalse(result.ready)
+        self.assertEqual("readiness response exceeds size limit", result.message)
+        self.assertIsNone(result.payload)
+
+    def test_probe_once_maps_malformed_http_to_safe_failure(self) -> None:
+        secret = "API_KEY=sentinel-secret"
+
+        class MalformedProtocolHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.recv(4096)
+                self.request.sendall(f"NOT-HTTP {secret}\r\n\r\n".encode("ascii"))
+
+        server, _thread = self._run_raw_server(MalformedProtocolHandler)
+
+        try:
+            result = probe_once(f"http://127.0.0.1:{server.server_address[1]}/health")
+        except HTTPException:
+            result = None
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertFalse(result.ready)
+        self.assertEqual("readiness endpoint returned a malformed HTTP response", result.message)
+        self.assertIsNone(result.payload)
+        self.assertNotIn(secret, repr(result))
 
     def test_probe_once_rejects_url_data_before_network_io(self) -> None:
         class TrackingHandler(_HealthHandler):

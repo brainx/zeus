@@ -4,11 +4,14 @@ import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import (
     HTTPRedirectHandler,
+    OpenerDirector,
     ProxyHandler,
+    Request,
     build_opener,
 )
 
@@ -20,7 +23,8 @@ class _RejectRedirects(HTTPRedirectHandler):
         return None
 
 
-_READINESS_OPENER = build_opener(ProxyHandler({}), _RejectRedirects())
+def _build_readiness_opener() -> OpenerDirector:
+    return build_opener(ProxyHandler({}), _RejectRedirects())
 
 
 @dataclass(frozen=True)
@@ -84,7 +88,8 @@ def probe_once(
     ):
         return ReadinessResult(False, "readiness URL must be loopback HTTP")
     try:
-        with _READINESS_OPENER.open(url, timeout=timeout_seconds) as response:  # nosec B310
+        request = Request(url, headers={"Connection": "close"})  # nosec B310
+        with _build_readiness_opener().open(request, timeout=timeout_seconds) as response:
             content_lengths = response.headers.get_all("content-length", [])
             try:
                 declared_lengths = {int(value) for value in content_lengths}
@@ -94,6 +99,12 @@ def probe_once(
                 return ReadinessResult(False, "readiness response has invalid content length")
             if any(length > MAX_READINESS_RESPONSE_BYTES for length in declared_lengths):
                 return ReadinessResult(False, "readiness response exceeds size limit")
+            # HTTPResponse.read(amt) clamps amt to its internal Content-Length. The
+            # connection-close request lets an honest fixed-length response reach EOF,
+            # while clearing this CPython parser field exposes any understated trailing
+            # data to the same bounded MAX + 1 read. Chunk framing remains handled by
+            # HTTPResponse because chunked responses already have length=None.
+            response.length = None
             body = response.read(MAX_READINESS_RESPONSE_BYTES + 1)
         if len(body) > MAX_READINESS_RESPONSE_BYTES:
             return ReadinessResult(False, "readiness response exceeds size limit")
@@ -111,6 +122,8 @@ def probe_once(
         return ReadinessResult(False, "readiness endpoint returned an HTTP error")
     except (URLError, OSError):
         return ReadinessResult(False, "readiness probe failed")
+    except HTTPException:
+        return ReadinessResult(False, "readiness endpoint returned a malformed HTTP response")
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return ReadinessResult(False, "readiness response is not valid JSON")
 
