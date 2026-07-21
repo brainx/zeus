@@ -141,10 +141,10 @@ def prepare(root: str, relative_directory: str, names: list[str]) -> None:
         create=True,
     )
     directory_fd = descriptors[-1]
-    if not hasattr(os, "O_NOFOLLOW"):
-        fail("O_NOFOLLOW is required for private evidence")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+        fail("O_NOFOLLOW and O_NONBLOCK are required for private evidence")
     file_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    file_flags |= os.O_NOFOLLOW
+    file_flags |= os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         for name in names:
             if "/" in name or name in {"", ".", ".."}:

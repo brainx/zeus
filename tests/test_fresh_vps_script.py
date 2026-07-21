@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -171,19 +172,37 @@ class FreshVPSVerifierTests(unittest.TestCase):
         apt_get.chmod(0o700)
         return f"{bootstrap_bin}:/bin"
 
-    def _run(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        *,
+        timeout: float = 20,
+        **overrides: str,
+    ) -> subprocess.CompletedProcess[str]:
         environment = self._base_environment()
         environment.update(overrides)
-        return subprocess.run(
-            ["/bin/bash", "scripts/fresh_vps_verify.sh"],
+        arguments = ["/bin/bash", "scripts/fresh_vps_verify.sh"]
+        process = subprocess.Popen(
+            arguments,
             cwd=self.checkout,
             env=environment,
-            input="",
             text=True,
-            capture_output=True,
-            check=False,
-            timeout=20,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
+        try:
+            stdout, stderr = process.communicate("", timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                error.cmd,
+                error.timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from None
+        return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
     def _curl_records(self) -> list[dict[str, object]]:
         if not self.curl_capture.exists():
@@ -369,6 +388,25 @@ class FreshVPSVerifierTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertEqual("preserve me\n", external.read_text(encoding="utf-8"))
         self.assertEqual(0o644, stat.S_IMODE(external.stat().st_mode))
+        self.assertFalse(self.installer_executed.exists())
+
+    def test_fifo_evidence_file_is_rejected_without_blocking(self) -> None:
+        evidence = self.checkout / "evidence"
+        evidence.mkdir(mode=0o700)
+        fifo = evidence / "run.log"
+        os.mkfifo(fifo, mode=0o600)
+
+        try:
+            result = self._run(
+                timeout=1.0,
+                ZEUS_VPS_HERMES_INSTALLER_SHA256=self.installer_digest,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("verifier blocked while opening a pre-existing evidence FIFO")
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertTrue(stat.S_ISFIFO(fifo.lstat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(fifo.lstat().st_mode))
         self.assertFalse(self.installer_executed.exists())
 
 
