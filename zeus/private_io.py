@@ -6,6 +6,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import BinaryIO, cast
 
@@ -14,6 +15,7 @@ _FILE_MODE = 0o600
 _SECURITY_FLAGS = ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK")
 _REQUIRED_FUNCTIONS = (
     "close",
+    "dup",
     "fchmod",
     "fdopen",
     "fstat",
@@ -38,6 +40,12 @@ class _PrivatePathMissing(Exception):
     pass
 
 
+class _DirectoryRequirement(Enum):
+    identity = "identity"
+    exact_private = "exact_private"
+    inspect_private = "inspect_private"
+
+
 @dataclass(frozen=True)
 class _Platform:
     euid: int
@@ -51,13 +59,20 @@ class _Platform:
 class _OpenedDirectoryPath:
     descriptors: tuple[int, ...]
     names: tuple[str, ...]
+    requirements: tuple[_DirectoryRequirement, ...]
+    euid: int
 
     @property
     def fd(self) -> int:
         return self.descriptors[-1]
 
     def validate_bindings(self) -> None:
-        _validate_directory_bindings(self.descriptors, self.names)
+        _validate_directory_bindings(
+            self.descriptors,
+            self.names,
+            self.requirements,
+            self.euid,
+        )
 
     def confirm_missing(self, name: str) -> None:
         self.validate_bindings()
@@ -71,6 +86,68 @@ class _OpenedDirectoryPath:
         except (TypeError, ValueError) as exc:
             raise UnsafeFileError("missing private path cannot be inspected safely") from exc
         raise UnsafeFileError("private path appeared while absence was confirmed")
+
+
+@dataclass(frozen=True)
+class _OpenedPrivateFile:
+    fd: int
+    parent_fd: int
+    name: str
+    identity: os.stat_result
+    platform: _Platform
+
+    def validate_binding(self) -> None:
+        try:
+            opened = os.fstat(self.fd)
+            current = os.lstat(self.name, dir_fd=self.parent_fd)
+            snapshots = (self.identity, opened, current)
+            for snapshot in snapshots:
+                _validate_file_snapshot(snapshot, self.platform)
+            if not _same_files(snapshots):
+                raise UnsafeFileError("private file changed while it was used")
+            if any(stat.S_IMODE(snapshot.st_mode) != _FILE_MODE for snapshot in (opened, current)):
+                raise UnsafeFileError("private file does not have private permissions")
+        except UnsafeFileError:
+            raise
+        except OSError as exc:
+            raise UnsafeFileError("private file binding changed while it was used") from exc
+        except (TypeError, ValueError) as exc:
+            raise UnsafeFileError("private file binding cannot be inspected safely") from exc
+
+
+@dataclass(frozen=True)
+class _PinnedPrivateDirectory:
+    fd: int
+    identity: os.stat_result
+    platform: _Platform
+
+    def validate_at(self, path: Path) -> None:
+        parts = _validate_path(path, file_path=False)
+        with _open_directory_path(
+            parts,
+            create=False,
+            tighten=False,
+            platform=self.platform,
+        ) as current:
+            try:
+                pinned = os.fstat(self.fd)
+                installed = os.fstat(current.fd)
+                snapshots = (self.identity, pinned, installed)
+                _validate_directory_snapshots(snapshots, "pinned private directory")
+                _validate_directory_requirement(
+                    snapshots,
+                    _DirectoryRequirement.exact_private,
+                    self.platform.euid,
+                    "pinned private directory",
+                )
+            except UnsafeFileError:
+                raise
+            except OSError as exc:
+                raise UnsafeFileError("pinned private directory is unavailable") from exc
+            except (TypeError, ValueError) as exc:
+                raise UnsafeFileError(
+                    "pinned private directory cannot be inspected safely"
+                ) from exc
 
 
 def _required_flag(name: str, *, allow_zero: bool = False) -> int:
@@ -187,20 +264,31 @@ def _validate_directory_snapshots(
 def _validate_directory_bindings(
     descriptors: tuple[int, ...],
     names: tuple[str, ...],
+    requirements: tuple[_DirectoryRequirement, ...],
+    euid: int,
 ) -> None:
-    if len(descriptors) != len(names) + 1:
+    if len(descriptors) != len(names) + 1 or len(requirements) != len(descriptors):
         raise UnsafeFileError("private directory descriptor chain is invalid")
     try:
         root_snapshots = (os.fstat(descriptors[0]), os.lstat("/"))
         _validate_directory_snapshots(root_snapshots, "filesystem root")
-        for parent_fd, name, directory_fd in zip(
+        _validate_directory_requirement(
+            root_snapshots,
+            requirements[0],
+            euid,
+            "filesystem root",
+        )
+        for parent_fd, name, directory_fd, requirement in zip(
             descriptors[:-1],
             names,
             descriptors[1:],
+            requirements[1:],
             strict=True,
         ):
+            description = f"private path component {name!r}"
             snapshots = (os.fstat(directory_fd), os.lstat(name, dir_fd=parent_fd))
-            _validate_directory_snapshots(snapshots, f"private path component {name!r}")
+            _validate_directory_snapshots(snapshots, description)
+            _validate_directory_requirement(snapshots, requirement, euid, description)
     except UnsafeFileError:
         raise
     except OSError as exc:
@@ -209,14 +297,22 @@ def _validate_directory_bindings(
         raise UnsafeFileError("private directory path cannot be inspected safely") from exc
 
 
-def _inspect_private_directory_snapshots(
+def _validate_directory_requirement(
     snapshots: tuple[os.stat_result, ...],
-    platform: _Platform,
+    requirement: _DirectoryRequirement,
+    euid: int,
     description: str,
 ) -> None:
-    if not all(snapshot.st_uid == platform.euid for snapshot in snapshots):
+    if requirement is _DirectoryRequirement.identity:
+        return
+    if not all(snapshot.st_uid == euid for snapshot in snapshots):
         raise UnsafeFileError(f"{description} has an unexpected owner")
-    if any(stat.S_IMODE(snapshot.st_mode) & 0o077 for snapshot in snapshots):
+    modes = tuple(stat.S_IMODE(snapshot.st_mode) for snapshot in snapshots)
+    if requirement is _DirectoryRequirement.exact_private:
+        unsafe = any(mode != _DIRECTORY_MODE for mode in modes)
+    else:
+        unsafe = any(mode & 0o077 for mode in modes)
+    if unsafe:
         raise UnsafeFileError(f"{description} does not have private permissions")
 
 
@@ -279,7 +375,7 @@ def _open_directory_at(
     private: bool,
     tighten: bool,
     platform: _Platform,
-) -> int:
+) -> tuple[int, _DirectoryRequirement]:
     description = f"private path component {name!r}"
     created = False
     try:
@@ -326,9 +422,18 @@ def _open_directory_at(
                 platform,
                 description,
             )
+            requirement = _DirectoryRequirement.exact_private
         elif private:
-            _inspect_private_directory_snapshots(snapshots, platform, description)
-        return directory_fd
+            requirement = _DirectoryRequirement.inspect_private
+            _validate_directory_requirement(
+                snapshots,
+                requirement,
+                platform.euid,
+                description,
+            )
+        else:
+            requirement = _DirectoryRequirement.identity
+        return directory_fd, requirement
     except UnsafeFileError:
         _close_suppressing_error(directory_fd)
         raise
@@ -351,10 +456,11 @@ def _open_directory_path(
 ) -> Iterator[_OpenedDirectoryPath]:
     descriptors = [_open_root(platform)]
     names: list[str] = []
+    requirements = [_DirectoryRequirement.identity]
     try:
         for index, component in enumerate(parts):
             try:
-                next_fd = _open_directory_at(
+                next_fd, requirement = _open_directory_at(
                     descriptors[-1],
                     component,
                     create=create,
@@ -364,16 +470,27 @@ def _open_directory_path(
                     platform=platform,
                 )
             except _PrivatePathMissing:
-                _OpenedDirectoryPath(tuple(descriptors), tuple(names)).confirm_missing(component)
+                _OpenedDirectoryPath(
+                    tuple(descriptors),
+                    tuple(names),
+                    tuple(requirements),
+                    platform.euid,
+                ).confirm_missing(component)
                 raise
             descriptors.append(next_fd)
             names.append(component)
+            requirements.append(requirement)
     except BaseException:
         for descriptor in reversed(descriptors):
             _close_suppressing_error(descriptor)
         raise
 
-    opened = _OpenedDirectoryPath(tuple(descriptors), tuple(names))
+    opened = _OpenedDirectoryPath(
+        tuple(descriptors),
+        tuple(names),
+        tuple(requirements),
+        platform.euid,
+    )
     try:
         yield opened
     except BaseException:
@@ -414,7 +531,7 @@ def _open_private_file_at(
     append: bool,
     create: bool,
     platform: _Platform,
-) -> int | None:
+) -> _OpenedPrivateFile | None:
     before: os.stat_result | None
     try:
         before = os.lstat(name, dir_fd=parent_fd)
@@ -457,7 +574,13 @@ def _open_private_file_at(
             raise UnsafeFileError("private file changed while it was opened")
         if any(stat.S_IMODE(snapshot.st_mode) != _FILE_MODE for snapshot in (tightened, final)):
             raise UnsafeFileError("private file does not have private permissions")
-        return file_fd
+        return _OpenedPrivateFile(
+            fd=file_fd,
+            parent_fd=parent_fd,
+            name=name,
+            identity=tightened,
+            platform=platform,
+        )
     except UnsafeFileError:
         _close_suppressing_error(file_fd)
         raise
@@ -476,15 +599,16 @@ def _private_append_context(
     platform: _Platform,
 ) -> Iterator[BinaryIO]:
     with _open_directory_path(parent_parts, create=True, platform=platform) as parent:
-        file_fd = _open_private_file_at(
+        opened_file = _open_private_file_at(
             parent.fd,
             name,
             append=True,
             create=True,
             platform=platform,
         )
-        if file_fd is None:
+        if opened_file is None:
             raise UnsafeFileError("private file was not created")
+        file_fd = opened_file.fd
         try:
             try:
                 handle = cast(BinaryIO, os.fdopen(file_fd, "ab", buffering=0))
@@ -502,6 +626,12 @@ def _private_append_context(
                     handle.close()
                 raise
             else:
+                try:
+                    opened_file.validate_binding()
+                except BaseException:
+                    with suppress(OSError):
+                        handle.close()
+                    raise
                 try:
                     handle.close()
                 except OSError as exc:
@@ -543,16 +673,17 @@ def read_private_tail(path: Path, max_bytes: int) -> bytes:
         with _open_directory_path(
             parts[:-1], create=False, missing_ok=True, platform=platform
         ) as parent:
-            file_fd = _open_private_file_at(
+            opened_file = _open_private_file_at(
                 parent.fd,
                 parts[-1],
                 append=False,
                 create=False,
                 platform=platform,
             )
-            if file_fd is None:
+            if opened_file is None:
                 parent.confirm_missing(parts[-1])
                 return b""
+            file_fd = opened_file.fd
             try:
                 try:
                     end = os.lseek(file_fd, 0, os.SEEK_END)
@@ -569,6 +700,7 @@ def read_private_tail(path: Path, max_bytes: int) -> bytes:
                     result = b"".join(chunks)
                 except OSError as exc:
                     raise UnsafeFileError("private file tail could not be read") from exc
+                opened_file.validate_binding()
             except BaseException:
                 _close_suppressing_error(file_fd)
                 raise
@@ -584,6 +716,40 @@ def validate_private_directory(path: Path) -> None:
     platform = _require_platform()
     with _open_directory_path(parts, create=False, platform=platform):
         pass
+
+
+@contextmanager
+def pin_private_directory(path: Path) -> Iterator[_PinnedPrivateDirectory]:
+    parts = _validate_path(path, file_path=False)
+    platform = _require_platform()
+    pinned_fd = -1
+    with _open_directory_path(parts, create=False, platform=platform) as opened:
+        try:
+            pinned_fd = os.dup(opened.fd)
+            identity = os.fstat(pinned_fd)
+            _validate_directory_snapshots((identity,), "pinned private directory")
+            _validate_directory_requirement(
+                (identity,),
+                _DirectoryRequirement.exact_private,
+                platform.euid,
+                "pinned private directory",
+            )
+        except UnsafeFileError:
+            if pinned_fd >= 0:
+                _close_suppressing_error(pinned_fd)
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            if pinned_fd >= 0:
+                _close_suppressing_error(pinned_fd)
+            raise UnsafeFileError("private directory could not be pinned safely") from exc
+    pinned = _PinnedPrivateDirectory(pinned_fd, identity, platform)
+    try:
+        yield pinned
+    except BaseException:
+        _close_suppressing_error(pinned_fd)
+        raise
+    else:
+        _close_descriptor(pinned_fd, "pinned private directory")
 
 
 def ensure_private_directory(path: Path) -> None:

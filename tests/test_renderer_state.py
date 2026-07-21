@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -789,6 +790,98 @@ class RendererStateTests(unittest.TestCase):
             self.assertEqual("external target\n", sentinel.read_text(encoding="utf-8"))
             self.assertEqual(external_mode, external_logs.stat().st_mode & 0o777)
             self.assertEqual("live log\n", live_log.read_text(encoding="utf-8"))
+
+    def test_renderer_rejects_logs_mode_drift_during_final_binding_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            hermes_root = root / ".zeus" / "hermes"
+            renderer = ProfileRenderer(hermes_root)
+            template = TemplateStore().get("coding-bot")
+            request = BotCreateRequest(bot_id="coder", template_id="coding-bot")
+            renderer.render(request, template)
+            profile = hermes_root / "profiles" / "coder"
+            live_soul = (profile / "SOUL.md").read_text(encoding="utf-8")
+            real_lstat = os.lstat
+            logs_lstats = 0
+            drifted_mode: int | None = None
+
+            def racing_lstat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> os.stat_result:
+                nonlocal drifted_mode, logs_lstats
+                if path == "logs" and dir_fd is not None:
+                    candidates = list(profile.parent.glob(".coder.staging-*/logs"))
+                    if len(candidates) == 1:
+                        staging_logs = candidates[0]
+                        parent = staging_logs.parent.stat()
+                        opened_parent = os.fstat(dir_fd)
+                        if (
+                            parent.st_dev == opened_parent.st_dev
+                            and parent.st_ino == opened_parent.st_ino
+                        ):
+                            logs_lstats += 1
+                            if logs_lstats == 4:
+                                staging_logs.chmod(0o777)
+                                drifted_mode = staging_logs.stat().st_mode & 0o777
+                return real_lstat(path, dir_fd=dir_fd)
+
+            with (
+                patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+                self.assertRaises(TemplateError),
+            ):
+                renderer.render(request, replace(template, soul="must not be committed"))
+
+            self.assertEqual(4, logs_lstats)
+            self.assertEqual(0o777, drifted_mode)
+            self.assertEqual(live_soul, (profile / "SOUL.md").read_text(encoding="utf-8"))
+            self.assertEqual(0o700, (profile / "logs").stat().st_mode & 0o777)
+            self.assertEqual(["coder"], sorted(path.name for path in profile.parent.iterdir()))
+
+    def test_renderer_rejects_logs_replacement_immediately_before_install(self) -> None:
+        from zeus.renderer import _install_staged_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            hermes_root = root / ".zeus" / "hermes"
+            renderer = ProfileRenderer(hermes_root)
+            template = TemplateStore().get("coding-bot")
+            request = BotCreateRequest(bot_id="coder", template_id="coding-bot")
+            renderer.render(request, template)
+            profile = hermes_root / "profiles" / "coder"
+            live_soul = (profile / "SOUL.md").read_text(encoding="utf-8")
+            live_log = profile / "logs" / "gateway.log"
+            live_log.write_text("live log\n", encoding="utf-8")
+            external_logs = root / "external-race-target"
+            external_logs.mkdir(mode=0o755)
+            external_logs.chmod(0o755)
+            sentinel = external_logs / "sentinel.txt"
+            sentinel.write_text("external target\n", encoding="utf-8")
+            external_mode = stat.S_IMODE(external_logs.stat().st_mode)
+            swapped = False
+
+            def racing_install(staging: Path, destination: Path) -> Path | None:
+                nonlocal swapped
+                staging_logs = staging / "logs"
+                staging_logs.rename(staging / "logs-displaced")
+                staging_logs.symlink_to(external_logs, target_is_directory=True)
+                swapped = True
+                return _install_staged_profile(staging, destination)
+
+            with (
+                patch("zeus.renderer._install_staged_profile", side_effect=racing_install),
+                self.assertRaises(TemplateError),
+            ):
+                renderer.render(request, replace(template, soul="must not be committed"))
+
+            self.assertTrue(swapped)
+            self.assertEqual(live_soul, (profile / "SOUL.md").read_text(encoding="utf-8"))
+            self.assertFalse((profile / "logs").is_symlink())
+            self.assertEqual("live log\n", live_log.read_text(encoding="utf-8"))
+            self.assertEqual("external target\n", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual(external_mode, stat.S_IMODE(external_logs.stat().st_mode))
+            self.assertEqual(["coder"], sorted(path.name for path in profile.parent.iterdir()))
 
     def test_renderer_replacement_preserves_complete_existing_profile_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

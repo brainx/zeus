@@ -14,7 +14,12 @@ from typing import Any
 
 from zeus.envfile import dump_env
 from zeus.models import BotCreateRequest, BotRecord, HermesTemplate, TemplateError
-from zeus.private_io import nofollow_absolute_path, validate_private_directory
+from zeus.private_io import (
+    UnsafeFileError,
+    nofollow_absolute_path,
+    pin_private_directory,
+    validate_private_directory,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -97,7 +102,19 @@ class ProfileRenderer:
         staging = Path(tempfile.mkdtemp(prefix=f".{request.bot_id}.staging-", dir=profiles_root))
         try:
             _write_staged_profile(staging, profile, rendered_files)
-            backup = _install_staged_profile(staging, profile)
+            backup: Path | None = None
+            installed = False
+            try:
+                with pin_private_directory(nofollow_absolute_path(staging / "logs")) as pinned:
+                    backup = _install_staged_profile(staging, profile)
+                    installed = True
+                    pinned.validate_at(nofollow_absolute_path(profile / "logs"))
+            except UnsafeFileError as exc:
+                if installed:
+                    _rollback_installed_profile(profile, backup)
+                raise TemplateError(
+                    "installed profile logs directory could not be verified safely"
+                ) from exc
         finally:
             try:
                 _remove_path(staging)

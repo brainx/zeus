@@ -3298,6 +3298,351 @@ raise SystemExit(0)
             self.assertEqual("external API marker target\n", sentinel.read_text(encoding="utf-8"))
             self.assertTrue(stat.S_ISFIFO(fifo.stat().st_mode))
 
+    def test_pid_marker_read_rejects_profile_ancestry_replacement_during_read(self) -> None:
+        from zeus.supervisor import _read_bounded_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / "zeus-gateway.pid.json"
+            marker.write_text('{"pid":4321}', encoding="utf-8")
+            displaced = root / "displaced-profile"
+            external = root / "external-profile"
+            external_logs = external / "logs"
+            external_logs.mkdir(parents=True)
+            (external_logs / marker.name).write_text('{"pid":9876}', encoding="utf-8")
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            real_open = os.open
+            opened: set[int] = set()
+            swapped = False
+
+            def tracking_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                opened.add(descriptor)
+                return descriptor
+
+            def racing_read(fd: int, limit: int = 64 * 1024) -> bytes:
+                nonlocal swapped
+                result = _read_bounded_file(fd, limit)
+                profile.rename(displaced)
+                profile.symlink_to(external, target_is_directory=True)
+                swapped = True
+                return result
+
+            with (
+                patch("zeus.gateway_launcher.os.open", side_effect=tracking_open),
+                patch("zeus.supervisor._read_bounded_file", side_effect=racing_read),
+                self.assertRaises(UnsafeFileError),
+            ):
+                supervisor._read_pid_marker(str(profile))
+
+            self.assertTrue(swapped)
+            self.assertTrue(profile.is_symlink())
+            for descriptor in opened:
+                with self.subTest(descriptor=descriptor), self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_strict_marker_read_rejects_profile_ancestry_replacement_during_read(self) -> None:
+        from zeus.supervisor import _read_bounded_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / "zeus-gateway.pid.json"
+            marker.write_text('{"pid":4321}', encoding="utf-8")
+            displaced = root / "displaced-profile"
+            external = root / "external-profile"
+            external_logs = external / "logs"
+            external_logs.mkdir(parents=True)
+            (external_logs / marker.name).write_text('{"pid":9876}', encoding="utf-8")
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            real_open = os.open
+            opened: set[int] = set()
+            swapped = False
+
+            def tracking_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                opened.add(descriptor)
+                return descriptor
+
+            def racing_read(fd: int, limit: int = 64 * 1024) -> bytes:
+                nonlocal swapped
+                result = _read_bounded_file(fd, limit)
+                profile.rename(displaced)
+                profile.symlink_to(external, target_is_directory=True)
+                swapped = True
+                return result
+
+            with (
+                patch("zeus.gateway_launcher.os.open", side_effect=tracking_open),
+                patch("zeus.supervisor._read_bounded_file", side_effect=racing_read),
+            ):
+                observation = supervisor._read_strict_runtime_marker("coder", str(profile))
+
+            self.assertTrue(swapped)
+            self.assertEqual("untrusted", observation.kind)
+            self.assertTrue(profile.is_symlink())
+            for descriptor in opened:
+                with self.subTest(descriptor=descriptor), self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_pid_marker_read_revalidates_ancestry_after_read_failure(self) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / "zeus-gateway.pid.json"
+            marker.write_text('{"pid":4321}', encoding="utf-8")
+            displaced = root / "displaced-profile"
+            external = root / "external-profile"
+            (external / "logs").mkdir(parents=True)
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            swapped = False
+
+            def failing_read(_fd: int, _limit: int = 64 * 1024) -> bytes:
+                nonlocal swapped
+                profile.rename(displaced)
+                profile.symlink_to(external, target_is_directory=True)
+                swapped = True
+                raise LaunchPayloadError("injected bounded read failure")
+
+            with (
+                patch("zeus.supervisor._read_bounded_file", side_effect=failing_read),
+                self.assertRaises(UnsafeFileError),
+            ):
+                supervisor._read_pid_marker(str(profile))
+
+            self.assertTrue(swapped)
+            self.assertTrue(profile.is_symlink())
+
+    def test_strict_marker_read_closes_all_descriptors_when_one_close_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / "zeus-gateway.pid.json"
+            marker.write_text('{"pid":4321}', encoding="utf-8")
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            real_open = os.open
+            real_close = os.close
+            opened: set[int] = set()
+            close_failed = False
+
+            def tracking_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                opened.add(descriptor)
+                return descriptor
+
+            def noisy_close(fd: int) -> None:
+                nonlocal close_failed
+                real_close(fd)
+                if not close_failed:
+                    close_failed = True
+                    raise OSError("injected close failure")
+
+            with (
+                patch("zeus.gateway_launcher.os.open", side_effect=tracking_open),
+                patch("zeus.supervisor.os.close", side_effect=noisy_close),
+            ):
+                observation = supervisor._read_strict_runtime_marker("coder", str(profile))
+
+            self.assertTrue(close_failed)
+            self.assertEqual("present", observation.kind)
+            for descriptor in opened:
+                with self.subTest(descriptor=descriptor), self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def test_strict_marker_read_rejects_current_owner_mismatch(self) -> None:
+        from zeus.gateway_launcher import MARKER_NAME
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / MARKER_NAME
+            marker.write_text('{"pid":4321}', encoding="utf-8")
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            real_stat = os.stat
+            marker_stats = 0
+
+            def mismatched_owner_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal marker_stats
+                result = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                if path == MARKER_NAME and dir_fd is not None:
+                    marker_stats += 1
+                    if marker_stats == 2:
+                        fields = list(result)
+                        fields[4] = result.st_uid + 1
+                        return os.stat_result(fields)
+                return result
+
+            with patch("zeus.gateway_launcher.os.stat", side_effect=mismatched_owner_stat):
+                observation = supervisor._read_strict_runtime_marker("coder", str(profile))
+
+            self.assertGreaterEqual(marker_stats, 2)
+            self.assertEqual("untrusted", observation.kind)
+
+    def test_strict_marker_read_rechecks_leaf_after_final_directory_validation(self) -> None:
+        from zeus.gateway_launcher import _validate_open_directory_binding
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / "zeus-gateway.pid.json"
+            marker.write_text('{"pid":4321}', encoding="utf-8")
+            displaced = logs / "displaced-marker.json"
+            target = root / "external-marker.json"
+            target.write_text('{"pid":9876}', encoding="utf-8")
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            logs_validations = 0
+            swapped = False
+
+            def racing_directory_validation(
+                parent_fd: int,
+                name: str,
+                directory_fd: int,
+                description: str,
+            ) -> os.stat_result:
+                nonlocal logs_validations, swapped
+                result = _validate_open_directory_binding(
+                    parent_fd,
+                    name,
+                    directory_fd,
+                    description,
+                )
+                if name == "logs":
+                    logs_validations += 1
+                    if logs_validations == 2:
+                        marker.rename(displaced)
+                        marker.symlink_to(target)
+                        swapped = True
+                return result
+
+            with patch(
+                "zeus.gateway_launcher._validate_open_directory_binding",
+                side_effect=racing_directory_validation,
+            ):
+                observation = supervisor._read_strict_runtime_marker("coder", str(profile))
+
+            self.assertTrue(swapped)
+            self.assertEqual(2, logs_validations)
+            self.assertEqual("untrusted", observation.kind)
+            self.assertTrue(marker.is_symlink())
+
+    def test_pid_marker_read_rejects_symlink_appearing_during_missing_lookup(self) -> None:
+        from zeus.gateway_launcher import MARKER_NAME
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / MARKER_NAME
+            target = root / "external-marker.json"
+            target.write_text('{"pid":9876}', encoding="utf-8")
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            real_stat = os.stat
+            appeared = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal appeared
+                if path == MARKER_NAME and dir_fd is not None and not appeared:
+                    try:
+                        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                    except FileNotFoundError:
+                        marker.symlink_to(target)
+                        appeared = True
+                        raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with (
+                patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat),
+                self.assertRaises(UnsafeFileError),
+            ):
+                supervisor._read_pid_marker(str(profile))
+
+            self.assertTrue(appeared)
+            self.assertTrue(marker.is_symlink())
+            self.assertEqual('{"pid":9876}', target.read_text(encoding="utf-8"))
+
+    def test_strict_marker_read_rejects_symlink_appearing_during_missing_lookup(self) -> None:
+        from zeus.gateway_launcher import MARKER_NAME
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / ".zeus" / "hermes" / "profiles" / "coder"
+            logs = profile / "logs"
+            logs.mkdir(parents=True, mode=0o700)
+            marker = logs / MARKER_NAME
+            target = root / "external-marker.json"
+            target.write_text('{"pid":9876}', encoding="utf-8")
+            _store, supervisor = self._supervisor_for_profile_path(root, profile)
+            real_stat = os.stat
+            appeared = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal appeared
+                if path == MARKER_NAME and dir_fd is not None and not appeared:
+                    try:
+                        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                    except FileNotFoundError:
+                        marker.symlink_to(target)
+                        appeared = True
+                        raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat):
+                observation = supervisor._read_strict_runtime_marker("coder", str(profile))
+
+            self.assertTrue(appeared)
+            self.assertEqual("untrusted", observation.kind)
+            self.assertTrue(marker.is_symlink())
+            self.assertEqual('{"pid":9876}', target.read_text(encoding="utf-8"))
+
     def test_supervisor_inspect_reports_metadata_without_env_contents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3795,6 +4140,35 @@ raise SystemExit(0)
                 (logs_dir / sentinel.name).read_text(encoding="utf-8"),
             )
             self.assertEqual(0o777, logs_dir.stat().st_mode & 0o777)
+
+    def test_doctor_rejects_same_inode_mode_drift_at_final_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            state_dir.chmod(0o700)
+            settings = Settings.from_env({"ZEUS_STATE_DIR": str(state_dir)})
+            real_lstat = os.lstat
+            state_lstats = 0
+
+            def racing_lstat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> os.stat_result:
+                nonlocal state_lstats
+                if path == state_dir.name and dir_fd is not None:
+                    state_lstats += 1
+                    if state_lstats == 3:
+                        state_dir.chmod(0o777)
+                return real_lstat(path, dir_fd=dir_fd)
+
+            with patch("zeus.doctor.os.lstat", side_effect=racing_lstat):
+                check = _check_runtime_paths(settings)
+
+            self.assertEqual("fail", check.status)
+            self.assertEqual(3, state_lstats)
+            self.assertEqual(0o777, state_dir.stat().st_mode & 0o777)
 
     def test_settings_ensure_dirs_creates_missing_private_runtime_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

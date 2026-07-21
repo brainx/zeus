@@ -15,6 +15,7 @@ from zeus import private_io
 from zeus.private_io import (
     UnsafeFileError,
     append_private_bytes,
+    ensure_private_directory,
     open_private_append,
     read_private_tail,
     validate_private_directory,
@@ -280,6 +281,54 @@ class PrivateIOTests(unittest.TestCase):
         self.assertEqual(3, directory_lstats)
         self.assertEqual(0o777, stat.S_IMODE(private_dir.stat().st_mode))
 
+    def test_validate_directory_rejects_mode_drift_during_final_binding_check(self) -> None:
+        private_dir = self.root / "final-mode-drift-dir"
+        private_dir.mkdir(mode=0o700)
+        private_dir.chmod(0o700)
+        real_lstat = os.lstat
+        directory_lstats = 0
+
+        def racing_lstat(name: str | bytes, *, dir_fd: int | None = None) -> os.stat_result:
+            nonlocal directory_lstats
+            if name == private_dir.name and dir_fd is not None:
+                directory_lstats += 1
+                if directory_lstats == 4:
+                    private_dir.chmod(0o777)
+            return real_lstat(name, dir_fd=dir_fd)
+
+        with (
+            patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+            self.assertRaises(UnsafeFileError),
+        ):
+            validate_private_directory(private_dir)
+
+        self.assertEqual(4, directory_lstats)
+        self.assertEqual(0o777, stat.S_IMODE(private_dir.stat().st_mode))
+
+    def test_ensure_directory_rechecks_created_intermediate_mode_at_final_binding(self) -> None:
+        created_parent = self.root / "created-parent"
+        private_dir = created_parent / "private"
+        real_lstat = os.lstat
+        parent_lstats = 0
+
+        def racing_lstat(name: str | bytes, *, dir_fd: int | None = None) -> os.stat_result:
+            nonlocal parent_lstats
+            if name == created_parent.name and dir_fd is not None:
+                parent_lstats += 1
+                if parent_lstats == 5:
+                    created_parent.chmod(0o777)
+            return real_lstat(name, dir_fd=dir_fd)
+
+        with (
+            patch.object(private_io.os, "lstat", side_effect=racing_lstat),
+            self.assertRaises(UnsafeFileError),
+        ):
+            ensure_private_directory(private_dir)
+
+        self.assertEqual(5, parent_lstats)
+        self.assertEqual(0o777, stat.S_IMODE(created_parent.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(private_dir.stat().st_mode))
+
     def test_existing_file_and_parent_modes_are_tightened_before_append(self) -> None:
         private_dir = self.root / "logs"
         private_dir.mkdir(mode=0o755)
@@ -533,6 +582,87 @@ raise SystemExit(1)
         self.assertEqual(2, leaf_lstats)
         self.assertEqual(b"original", displaced.read_bytes())
         self.assertEqual(b"replacement", path.read_bytes())
+
+    def test_tail_rejects_leaf_replacement_after_read(self) -> None:
+        private_dir = self.root / "logs"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "events.log"
+        path.write_bytes(b"original")
+        displaced = private_dir / "displaced.log"
+        target = self.root / "external-target.log"
+        target.write_bytes(b"external")
+        target.chmod(0o644)
+        target_mode = stat.S_IMODE(target.stat().st_mode)
+        real_read = os.read
+        swapped = False
+
+        def racing_read(fd: int, size: int) -> bytes:
+            nonlocal swapped
+            result = real_read(fd, size)
+            if result and not swapped and stat.S_ISREG(os.fstat(fd).st_mode):
+                path.rename(displaced)
+                path.symlink_to(target)
+                swapped = True
+            return result
+
+        with (
+            patch.object(private_io.os, "read", side_effect=racing_read),
+            self.assertRaises(UnsafeFileError),
+        ):
+            read_private_tail(path, 128)
+
+        self.assertTrue(swapped)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(b"original", displaced.read_bytes())
+        self.assertEqual(b"external", target.read_bytes())
+        self.assertEqual(target_mode, stat.S_IMODE(target.stat().st_mode))
+
+    def test_append_rejects_leaf_replacement_after_write(self) -> None:
+        private_dir = self.root / "logs"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "events.log"
+        path.write_bytes(b"original")
+        displaced = private_dir / "displaced.log"
+        target = self.root / "external-target.log"
+        target.write_bytes(b"external")
+        target.chmod(0o644)
+        target_mode = stat.S_IMODE(target.stat().st_mode)
+        real_fdopen = os.fdopen
+        swapped = False
+
+        class RacingHandle:
+            def __init__(self, handle: BinaryIO) -> None:
+                self.handle = handle
+
+            def write(self, data: bytes) -> int:
+                nonlocal swapped
+                written = self.handle.write(data)
+                if not swapped:
+                    path.rename(displaced)
+                    path.symlink_to(target)
+                    swapped = True
+                return written
+
+            def fileno(self) -> int:
+                return self.handle.fileno()
+
+            def close(self) -> None:
+                self.handle.close()
+
+        def racing_fdopen(fd: int, mode: str, buffering: int = -1) -> RacingHandle:
+            return RacingHandle(real_fdopen(fd, mode, buffering=buffering))
+
+        with (
+            patch.object(private_io.os, "fdopen", side_effect=racing_fdopen),
+            self.assertRaises(UnsafeFileError),
+        ):
+            append_private_bytes(path, b"event")
+
+        self.assertTrue(swapped)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(b"originalevent", displaced.read_bytes())
+        self.assertEqual(b"external", target.read_bytes())
+        self.assertEqual(target_mode, stat.S_IMODE(target.stat().st_mode))
 
     def test_directory_replacement_between_lstat_and_open_is_rejected(self) -> None:
         private_dir = self.root / "private"

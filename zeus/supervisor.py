@@ -33,16 +33,17 @@ from zeus.errors import (
 )
 from zeus.fs_utils import atomic_write_json
 from zeus.gateway_launcher import (
-    MARKER_NAME,
     MAX_PAYLOAD_BYTES,
     LaunchPayloadError,
+    _confirm_marker_missing,
     _is_owned_runtime_marker,
     _open_logs,
-    _open_profile,
+    _open_profile_chain,
     _open_regular_marker,
     _read_bounded_file,
     _reject_duplicate_keys,
     _remove_marker_if_owned_locked,
+    _validate_marker_bindings,
     marker_publication_lock,
     remove_marker_if_owned,
 )
@@ -1220,9 +1221,10 @@ class Supervisor:
                 "untrusted",
                 reason="registered profile path does not match the trusted Hermes profile",
             )
-        profile_fd = logs_fd = marker_fd = -1
+        profile = None
+        logs_fd = marker_fd = -1
         try:
-            profile_fd = _open_profile(profile_path)
+            profile = _open_profile_chain(profile_path)
         except (OSError, ValueError) as exc:
             if isinstance(exc.__cause__, FileNotFoundError):
                 return _MarkerObservation("missing", reason="marker is missing")
@@ -1231,9 +1233,16 @@ class Supervisor:
             )
         try:
             try:
-                logs_fd = _open_logs(profile_fd, create=False)
+                logs_fd = _open_logs(profile.fd, create=False)
             except ValueError as exc:
                 if isinstance(exc.__cause__, FileNotFoundError):
+                    try:
+                        profile.confirm_missing("logs")
+                    except (OSError, ValueError) as confirm_error:
+                        return _MarkerObservation(
+                            "untrusted",
+                            reason=f"marker directory absence is untrusted: {confirm_error}",
+                        )
                     return _MarkerObservation("missing", reason="marker is missing")
                 return _MarkerObservation(
                     "untrusted", reason=f"marker directory cannot be opened safely: {exc}"
@@ -1241,11 +1250,31 @@ class Supervisor:
             try:
                 marker_fd, marker_stat = _open_regular_marker(logs_fd)
                 raw = _read_bounded_file(marker_fd)
+                marker_stat = _validate_marker_bindings(
+                    profile,
+                    logs_fd,
+                    marker_fd,
+                    marker_stat,
+                )
                 value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
             except FileNotFoundError:
+                try:
+                    _confirm_marker_missing(profile, logs_fd)
+                except (OSError, ValueError) as confirm_error:
+                    return _MarkerObservation(
+                        "untrusted",
+                        reason=f"marker absence is untrusted: {confirm_error}",
+                    )
                 return _MarkerObservation("missing", reason="marker is missing")
             except ValueError as exc:
                 if isinstance(exc.__cause__, FileNotFoundError):
+                    try:
+                        _confirm_marker_missing(profile, logs_fd)
+                    except (OSError, ValueError) as confirm_error:
+                        return _MarkerObservation(
+                            "untrusted",
+                            reason=f"marker absence is untrusted: {confirm_error}",
+                        )
                     return _MarkerObservation("missing", reason="marker is missing")
                 return _MarkerObservation("untrusted", reason=f"marker is invalid: {exc}")
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1253,9 +1282,12 @@ class Supervisor:
         except FileNotFoundError:
             return _MarkerObservation("missing", reason="marker is missing")
         finally:
-            for fd in (marker_fd, logs_fd, profile_fd):
+            for fd in (marker_fd, logs_fd):
                 if fd >= 0:
-                    os.close(fd)
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            if profile is not None:
+                profile.close()
         if type(value) is not dict:
             return _MarkerObservation("untrusted", reason="marker is not an object")
         if marker_stat.st_nlink != 1:
@@ -3360,14 +3392,24 @@ class Supervisor:
 
     def _read_pid_marker(self, profile_path: str) -> dict[str, object]:
         safe_profile_path = _nofollow_absolute_path(Path(profile_path))
-        profile_fd = logs_fd = marker_fd = -1
+        profile = None
+        logs_fd = marker_fd = -1
         try:
             try:
-                profile_fd = _open_profile(safe_profile_path)
-                logs_fd = _open_logs(profile_fd, create=False)
+                profile = _open_profile_chain(safe_profile_path)
+                logs_fd = _open_logs(profile.fd, create=False)
                 marker_fd, marker_stat = _open_regular_marker(logs_fd)
             except (LaunchPayloadError, OSError, ValueError) as exc:
                 if _caused_by_missing_path(exc):
+                    try:
+                        if profile is not None and logs_fd >= 0:
+                            _confirm_marker_missing(profile, logs_fd)
+                        elif profile is not None:
+                            profile.confirm_missing("logs")
+                    except (LaunchPayloadError, OSError, ValueError) as confirm_error:
+                        raise UnsafeFileError(
+                            "PID marker absence cannot be confirmed safely"
+                        ) from confirm_error
                     return {"exists": False}
                 raise UnsafeFileError("PID marker cannot be opened safely") from exc
             if marker_stat.st_uid != os.geteuid() or marker_stat.st_nlink != 1:
@@ -3375,30 +3417,47 @@ class Supervisor:
             marker_mode = f"{stat.S_IMODE(marker_stat.st_mode):04o}"
             try:
                 raw = _read_bounded_file(marker_fd)
-                current_marker = os.stat(MARKER_NAME, dir_fd=logs_fd, follow_symlinks=False)
-                current_logs = os.stat("logs", dir_fd=profile_fd, follow_symlinks=False)
-                opened_logs = os.fstat(logs_fd)
             except (LaunchPayloadError, OSError, TypeError, ValueError) as exc:
+                try:
+                    _validate_marker_bindings(
+                        profile,
+                        logs_fd,
+                        marker_fd,
+                        marker_stat,
+                    )
+                except (LaunchPayloadError, OSError, TypeError, ValueError) as binding_error:
+                    raise UnsafeFileError(
+                        "PID marker changed while it was inspected"
+                    ) from binding_error
                 return {
                     "exists": True,
                     "valid": False,
                     "mode": marker_mode,
                     "error": str(exc),
                 }
+            try:
+                current_marker = _validate_marker_bindings(
+                    profile,
+                    logs_fd,
+                    marker_fd,
+                    marker_stat,
+                )
+            except (LaunchPayloadError, OSError, TypeError, ValueError) as exc:
+                raise UnsafeFileError("PID marker changed while it was inspected") from exc
             if (
                 not stat.S_ISREG(current_marker.st_mode)
                 or current_marker.st_uid != os.geteuid()
                 or current_marker.st_nlink != 1
                 or not _same_identity(marker_stat, current_marker)
-                or not stat.S_ISDIR(current_logs.st_mode)
-                or not _same_identity(opened_logs, current_logs)
             ):
                 raise UnsafeFileError("PID marker changed while it was inspected")
         finally:
-            for descriptor in (marker_fd, logs_fd, profile_fd):
+            for descriptor in (marker_fd, logs_fd):
                 if descriptor >= 0:
                     with contextlib.suppress(OSError):
                         os.close(descriptor)
+            if profile is not None:
+                profile.close()
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

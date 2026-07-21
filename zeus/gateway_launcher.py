@@ -11,6 +11,7 @@ import stat
 import subprocess  # nosec B404
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import NoReturn
@@ -239,6 +240,108 @@ def _same_file(before: os.stat_result, after: os.stat_result) -> bool:
     return before.st_dev == after.st_dev and before.st_ino == after.st_ino
 
 
+def _caused_by_missing_path(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, FileNotFoundError):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _validate_open_directory_binding(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    description: str,
+) -> os.stat_result:
+    try:
+        opened = os.fstat(directory_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise LaunchPayloadError(f"{description} changed while it was used") from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or not _same_file(opened, current)
+    ):
+        raise LaunchPayloadError(f"{description} changed while it was used")
+    return opened
+
+
+@dataclass
+class _OpenedProfile:
+    descriptors: list[int]
+    names: tuple[str, ...]
+
+    @property
+    def fd(self) -> int:
+        if not self.descriptors:
+            raise LaunchPayloadError("profile descriptor chain is closed")
+        return self.descriptors[-1]
+
+    def validate_bindings(self, *, require_profile_owner: bool = True) -> None:
+        if len(self.descriptors) != len(self.names) + 1:
+            raise LaunchPayloadError("profile descriptor chain is invalid")
+        try:
+            opened_root = os.fstat(self.descriptors[0])
+            current_root = os.stat("/", follow_symlinks=False)
+        except OSError as exc:
+            raise LaunchPayloadError("filesystem root changed while it was used") from exc
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or not stat.S_ISDIR(current_root.st_mode)
+            or not _same_file(opened_root, current_root)
+        ):
+            raise LaunchPayloadError("filesystem root changed while it was used")
+        for parent_fd, name, directory_fd in zip(
+            self.descriptors[:-1],
+            self.names,
+            self.descriptors[1:],
+            strict=True,
+        ):
+            _validate_open_directory_binding(
+                parent_fd,
+                name,
+                directory_fd,
+                "profile path component",
+            )
+        try:
+            profile_stat = os.fstat(self.fd)
+        except OSError as exc:
+            raise LaunchPayloadError("profile directory changed while it was used") from exc
+        if require_profile_owner and hasattr(os, "geteuid") and profile_stat.st_uid != os.geteuid():
+            raise LaunchPayloadError("profile directory has an unexpected owner")
+
+    def confirm_missing(self, name: str) -> None:
+        for _attempt in range(2):
+            self.validate_bindings(require_profile_owner=False)
+            try:
+                os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise LaunchPayloadError("missing profile entry cannot be confirmed") from exc
+            raise LaunchPayloadError("profile entry appeared while absence was confirmed")
+        self.validate_bindings(require_profile_owner=False)
+
+    def detach_fd(self) -> int:
+        result = self.fd
+        ancestors = self.descriptors[:-1]
+        self.descriptors = []
+        for descriptor in reversed(ancestors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        return result
+
+    def close(self) -> None:
+        descriptors = self.descriptors
+        self.descriptors = []
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
 def _open_directory_at(parent_fd: int, name: str) -> int:
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -250,34 +353,56 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
         opened_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
     except OSError as exc:
         raise LaunchPayloadError("profile path component cannot be opened safely") from exc
-    after = os.fstat(opened_fd)
-    if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
-        os.close(opened_fd)
-        raise LaunchPayloadError("profile path changed while it was opened")
-    return opened_fd
+    try:
+        after = os.fstat(opened_fd)
+        if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
+            raise LaunchPayloadError("profile path changed while it was opened")
+        return opened_fd
+    except LaunchPayloadError:
+        with contextlib.suppress(OSError):
+            os.close(opened_fd)
+        raise
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(opened_fd)
+        raise LaunchPayloadError("profile path could not be validated safely") from exc
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(opened_fd)
+        raise
 
 
-def _open_profile(profile_path: Path) -> int:
+def _open_profile_chain(profile_path: Path) -> _OpenedProfile:
     if not profile_path.is_absolute() or not profile_path.parts or profile_path.parts[0] != "/":
         raise LaunchPayloadError("profile path must be absolute")
     try:
-        current_fd = os.open("/", _directory_flags())
+        root_fd = os.open("/", _directory_flags())
     except OSError as exc:
         raise LaunchPayloadError("filesystem root cannot be opened safely") from exc
+    descriptors = [root_fd]
+    names: list[str] = []
     try:
         for component in profile_path.parts[1:]:
-            next_fd = _open_directory_at(current_fd, component)
-            os.close(current_fd)
-            current_fd = next_fd
-        profile_stat = os.fstat(current_fd)
-        if hasattr(os, "geteuid") and profile_stat.st_uid != os.geteuid():
-            raise LaunchPayloadError("profile directory has an unexpected owner")
-        result = current_fd
-        current_fd = -1
-        return result
-    finally:
-        if current_fd >= 0:
-            os.close(current_fd)
+            try:
+                next_fd = _open_directory_at(descriptors[-1], component)
+            except LaunchPayloadError as exc:
+                if _caused_by_missing_path(exc):
+                    _OpenedProfile(descriptors, tuple(names)).confirm_missing(component)
+                raise
+            descriptors.append(next_fd)
+            names.append(component)
+        opened = _OpenedProfile(descriptors, tuple(names))
+        opened.validate_bindings()
+        return opened
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        raise
+
+
+def _open_profile(profile_path: Path) -> int:
+    return _open_profile_chain(profile_path).detach_fd()
 
 
 class _MarkerPublicationLock:
@@ -400,14 +525,25 @@ def _open_logs(profile_fd: int, *, create: bool) -> int:
         logs_fd = _open_directory_at(profile_fd, "logs")
     except OSError as exc:
         raise LaunchPayloadError("marker directory cannot be opened safely") from exc
-    logs_stat = os.fstat(logs_fd)
-    if not stat.S_ISDIR(logs_stat.st_mode):
-        os.close(logs_fd)
-        raise LaunchPayloadError("marker directory is not a directory")
-    if hasattr(os, "geteuid") and logs_stat.st_uid != os.geteuid():
-        os.close(logs_fd)
-        raise LaunchPayloadError("marker directory has an unexpected owner")
-    return logs_fd
+    try:
+        logs_stat = os.fstat(logs_fd)
+        if not stat.S_ISDIR(logs_stat.st_mode):
+            raise LaunchPayloadError("marker directory is not a directory")
+        if hasattr(os, "geteuid") and logs_stat.st_uid != os.geteuid():
+            raise LaunchPayloadError("marker directory has an unexpected owner")
+        return logs_fd
+    except LaunchPayloadError:
+        with contextlib.suppress(OSError):
+            os.close(logs_fd)
+        raise
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(logs_fd)
+        raise LaunchPayloadError("marker directory could not be validated safely") from exc
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(logs_fd)
+        raise
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -544,11 +680,95 @@ def _open_regular_marker(logs_fd: int) -> tuple[int, os.stat_result]:
         marker_fd = os.open(MARKER_NAME, flags, dir_fd=logs_fd)
     except OSError as exc:
         raise LaunchPayloadError("marker cannot be opened safely") from exc
-    after = os.fstat(marker_fd)
-    if not stat.S_ISREG(after.st_mode) or not _same_file(before, after):
-        os.close(marker_fd)
-        raise LaunchPayloadError("marker changed while it was opened")
-    return marker_fd, after
+    try:
+        after = os.fstat(marker_fd)
+        if not stat.S_ISREG(after.st_mode) or not _same_file(before, after):
+            raise LaunchPayloadError("marker changed while it was opened")
+        return marker_fd, after
+    except LaunchPayloadError:
+        with contextlib.suppress(OSError):
+            os.close(marker_fd)
+        raise
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(marker_fd)
+        raise LaunchPayloadError("marker could not be validated safely") from exc
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(marker_fd)
+        raise
+
+
+def _validate_open_marker_binding(
+    logs_fd: int,
+    marker_fd: int,
+    marker_stat: os.stat_result,
+) -> os.stat_result:
+    try:
+        opened_marker = os.fstat(marker_fd)
+        current_marker = os.stat(MARKER_NAME, dir_fd=logs_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise LaunchPayloadError("marker changed while it was read") from exc
+    snapshots = (marker_stat, opened_marker, current_marker)
+    if not all(stat.S_ISREG(snapshot.st_mode) for snapshot in snapshots) or not all(
+        _same_file(marker_stat, snapshot) for snapshot in snapshots[1:]
+    ):
+        raise LaunchPayloadError("marker changed while it was read")
+    if hasattr(os, "geteuid") and any(snapshot.st_uid != os.geteuid() for snapshot in snapshots):
+        raise LaunchPayloadError("marker has an unexpected owner")
+    if any(snapshot.st_nlink != 1 for snapshot in snapshots):
+        raise LaunchPayloadError("marker has unexpected links")
+    return current_marker
+
+
+def _validate_marker_bindings(
+    profile: _OpenedProfile,
+    logs_fd: int,
+    marker_fd: int,
+    marker_stat: os.stat_result,
+) -> os.stat_result:
+    current_marker = marker_stat
+    for _attempt in range(2):
+        profile.validate_bindings()
+        logs_stat = _validate_open_directory_binding(
+            profile.fd,
+            "logs",
+            logs_fd,
+            "marker directory",
+        )
+        if hasattr(os, "geteuid") and logs_stat.st_uid != os.geteuid():
+            raise LaunchPayloadError("marker directory has an unexpected owner")
+        current_marker = _validate_open_marker_binding(
+            logs_fd,
+            marker_fd,
+            marker_stat,
+        )
+    return current_marker
+
+
+def _confirm_marker_missing(profile: _OpenedProfile, logs_fd: int) -> None:
+    for _attempt in range(2):
+        profile.validate_bindings()
+        _validate_open_directory_binding(
+            profile.fd,
+            "logs",
+            logs_fd,
+            "marker directory",
+        )
+        try:
+            os.stat(MARKER_NAME, dir_fd=logs_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise LaunchPayloadError("missing marker cannot be confirmed") from exc
+        raise LaunchPayloadError("marker appeared while absence was confirmed")
+    profile.validate_bindings()
+    _validate_open_directory_binding(
+        profile.fd,
+        "logs",
+        logs_fd,
+        "marker directory",
+    )
 
 
 def _remove_marker_if_owned_locked(

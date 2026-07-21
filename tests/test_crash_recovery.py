@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -698,6 +699,173 @@ class GatewayLauncherTests(unittest.TestCase):
                 os.close(fd)
 
             self.assertTrue(swapped)
+
+    def test_profile_chain_rejects_final_symlink_appearing_during_missing_lookup(self) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_profile_chain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / "hermes" / "profiles" / "coder"
+            profile.parent.mkdir(parents=True)
+            external = root / "external-profile"
+            external.mkdir()
+            real_stat = os.stat
+            appeared = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal appeared
+                if path == profile.name and dir_fd is not None and not appeared:
+                    try:
+                        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                    except FileNotFoundError:
+                        profile.symlink_to(external, target_is_directory=True)
+                        appeared = True
+                        raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with (
+                patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat),
+                self.assertRaisesRegex(LaunchPayloadError, "appeared"),
+            ):
+                _open_profile_chain(profile)
+
+            self.assertTrue(appeared)
+            self.assertTrue(profile.is_symlink())
+
+    def test_profile_chain_rejects_intermediate_symlink_appearing_during_missing_lookup(
+        self,
+    ) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_profile_chain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            hermes = root / "hermes"
+            hermes.mkdir()
+            profiles = hermes / "profiles"
+            profile = profiles / "coder"
+            external = root / "external-profiles"
+            (external / "coder").mkdir(parents=True)
+            real_stat = os.stat
+            appeared = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal appeared
+                if path == profiles.name and dir_fd is not None and not appeared:
+                    try:
+                        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                    except FileNotFoundError:
+                        profiles.symlink_to(external, target_is_directory=True)
+                        appeared = True
+                        raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with (
+                patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat),
+                self.assertRaisesRegex(LaunchPayloadError, "appeared"),
+            ):
+                _open_profile_chain(profile)
+
+            self.assertTrue(appeared)
+            self.assertTrue(profiles.is_symlink())
+
+    def test_directory_open_closes_new_descriptor_when_post_open_fstat_fails(self) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_directory_at
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = root / "child"
+            child.mkdir()
+            parent_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            real_open = os.open
+            real_fstat = os.fstat
+            opened_fd: int | None = None
+
+            def tracking_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal opened_fd
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if path == child.name and dir_fd == parent_fd:
+                    opened_fd = descriptor
+                return descriptor
+
+            def failing_fstat(fd: int) -> os.stat_result:
+                if fd == opened_fd:
+                    raise OSError(errno.EIO, "injected directory fstat failure")
+                return real_fstat(fd)
+
+            try:
+                with (
+                    patch("zeus.gateway_launcher.os.open", side_effect=tracking_open),
+                    patch("zeus.gateway_launcher.os.fstat", side_effect=failing_fstat),
+                    self.assertRaises(LaunchPayloadError),
+                ):
+                    _open_directory_at(parent_fd, child.name)
+            finally:
+                os.close(parent_fd)
+
+            self.assertIsNotNone(opened_fd)
+            with self.assertRaises(OSError):
+                os.fstat(opened_fd)  # type: ignore[arg-type]
+
+    def test_marker_open_closes_new_descriptor_when_post_open_fstat_fails(self) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_regular_marker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / "logs"
+            logs.mkdir()
+            marker = logs / "zeus-gateway.pid.json"
+            marker.write_text("{}", encoding="utf-8")
+            logs_fd = os.open(logs, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            real_open = os.open
+            real_fstat = os.fstat
+            opened_fd: int | None = None
+
+            def tracking_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal opened_fd
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if path == marker.name and dir_fd == logs_fd:
+                    opened_fd = descriptor
+                return descriptor
+
+            def failing_fstat(fd: int) -> os.stat_result:
+                if fd == opened_fd:
+                    raise OSError(errno.EIO, "injected marker fstat failure")
+                return real_fstat(fd)
+
+            try:
+                with (
+                    patch("zeus.gateway_launcher.os.open", side_effect=tracking_open),
+                    patch("zeus.gateway_launcher.os.fstat", side_effect=failing_fstat),
+                    self.assertRaises(LaunchPayloadError),
+                ):
+                    _open_regular_marker(logs_fd)
+            finally:
+                os.close(logs_fd)
+
+            self.assertIsNotNone(opened_fd)
+            with self.assertRaises(OSError):
+                os.fstat(opened_fd)  # type: ignore[arg-type]
 
     def test_ack_failure_removes_only_the_owned_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
