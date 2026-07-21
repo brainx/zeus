@@ -202,7 +202,9 @@ passes a random per-run API key, probes `/health`, and then stops the bot.
 For a clean Debian/Ubuntu host, use the fresh VPS harness:
 
 ```bash
-ZEUS_VPS_INSTALL_PACKAGES=1 ZEUS_VPS_INSTALL_HERMES=1 bash scripts/fresh_vps_verify.sh
+ZEUS_VPS_HERMES_INSTALLER_SHA256='<64-hex SHA-256 of the reviewed installer>' \
+ZEUS_VPS_INSTALL_PACKAGES=1 ZEUS_VPS_INSTALL_HERMES=1 \
+bash scripts/fresh_vps_verify.sh
 ```
 
 See [Fresh VPS test](docs/FRESH_VPS_TEST.md) for gateway and async-delegation probes.

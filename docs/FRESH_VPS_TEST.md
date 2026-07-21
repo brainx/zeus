@@ -15,25 +15,33 @@ Use this runbook to verify Zeus on a clean Debian or Ubuntu VPS with a real Herm
 
 ## Threat Model
 
-The VPS test downloads and executes the official Hermes installer only when `ZEUS_VPS_INSTALL_HERMES=1` is set. That crosses the network boundary and trusts the Hermes installer HTTPS endpoint. Run it only on a disposable host or after reviewing the downloaded installer saved in the evidence directory.
+The VPS test downloads the official Hermes installer only when `ZEUS_VPS_INSTALL_HERMES=1` is set. Remote bootstrap also requires `ZEUS_VPS_HERMES_INSTALLER_SHA256` to contain the exact 64-hex-character SHA-256 digest of an installer you reviewed. The script verifies the downloaded bytes with a constant-time comparison and refuses to execute a missing, malformed, or mismatched digest. This still crosses the network boundary, so use a digest obtained through a trusted review process and run the bootstrap only on a disposable host.
 
-Do not put provider tokens in command history. Configure Hermes credentials through Hermes' own setup flow or a secure environment mechanism. Review `.tmp/fresh-vps-verify/.../run.log` before sharing it, because Hermes tools may print environment-specific diagnostics.
+Do not put provider tokens in command history. Configure Hermes credentials through Hermes' own setup flow or a secure environment mechanism. The API smoke key is generated ephemerally by default; authenticated curl commands use a redacted transcript label and receive the key through standard input instead of an argument. Review `.tmp/fresh-vps-verify/.../run.log` before sharing it, because Hermes tools may print environment-specific diagnostics.
+
+`ZEUS_VPS_ASYNC_PROMPT` is also replaced by a fixed label in the transcript. Hermes still receives that operator-supplied prompt through its established `-z <prompt>` argument, so it may be visible to local process inspection while that optional probe runs.
 
 ## Fresh Host Flow
 
 Clone or copy this repository onto the VPS, then run from the repository root:
 
 ```bash
+ZEUS_VPS_HERMES_INSTALLER_SHA256='<64-hex SHA-256 of the reviewed installer>' \
 ZEUS_VPS_INSTALL_PACKAGES=1 \
 ZEUS_VPS_INSTALL_HERMES=1 \
 bash scripts/fresh_vps_verify.sh
 ```
 
-This installs basic Debian/Ubuntu packages, creates `.venv/`, installs Zeus editable, installs Hermes if missing, runs the local gates, checks Hermes, renders all templates, and runs an API smoke test.
+Obtain the pinned digest separately: download the installer without executing it, review the saved file, and calculate its SHA-256 with a trusted local tool such as `sha256sum`. The verifier never learns or trusts a digest from the download endpoint itself.
+
+The command installs basic Debian/Ubuntu packages, creates `.venv/`, installs Zeus editable, installs the digest-verified Hermes payload if missing, runs the local gates, checks Hermes, renders all templates, and runs an API smoke test.
+
+On a minimal supported apt host where `python3` is not yet available, `ZEUS_VPS_INSTALL_PACKAGES=1` permits a minimal Python 3 prerequisite install before the private evidence log can be initialized. That early package-manager output is console-only; the normal package step is still recorded afterward. Without that explicit package-bootstrap opt-in, the verifier fails with a prerequisite error.
 
 To also start a real Hermes gateway for the default real-Hermes bot:
 
 ```bash
+ZEUS_VPS_HERMES_INSTALLER_SHA256='<64-hex SHA-256 of the reviewed installer>' \
 ZEUS_VPS_INSTALL_PACKAGES=1 \
 ZEUS_VPS_INSTALL_HERMES=1 \
 ZEUS_VPS_START_GATEWAY=1 \
@@ -66,7 +74,7 @@ The pass criteria are:
 
 ## Evidence
 
-The script writes logs under:
+The script writes logs under a workspace-relative directory with mode `0700`:
 
 ```text
 .tmp/fresh-vps-verify/<timestamp>/
@@ -74,9 +82,11 @@ The script writes logs under:
 
 Important files:
 
-- `run.log`: full command transcript, including `git rev-parse HEAD` and `git status --short` when run from a Git checkout.
-- `hermes-install.sh`: downloaded installer, when Hermes installation is enabled.
+- `run.log`: command transcript, including `git rev-parse HEAD` and `git status --short` when run from a Git checkout; sensitive invocations use fixed redacted labels.
+- `hermes-install.sh`: downloaded and digest-verified installer, when Hermes installation is enabled.
 - `zeus-api.log`: API server log from the loopback smoke test.
+
+Evidence files use mode `0600`. The verifier rejects absolute, escaping, symlinked, or otherwise unsafe evidence paths instead of changing permissions on their targets. `ZEUS_VPS_LOG_DIR` must remain a workspace-relative scratch directory.
 
 Runtime state is created under ignored workspace directories such as `.zeus-real-hermes-check/`, `.zeus-vps-multi/`, and `.zeus-vps-api/`.
 
