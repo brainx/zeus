@@ -1,11 +1,108 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
 from zeus.state import SCHEMA_VERSION
+
+
+def _workflow_job_bodies(workflow: str) -> dict[str, str]:
+    jobs_header = re.search(r"(?m)^jobs:\s*$", workflow)
+    if jobs_header is None:
+        raise ValueError("workflow has no jobs mapping")
+
+    jobs_text = workflow[jobs_header.end() :]
+    next_top_level = re.search(r"(?m)^[A-Za-z_][A-Za-z0-9_-]*:\s*", jobs_text)
+    if next_top_level is not None:
+        jobs_text = jobs_text[: next_top_level.start()]
+
+    headers = list(re.finditer(r"(?m)^  (?P<name>[A-Za-z0-9_-]+):\s*$", jobs_text))
+    if not headers:
+        raise ValueError("workflow jobs mapping is empty")
+
+    jobs: dict[str, str] = {}
+    for index, header in enumerate(headers):
+        name = header.group("name")
+        if name in jobs:
+            raise ValueError(f"duplicate workflow job: {name}")
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(jobs_text)
+        jobs[name] = jobs_text[header.end() : end]
+    return jobs
+
+
+def _job_level_scalar(job_body: str, key: str) -> str:
+    values = re.findall(
+        rf"(?m)^    {re.escape(key)}:\s*(?P<value>[^\s#][^\n#]*?)\s*(?:#.*)?$",
+        job_body,
+    )
+    if len(values) != 1:
+        raise ValueError(f"expected one job-level {key}, found {len(values)}")
+    return values[0]
+
+
+def _job_python_versions(job_body: str) -> tuple[str, ...]:
+    matrix = re.search(r"(?m)^        python-version:\s*(?P<versions>\[[^\n]+\])\s*$", job_body)
+    if matrix is not None:
+        versions = json.loads(matrix.group("versions"))
+        if not isinstance(versions, list) or not all(isinstance(item, str) for item in versions):
+            raise ValueError("python-version matrix must be a list of strings")
+        return tuple(versions)
+
+    setup_versions = re.findall(
+        r'(?m)^          python-version:\s*"(?P<version>3\.\d+)"\s*$', job_body
+    )
+    if len(setup_versions) != 1:
+        raise ValueError(f"expected one setup-python version, found {len(setup_versions)}")
+    return tuple(setup_versions)
+
+
+def _job_run_commands(job_body: str) -> tuple[str, ...]:
+    lines = job_body.splitlines()
+    commands: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^        run:\s*(?P<value>.*)$", lines[index])
+        if match is None:
+            index += 1
+            continue
+
+        value = match.group("value").strip()
+        if value not in {"|", "|-"}:
+            commands.append(value)
+            index += 1
+            continue
+
+        index += 1
+        block: list[str] = []
+        while index < len(lines):
+            line = lines[index]
+            if line.strip() and len(line) - len(line.lstrip(" ")) <= 8:
+                break
+            block.append(line)
+            index += 1
+        commands.append(textwrap.dedent("\n".join(block)).strip())
+    return tuple(commands)
+
+
+def _markdown_table_rows(markdown: str) -> dict[str, tuple[str, ...]]:
+    rows: dict[str, tuple[str, ...]] = {}
+    for line in markdown.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+        if not cells or cells[0] == "Gate" or set(cells[0]) <= {"-", ":"}:
+            continue
+        if cells[0] in rows:
+            raise ValueError(f"duplicate Markdown table row: {cells[0]}")
+        rows[cells[0]] = cells[1:]
+    return rows
 
 
 class RepoContractTests(unittest.TestCase):
@@ -67,50 +164,224 @@ class RepoContractTests(unittest.TestCase):
 
     def test_ci_runs_project_test_script_on_supported_python_versions(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        jobs = _workflow_job_bodies(workflow)
 
+        expected_runners = {
+            "test": "ubuntu-24.04",
+            "python-3-14": "ubuntu-24.04",
+            "lifecycle-subprocess": "ubuntu-24.04",
+            "macos-process-lifecycle": "macos-26",
+            "package": "ubuntu-24.04",
+        }
+        expected_python_versions = {
+            "test": ("3.11", "3.12", "3.13"),
+            "python-3-14": ("3.14",),
+            "lifecycle-subprocess": ("3.11",),
+            "macos-process-lifecycle": ("3.13",),
+            "package": ("3.11",),
+        }
+        expected_setup_python = {
+            "test": "${{ matrix.python-version }}",
+            "python-3-14": '"3.14"',
+            "lifecycle-subprocess": '"3.11"',
+            "macos-process-lifecycle": '"3.13"',
+            "package": '"3.11"',
+        }
+        expected_commands = {
+            "test": (
+                "sudo apt-get update\nsudo apt-get install -y shellcheck",
+                'python -m pip install -e ".[dev]"',
+                "ruff format --check .",
+                "ruff check .",
+                "mypy zeus",
+                "bandit -r zeus",
+                "shellcheck scripts/*.sh",
+                "sh scripts/test.sh",
+                "sh scripts/repo_check.sh",
+                "coverage erase\ncoverage run -m unittest discover -s tests\ncoverage report",
+            ),
+            "python-3-14": (
+                'python -m pip install -e ".[dev]"',
+                "sh scripts/test.sh",
+            ),
+            "lifecycle-subprocess": (
+                'python -m pip install -e ".[dev]"',
+                "python -m unittest tests.test_subprocess_lifecycle",
+            ),
+            "macos-process-lifecycle": (
+                'python -m pip install -e ".[dev]"',
+                "python -m unittest -v \\\n"
+                "  tests.test_subprocess_lifecycle \\\n"
+                "  tests.test_fake_hermes_integration \\\n"
+                "  tests.test_crash_recovery.GatewayLauncherTests",
+            ),
+            "package": (
+                'python -m pip install -e ".[dev]"',
+                "python -m pip check",
+                "rm -rf dist\npython -m build",
+                "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
+                "twine check dist/*",
+            ),
+        }
+
+        self.assertEqual(set(expected_runners), set(jobs))
         self.assertIn("workflow_dispatch:", workflow)
-        self.assertIn("runs-on: ubuntu-24.04", workflow)
-        self.assertNotIn("runs-on: ubuntu-latest", workflow)
-        self.assertIn("3.11", workflow)
-        self.assertIn("3.12", workflow)
-        self.assertIn("3.13", workflow)
-        self.assertIn("python-3-14:", workflow)
-        self.assertIn('python-version: "3.14"', workflow)
-        self.assertIn("continue-on-error: true", workflow)
-        self.assertIn("macos-process-lifecycle:", workflow)
-        self.assertIn("runs-on: macos-26", workflow)
-        self.assertIn("tests.test_subprocess_lifecycle", workflow)
-        self.assertIn("tests.test_fake_hermes_integration", workflow)
-        self.assertIn("tests.test_crash_recovery.GatewayLauncherTests", workflow)
-        self.assertIn('pip install -e ".[dev]"', workflow)
-        self.assertIn("python -m pip check", workflow)
-        self.assertIn("ruff format --check .", workflow)
-        self.assertIn("ruff check .", workflow)
-        self.assertIn("mypy zeus", workflow)
-        self.assertIn("bandit -r zeus", workflow)
-        self.assertIn("shellcheck scripts/*.sh", workflow)
-        self.assertIn("sh scripts/test.sh", workflow)
-        self.assertIn("coverage erase", workflow)
-        self.assertIn("coverage run -m unittest discover -s tests", workflow)
-        self.assertIn("coverage report", workflow)
-        self.assertNotIn("coverage report --fail-under", workflow)
-        self.assertIn("python -m build", workflow)
-        self.assertIn("twine check dist/*", workflow)
-        self.assertIn("- name: Verify installed wheel behavior", workflow)
-        self.assertIn("ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh", workflow)
-        self.assertNotIn("- name: Smoke test built wheel", workflow)
+        for job_name, job_body in jobs.items():
+            with self.subTest(job=job_name):
+                self.assertEqual(expected_runners[job_name], _job_level_scalar(job_body, "runs-on"))
+                self.assertEqual(expected_python_versions[job_name], _job_python_versions(job_body))
+                self.assertEqual(
+                    [expected_setup_python[job_name]],
+                    re.findall(r"(?m)^          python-version:\s*(.+?)\s*$", job_body),
+                )
+                self.assertEqual(expected_commands[job_name], _job_run_commands(job_body))
 
-    def test_test_script_runs_compile_unittest_and_doctor(self) -> None:
-        script = Path("scripts/test.sh").read_text(encoding="utf-8")
+        job_level_continue_on_error: dict[str, str] = {}
+        for job_name, job_body in jobs.items():
+            values = re.findall(r"(?m)^    continue-on-error:\s*([^\s#]+)\s*$", job_body)
+            self.assertLessEqual(len(values), 1, msg=f"duplicate setting in {job_name}")
+            if values:
+                job_level_continue_on_error[job_name] = values[0]
+        self.assertEqual({"python-3-14": "true"}, job_level_continue_on_error)
 
-        self.assertIn("compileall zeus tests", script)
-        self.assertIn("unittest discover -s tests -v", script)
-        self.assertIn("-W error::ResourceWarning", script)
-        self.assertIn('warning_log="$tmp_dir/unittest-stderr.log"', script)
-        self.assertIn('grep -F "ResourceWarning" "$warning_log"', script)
-        self.assertIn("trap cleanup EXIT INT TERM", script)
-        self.assertIn('mkdir -p "$tmp_dir"', script)
-        self.assertIn("zeus.cli doctor --json", script)
+        python_314 = jobs["python-3-14"].lower()
+        self.assertNotIn("hermes", python_314)
+        self.assertNotIn("verify_real_hermes", python_314)
+
+        macos_selectors = re.findall(
+            r"(?<![\w.])(tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+)",
+            jobs["macos-process-lifecycle"],
+        )
+        self.assertEqual(
+            [
+                "tests.test_subprocess_lifecycle",
+                "tests.test_fake_hermes_integration",
+                "tests.test_crash_recovery.GatewayLauncherTests",
+            ],
+            macos_selectors,
+        )
+
+        package_commands = _job_run_commands(jobs["package"])
+        pip_check_index = package_commands.index("python -m pip check")
+        for later_command in (
+            "rm -rf dist\npython -m build",
+            "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
+            "twine check dist/*",
+        ):
+            self.assertLess(pip_check_index, package_commands.index(later_command))
+
+    def test_test_script_preserves_failures_and_gates_resource_warnings(self) -> None:
+        script_source = Path("scripts/test.sh").read_text(encoding="utf-8")
+        fake_python_source = textwrap.dedent(
+            """\
+            #!/bin/sh
+            set -eu
+            : "${FAKE_PYTHON_LOG:?}"
+            : "${FAKE_UNITTEST_MODE:?}"
+            printf '%s\\n' "$*" >> "$FAKE_PYTHON_LOG"
+            case "$*" in
+              *"-m compileall zeus tests")
+                exit 0
+                ;;
+              *"-m unittest discover -s tests -v")
+                case "$FAKE_UNITTEST_MODE" in
+                  warning)
+                    printf '%s\\n' "Exception ignored in: <_io.FileIO name='fixture'>" >&2
+                    printf '%s\\n' "ResourceWarning: unclosed file <fixture>" >&2
+                    exit 0
+                    ;;
+                  exit7)
+                    printf '%s\\n' "synthetic unittest failure" >&2
+                    exit 7
+                    ;;
+                  clean)
+                    exit 0
+                    ;;
+                  *)
+                    exit 98
+                    ;;
+                esac
+                ;;
+              *"-m zeus.cli doctor --json")
+                printf '%s\\n' '{"ok": true}'
+                ;;
+              *"-m zeus.cli template list")
+                printf '%s\\n' 'coding-bot'
+                ;;
+              *)
+                printf '%s\\n' "unexpected python invocation: $*" >&2
+                exit 97
+                ;;
+            esac
+            """
+        )
+
+        def run_case(
+            root: Path, mode: str
+        ) -> tuple[subprocess.CompletedProcess[str], tuple[str, ...]]:
+            case_root = root / mode
+            scripts_dir = case_root / "scripts"
+            bin_dir = case_root / "bin"
+            scripts_dir.mkdir(parents=True)
+            bin_dir.mkdir()
+            script = scripts_dir / "test.sh"
+            fake_python = bin_dir / "python3"
+            log = case_root / "python-calls.log"
+            script.write_text(script_source, encoding="utf-8")
+            fake_python.write_text(fake_python_source, encoding="utf-8")
+            fake_python.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "FAKE_PYTHON_LOG": str(log),
+                    "FAKE_UNITTEST_MODE": mode,
+                    "PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
+                }
+            )
+            shell = shutil.which("sh", path=environment["PATH"])
+            if shell is None:
+                self.fail("POSIX sh is required for the shell contract")
+            result = subprocess.run(
+                [shell, str(script)],
+                cwd=case_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            calls = tuple(log.read_text(encoding="utf-8").splitlines())
+            return result, calls
+
+        pre_gate_calls = (
+            "-B -m compileall zeus tests",
+            "-B -W error::ResourceWarning -m unittest discover -s tests -v",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            warning_result, warning_calls = run_case(root, "warning")
+            self.assertNotEqual(0, warning_result.returncode)
+            self.assertIn("Exception ignored in:", warning_result.stderr)
+            self.assertIn("ResourceWarning", warning_result.stderr)
+            self.assertEqual(pre_gate_calls, warning_calls)
+
+            failed_result, failed_calls = run_case(root, "exit7")
+            self.assertEqual(7, failed_result.returncode)
+            self.assertNotIn("ResourceWarning", failed_result.stderr)
+            self.assertEqual(pre_gate_calls, failed_calls)
+
+            clean_result, clean_calls = run_case(root, "clean")
+            self.assertEqual(0, clean_result.returncode)
+            self.assertEqual(
+                (
+                    *pre_gate_calls,
+                    "-B -m zeus.cli doctor --json",
+                    "-B -m zeus.cli template list",
+                ),
+                clean_calls,
+            )
 
     def test_wheel_smoke_exercises_installed_demo_entrypoint(self) -> None:
         script = Path("scripts/wheel_smoke.sh").read_text(encoding="utf-8")
@@ -329,16 +600,94 @@ class RepoContractTests(unittest.TestCase):
         ):
             self.assertIn(statement, roadmap_text)
 
-        workflow_text = ci_workflow + "\n" + release_workflow
-        workflow_runners = set(re.findall(r"(?m)^\s*runs-on:\s*([^\s#]+)", workflow_text))
-        workflow_python_versions = set(re.findall(r'"(3\.\d+)"', workflow_text))
-        documented_python_versions = set(re.findall(r"(?<![\d.])3\.\d+(?![\d.])", compatibility))
+        ci_jobs = _workflow_job_bodies(ci_workflow)
+        release_jobs = _workflow_job_bodies(release_workflow)
+        automated_matrix = compatibility.split("## Automated matrix", 1)[1].split("\n## ", 1)[0]
+        compatibility_rows = _markdown_table_rows(automated_matrix)
+        compatibility_contracts = {
+            "test": (
+                ci_jobs["test"],
+                "Main CI matrix",
+                "ubuntu-24.04",
+                ("3.11", "3.12", "3.13"),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11, 3.12, and 3.13",
+                    "Unit and integration tests, repository contracts, source-and-branch "
+                    "coverage, formatting, lint, typing, Bandit, and ShellCheck",
+                ),
+            ),
+            "python-3-14": (
+                ci_jobs["python-3-14"],
+                "Provisional Python compatibility",
+                "ubuntu-24.04",
+                ("3.14",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.14",
+                    "Full Zeus test suite; non-required and Zeus-only because no Hermes "
+                    "baseline is pinned",
+                ),
+            ),
+            "lifecycle-subprocess": (
+                ci_jobs["lifecycle-subprocess"],
+                "Subprocess lifecycle",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Focused multi-process lifecycle and locking behavior",
+                ),
+            ),
+            "macos-process-lifecycle": (
+                ci_jobs["macos-process-lifecycle"],
+                "macOS process lifecycle",
+                "macos-26",
+                ("3.13",),
+                (
+                    "macOS `macos-26`",
+                    "Python 3.13",
+                    "Focused process, fake-Hermes integration, and gateway-launcher recovery tests",
+                ),
+            ),
+            "package": (
+                ci_jobs["package"],
+                "Package build",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Wheel and source build, installed-wheel smoke test, dependency "
+                    "consistency, and metadata checks",
+                ),
+            ),
+            "release:build": (
+                release_jobs["build"],
+                "Tagged release build",
+                "ubuntu-latest",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-latest`",
+                    "Python 3.11",
+                    "Full release gate, artifact checksums, and GitHub release artifacts",
+                ),
+            ),
+        }
         requires_python = re.search(r'(?m)^requires-python = "([^"]+)"$', pyproject)
 
         self.assertIsNotNone(requires_python)
-        for runner in workflow_runners:
-            self.assertIn(f"`{runner}`", compatibility_text)
-        self.assertEqual(workflow_python_versions, documented_python_versions)
+        self.assertEqual(
+            {contract[1] for contract in compatibility_contracts.values()},
+            set(compatibility_rows),
+        )
+        for job_name, contract in compatibility_contracts.items():
+            job_body, row_name, runner, python_versions, expected_row = contract
+            with self.subTest(compatibility_job=job_name):
+                self.assertEqual(runner, _job_level_scalar(job_body, "runs-on"))
+                self.assertEqual(python_versions, _job_python_versions(job_body))
+                self.assertEqual(expected_row, compatibility_rows[row_name])
         self.assertIn(
             f'`requires-python = "{requires_python.group(1)}"`',
             compatibility_text,
