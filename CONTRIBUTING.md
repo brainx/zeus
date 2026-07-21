@@ -7,9 +7,14 @@ Zeus is intentionally small and workspace-local. Changes should keep the project
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e .
-sh scripts/test.sh
+python -m pip install -e ".[dev]"
+make check
 ```
+
+See the [compatibility policy](docs/COMPATIBILITY.md) for the operating systems,
+Python versions, and Hermes boundary covered by committed automation. The
+real-Hermes check below is a separate release gate because it depends on the
+operator's installed Hermes version.
 
 ## Quality Bar
 
@@ -25,7 +30,8 @@ sh scripts/test.sh
 
 ## Real Hermes Verification
 
-The default test suite uses a fake Hermes executable to verify Zeus process handling. Before release, run:
+The default test suite uses a fake Hermes executable to verify Zeus process handling.
+Before release, separately run:
 
 ```bash
 sh scripts/verify_real_hermes.sh

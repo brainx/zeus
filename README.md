@@ -48,14 +48,45 @@ run summaries at that boundary.
 
 ## Quick Start
 
+### 1. Credential-free offline demo
+
+The fastest first success needs neither Hermes nor provider credentials. From a
+checkout:
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e .
+python -m pip install -e .
+
+zeus demo up
+zeus demo status
+zeus demo down
+```
+
+The demo uses Zeus' packaged fake-Hermes executable and stores its disposable
+runtime under `ZEUS_STATE_DIR` (the workspace-local `.zeus/` directory by
+default). It exercises real profile rendering and process lifecycle behavior
+without contacting a provider.
+
+### 2. Real Hermes setup
+
+Check the installed Hermes version, then prepare a private workspace secret
+file:
+
+```bash
+hermes version
 cp .env.example .env
 chmod 0600 .env
-# Edit .env and set OPENROUTER_API_KEY to a non-empty provider key.
+```
 
+`.env.example` contains empty placeholders and is not ready to import. Stop here
+until `.env` contains a real, non-empty provider key required by the selected
+template, such as `OPENROUTER_API_KEY` for `coding-bot`. As an alternative,
+provide the same named secret through a secure process-environment mechanism.
+
+Then validate Zeus and render the real Hermes profile:
+
+```bash
 zeus doctor
 zeus template list
 zeus bot create coder --template coding-bot --env-from OPENROUTER_API_KEY
@@ -84,8 +115,10 @@ ZEUS_API_KEY=change-me sh scripts/start.sh
 
 ## 60-Second Demo
 
-The asciinema recording in [docs/assets/demo.cast](docs/assets/demo.cast) mirrors the local
-operator flow:
+The pre-recorded asciinema cast in [docs/assets/demo.cast](docs/assets/demo.cast)
+illustrates the local operator flow. It is not evidence that the current Zeus
+checkout is compatible with whichever Hermes version is installed today; use
+the live verification steps below for that evidence.
 
 ```bash
 zeus doctor
@@ -108,6 +141,7 @@ zeus bot stop coder
 - [Operations](docs/OPERATIONS.md)
 - [Reconcile scheduling](docs/RECONCILE.md)
 - [Release process](docs/RELEASE.md)
+- [Compatibility policy](docs/COMPATIBILITY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)
@@ -122,16 +156,10 @@ Zeus is maintained by [BrainX](https://github.com/brainx). See [Credits](CREDITS
 - Hermes Agent installed as `hermes` for real bot startup
 - Optional Docker or another Hermes terminal backend for stronger execution isolation
 
-No Python package dependencies are required for the current MVP.
-
-## Setup
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-cp .env.example .env
-```
+Zeus has no required third-party Python runtime dependencies. Development and
+build tools are available separately through the optional `dev` dependency
+group; see [Contributing](CONTRIBUTING.md). The exact automated platform and
+Python matrix is recorded in the [compatibility policy](docs/COMPATIBILITY.md).
 
 ## Install Modes
 

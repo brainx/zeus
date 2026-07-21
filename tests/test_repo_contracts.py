@@ -27,6 +27,7 @@ class RepoContractTests(unittest.TestCase):
             "docs/OPERATIONS.md",
             "docs/RECONCILE.md",
             "docs/RELEASE.md",
+            "docs/COMPATIBILITY.md",
             "docs/openapi.json",
             "docs/ROADMAP.md",
             "docs/assets/demo.cast",
@@ -187,6 +188,75 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("local process orchestrator, not a sandbox", readme)
         self.assertIn("Do not expose the API", readme)
         self.assertIn("## Known Limitations", readme)
+
+    def test_onboarding_compatibility_and_roadmap_match_current_evidence(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        contributing = Path("CONTRIBUTING.md").read_text(encoding="utf-8")
+        roadmap = Path("docs/ROADMAP.md").read_text(encoding="utf-8")
+        roadmap_text = " ".join(roadmap.split())
+        compatibility_path = Path("docs/COMPATIBILITY.md")
+
+        self.assertTrue(compatibility_path.is_file())
+        compatibility = compatibility_path.read_text(encoding="utf-8")
+        compatibility_text = " ".join(compatibility.split())
+
+        offline_heading = "### 1. Credential-free offline demo"
+        hermes_heading = "### 2. Real Hermes setup"
+        self.assertLess(readme.index(offline_heading), readme.index(hermes_heading))
+        for command in (
+            "python3 -m venv .venv",
+            "python -m pip install -e .",
+            "zeus demo up",
+            "zeus demo status",
+            "zeus demo down",
+        ):
+            self.assertIn(command, readme)
+        for command in (
+            "hermes version",
+            "cp .env.example .env",
+            "chmod 0600 .env",
+            "zeus doctor",
+            "--env-from OPENROUTER_API_KEY",
+            "zeus bot doctor coder",
+        ):
+            self.assertIn(command, readme)
+        self.assertIn("real, non-empty provider key", readme)
+        self.assertIn("docs/COMPATIBILITY.md", readme)
+        self.assertIn("no required third-party Python runtime dependencies", readme)
+
+        self.assertIn('python -m pip install -e ".[dev]"', contributing)
+        self.assertIn("make check", contributing)
+        self.assertIn("docs/COMPATIBILITY.md", contributing)
+        self.assertIn("sh scripts/verify_real_hermes.sh", contributing)
+
+        for heading in (
+            "## Current status",
+            "## Shipped",
+            "## Near term",
+            "## Under evaluation",
+            "## Out of scope",
+        ):
+            self.assertIn(heading, roadmap)
+        for statement in (
+            "v0.3.0",
+            "alpha",
+            "host-local",
+            "cross-host placement",
+            "distributed approvals",
+            "fleet rollout policy",
+            "control-plane ownership",
+            "Olymp",
+        ):
+            self.assertIn(statement, roadmap_text)
+
+        self.assertIn("`ubuntu-latest`", compatibility_text)
+        self.assertIn("Python 3.11, 3.12, and 3.13", compatibility_text)
+        self.assertIn("focused lifecycle and package jobs use Python 3.11", compatibility_text)
+        self.assertIn("Debian and Ubuntu", compatibility_text)
+        self.assertIn("No Hermes version is pinned", compatibility_text)
+        self.assertIn("whichever `hermes` executable is installed", compatibility_text)
+        self.assertIn("macOS and Windows are not currently automated", compatibility_text)
+        self.assertNotIn("Python 3.14", compatibility_text)
 
     def test_env_example_lists_deepseek_and_api_auth(self) -> None:
         env = Path(".env.example").read_text(encoding="utf-8")
