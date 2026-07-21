@@ -68,6 +68,7 @@ _AUTHORIZATION_RE = re.compile(
     (?P<name>AUTHORIZATION(?:[^A-Z0-9\r\n:=]*HEADERS?)?)
     (?P=prefix)
     (?P<sep>[ \t]*[:=][ \t]*)
+    (?P<initial_fold>(?:(?:\r\n|[\r\n])[ \t]+)?)
     (?P<value>
         "(?:[^"\\\r\n]|\\.)*" |
         '(?:[^'\\\r\n]|\\.)*' |

@@ -710,7 +710,7 @@ class LifecycleLedgerTests(unittest.TestCase):
                 )
 
     def test_authorization_label_variants_and_folded_credentials_are_redacted(self) -> None:
-        credentials = tuple(f"authorization-variant-sentinel-{index:02d}" for index in range(12))
+        credentials = tuple(f"authorization-variant-sentinel-{index:02d}" for index in range(16))
         messages = (
             f"Authorization Header: Basic {credentials[0]}",
             f'authorization_header=Digest response="{credentials[1]}"',
@@ -724,6 +724,10 @@ class LifecycleLedgerTests(unittest.TestCase):
             f'Authorization Header: Digest\n\tresponse="{credentials[9]}"',
             f"authorization_headers=CustomScheme\r\n  {credentials[10]}",
             f"authorizationHeaders: Bearer\n\t{credentials[11]}",
+            f"Authorization:\r\n  Basic {credentials[12]}",
+            f'Authorization Header:\n\tDigest response="{credentials[13]}"',
+            f"authorization_headers=\r\n  CustomScheme {credentials[14]}",
+            f'"Authorization":\n  "Basic {credentials[15]}"',
         )
         combined = "\nnext authorization case\n".join(messages)
         started_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
