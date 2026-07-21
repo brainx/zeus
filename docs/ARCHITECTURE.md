@@ -130,7 +130,7 @@ The v2-to-v3 migration is also one transaction. It creates a
 the projection/event invariant, and advances the schema version only after all
 steps succeed. Additive v3-to-v4 and v4-to-v5 upgrades add durable idempotency
 and desired/pending intent in forward-only transactions. Databases newer than
-schema v5 are rejected rather than downgraded.
+schema v6 are rejected rather than downgraded.
 
 `$ZEUS_STATE_DIR/logs/audit.jsonl` remains a best-effort compatibility mirror.
 It is written only after the SQLite transaction commits and is not imported into

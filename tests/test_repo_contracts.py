@@ -5,6 +5,8 @@ import re
 import unittest
 from pathlib import Path
 
+from zeus.state import SCHEMA_VERSION
+
 
 class RepoContractTests(unittest.TestCase):
     def test_publishable_repository_files_exist(self) -> None:
@@ -237,6 +239,16 @@ class RepoContractTests(unittest.TestCase):
         }
         for field in access_fields:
             self.assertIn(f"`{field}`", api_docs)
+
+    def test_architecture_terminal_schema_compatibility_matches_runtime(self) -> None:
+        architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+        compatibility_statement = re.search(
+            r"Databases newer than\s+schema v(?P<version>\d+) are rejected rather than downgraded\.",
+            architecture,
+        )
+
+        self.assertIsNotNone(compatibility_statement)
+        self.assertEqual(str(SCHEMA_VERSION), compatibility_statement["version"])
 
     def test_every_openapi_response_documents_request_id_header(self) -> None:
         document = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
