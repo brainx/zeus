@@ -6,13 +6,14 @@ import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput, serialize_lifecycle_details
 from zeus.models import BotRecord, BotStatus, DesiredState
-from zeus.sanitization import sanitize_details
+from zeus.reconciliation import BotReconcileResult, ReconcileOutcome, ReconcileRunStart
+from zeus.sanitization import sanitize_details, sanitize_text
 from zeus.state import StateStore
 
 
@@ -612,6 +613,112 @@ class LifecycleLedgerTests(unittest.TestCase):
             assert row is not None
             persisted = "\n".join(str(value) for value in row if value is not None)
             self.assertFalse(secret in persisted)
+
+    def test_authorization_credentials_are_redacted_from_all_persistence_sinks(self) -> None:
+        credentials = (
+            "basic-credential-sentinel-47d1",
+            "digest-credential-sentinel-8a20",
+            "custom-credential-sentinel-53fe",
+        )
+        messages = (
+            f"Authorization: Basic {credentials[0]}",
+            f'authorization=Digest username="operator", response="{credentials[1]}"',
+            f"Authorization: CustomScheme {credentials[2]}",
+        )
+        started_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            event = LifecycleEventInput(
+                bot_id="coder",
+                operation_id="a" * 32,
+                source="cli",
+                action="bot.start",
+                outcome="failure",
+                reason=messages[0],
+                error_code="authorization_failed",
+                error_message=messages[1],
+                details={"message": messages[2]},
+            )
+            store.upsert_bot_with_event(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / "profiles" / "coder"),
+                    last_error=messages[0],
+                    last_transition_reason=messages[1],
+                ),
+                event=event,
+            )
+            store.append_audit_event(
+                "bot.authorization_failed",
+                cleanup_errors=list(messages),
+            )
+            run = ReconcileRunStart(
+                run_id="authorization-sanitization",
+                scope="fleet",
+                requested_bot_id=None,
+                source="cli",
+                force=False,
+                reset_restart=False,
+                started_at=started_at,
+            )
+            result = BotReconcileResult(
+                bot_id="coder",
+                outcome=ReconcileOutcome.error,
+                desired_state="running",
+                observed_status="failed",
+                pid=None,
+                action="inspect",
+                message="; ".join(messages),
+                error_code="authorization_failed",
+                event_id=None,
+                started_at=started_at,
+                finished_at=started_at + timedelta(seconds=1),
+            )
+            store.begin_reconcile_run(run)
+            store.append_reconcile_result(run.run_id, result)
+
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                lifecycle_row = conn.execute(
+                    "SELECT reason, error_message, details_json FROM lifecycle_events"
+                ).fetchone()
+                bot_row = conn.execute(
+                    "SELECT last_error, last_transition_reason FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()
+                reconcile_row = conn.execute(
+                    "SELECT message FROM reconcile_results WHERE run_id = ?",
+                    (run.run_id,),
+                ).fetchone()
+            assert lifecycle_row is not None
+            assert bot_row is not None
+            assert reconcile_row is not None
+            observed = (
+                *(sanitize_text(message) for message in messages),
+                *lifecycle_row,
+                *bot_row,
+                *reconcile_row,
+                result.message,
+                store.audit_log_path().read_text(encoding="utf-8"),
+            )
+            for credential in credentials:
+                self.assertFalse(
+                    any(credential in value for value in observed if isinstance(value, str))
+                )
+
+    def test_audit_non_bmp_event_fallback_is_strictly_byte_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "zeus.db")
+
+            store.append_audit_event(chr(0x1F512) * 2_048, message="ordinary")
+
+            line = store.audit_log_path().read_bytes()
+            self.assertLessEqual(len(line), 8192)
+            self.assertEqual(1, len(line.splitlines()))
+            self.assertTrue(json.loads(line)["truncated"])
 
     def test_upsert_bot_with_event_rolls_back_projection_when_event_insert_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

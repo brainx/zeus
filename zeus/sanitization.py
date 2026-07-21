@@ -52,7 +52,6 @@ _SECRET_KV_RE = re.compile(
     (?P<prefix>["']?)
     (?P<name>
         [A-Z0-9_.-]*(?:API[_-]?KEY|KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_.-]*
-        | AUTHORIZATION
     )
     (?P=prefix)
     (?P<sep>\s*[:=]\s*)
@@ -63,13 +62,33 @@ _SECRET_KV_RE = re.compile(
     )
     """
 )
+_AUTHORIZATION_RE = re.compile(
+    r"""(?ix)
+    (?P<prefix>["']?)
+    (?P<name>AUTHORIZATION)
+    (?P=prefix)
+    (?P<sep>\s*[:=]\s*)
+    (?P<value>
+        "(?:[^"\\\r\n]|\\.)*" |
+        '(?:[^'\\\r\n]|\\.)*' |
+        [^\r\n]+
+    )
+    """
+)
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]+)")
 
 
 def redact_secrets(text: str) -> str:
     """Redact common secret assignments and bearer credentials from free text."""
 
-    redacted = _BEARER_RE.sub(r"\1[redacted]", text)
+    redacted = _AUTHORIZATION_RE.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('name')}{match.group('prefix')}"
+            f"{match.group('sep')}[redacted]"
+        ),
+        text,
+    )
+    redacted = _BEARER_RE.sub(r"\1[redacted]", redacted)
     return _SECRET_KV_RE.sub(
         lambda match: (
             f"{match.group('prefix')}{match.group('name')}{match.group('prefix')}"

@@ -1759,7 +1759,7 @@ class StateStore:
                     json.dumps(
                         {
                             "ts": timestamp,
-                            "event": safe_event,
+                            "event": "audit.truncated",
                             "truncated": True,
                         },
                         sort_keys=True,
@@ -1767,6 +1767,8 @@ class StateStore:
                     )
                     + "\n"
                 ).encode("utf-8")
+            if len(line) > MAX_SANITIZED_JSON_BYTES:
+                return
             append_private_bytes(nofollow_absolute_path(self.audit_log_path()), line)
         except Exception:
             return
