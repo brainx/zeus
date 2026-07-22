@@ -130,6 +130,7 @@ class RepoContractTests(unittest.TestCase):
             "docs/assets/demo.cast",
             "docs/assets/zeus-hero.png",
             ".coveragerc",
+            "requirements-hermes-ci.txt",
             ".github/workflows/release.yml",
             ".github/ISSUE_TEMPLATE/bug_report.yml",
             ".github/ISSUE_TEMPLATE/feature_request.yml",
@@ -171,6 +172,7 @@ class RepoContractTests(unittest.TestCase):
             "python-3-14": "ubuntu-24.04",
             "lifecycle-subprocess": "ubuntu-24.04",
             "macos-process-lifecycle": "macos-26",
+            "real-hermes": "ubuntu-24.04",
             "package": "ubuntu-24.04",
         }
         expected_python_versions = {
@@ -178,6 +180,7 @@ class RepoContractTests(unittest.TestCase):
             "python-3-14": ("3.14",),
             "lifecycle-subprocess": ("3.11",),
             "macos-process-lifecycle": ("3.13",),
+            "real-hermes": ("3.11",),
             "package": ("3.11",),
         }
         expected_setup_python = {
@@ -185,6 +188,7 @@ class RepoContractTests(unittest.TestCase):
             "python-3-14": '"3.14"',
             "lifecycle-subprocess": '"3.11"',
             "macos-process-lifecycle": '"3.13"',
+            "real-hermes": '"3.11"',
             "package": '"3.11"',
         }
         expected_commands = {
@@ -215,6 +219,19 @@ class RepoContractTests(unittest.TestCase):
                 "  tests.test_fake_hermes_integration \\\n"
                 "  tests.test_crash_recovery.GatewayLauncherTests",
             ),
+            "real-hermes": (
+                "mkdir -p .tmp/real-hermes-evidence\n"
+                "printf '%s\\n' 'result=failed' 'failure_stage=ci_setup' > "
+                ".tmp/real-hermes-evidence/summary.txt",
+                "python -m pip install --require-hashes --only-binary=:all: "
+                "-r requirements-hermes-ci.txt",
+                "python -m pip install -e .",
+                "python -m pip check",
+                "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
+                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \\\n"
+                "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
+                "sh scripts/verify_real_hermes.sh",
+            ),
             "package": (
                 'python -m pip install -e ".[dev]"',
                 "python -m pip check",
@@ -243,6 +260,14 @@ class RepoContractTests(unittest.TestCase):
             if values:
                 job_level_continue_on_error[job_name] = values[0]
         self.assertEqual({"python-3-14": "true"}, job_level_continue_on_error)
+
+        real_hermes = jobs["real-hermes"]
+        self.assertEqual("15", _job_level_scalar(real_hermes, "timeout-minutes"))
+        self.assertNotIn("secrets.", real_hermes)
+        self.assertNotRegex(real_hermes, r"(?i)(openai|anthropic|openrouter).*api[_-]?key")
+        self.assertRegex(real_hermes, r"(?m)^        if: failure\(\)\s*$")
+        self.assertIn(".tmp/real-hermes-evidence/summary.txt", real_hermes)
+        self.assertIn("if-no-files-found: error", real_hermes)
 
         python_314 = jobs["python-3-14"].lower()
         self.assertNotIn("hermes", python_314)
@@ -625,8 +650,8 @@ class RepoContractTests(unittest.TestCase):
                 (
                     "Linux `ubuntu-24.04`",
                     "Python 3.14",
-                    "Full Zeus test suite; non-required and Zeus-only because no Hermes "
-                    "baseline is pinned",
+                    "Full Zeus test suite; non-required and Zeus-only because the pinned "
+                    "Hermes baseline requires Python below 3.14",
                 ),
             ),
             "lifecycle-subprocess": (
@@ -649,6 +674,19 @@ class RepoContractTests(unittest.TestCase):
                     "macOS `macos-26`",
                     "Python 3.13",
                     "Focused process, fake-Hermes integration, and gateway-launcher recovery tests",
+                ),
+            ),
+            "real-hermes": (
+                ci_jobs["real-hermes"],
+                "Real Hermes compatibility",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Hash-locked Hermes Agent 0.19.0 profile rendering, strict diagnostics, "
+                    "loopback gateway readiness, process ownership, and clean shutdown "
+                    "without a model-provider credential",
                 ),
             ),
             "package": (
@@ -694,7 +732,9 @@ class RepoContractTests(unittest.TestCase):
         )
         self.assertIn("lifecycle and package jobs use Python 3.11", compatibility_text)
         self.assertIn("Debian and Ubuntu", compatibility_text)
-        self.assertIn("No Hermes version is pinned", compatibility_text)
+        self.assertIn("Hermes Agent 0.19.0", compatibility_text)
+        self.assertIn("complete 60-package wheel closure", compatibility_text)
+        self.assertIn("no model-provider credential", compatibility_text)
         self.assertIn("whichever `hermes` executable is installed", compatibility_text)
         self.assertIn("Python 3.14", compatibility_text)
         self.assertIn("provisional Zeus-only", compatibility_text)
@@ -808,6 +848,30 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("/health", script)
         self.assertIn("time.monotonic", script)
         self.assertIn("Hermes /health did not become ready", script)
+        self.assertIn("ZEUS_VERIFY_EXPECTED_HERMES_VERSION", script)
+        self.assertIn('bot start "$bot_id" --wait', script)
+        self.assertIn("ZEUS_VERIFY_EVIDENCE_DIR", script)
+        self.assertIn("failure_stage=%s", script)
+        self.assertIn('rm -rf -- "$state_dir"', script)
+
+    def test_real_hermes_ci_lock_is_complete_and_hash_pinned(self) -> None:
+        requirements = Path("requirements-hermes-ci.txt").read_text(encoding="utf-8")
+        entries = re.findall(
+            r"(?m)^([a-z0-9][a-z0-9._-]*)==([^\\\s]+) \\$",
+            requirements,
+        )
+        hashes = re.findall(r"(?m)^    --hash=sha256:([0-9a-f]{64})(?: \\)?$", requirements)
+
+        self.assertEqual(60, len(entries))
+        self.assertEqual(60, len({name for name, _version in entries}))
+        self.assertEqual(74, len(hashes))
+        self.assertIn(("hermes-agent", "0.19.0"), entries)
+        self.assertIn(
+            "bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f",
+            hashes,
+        )
+        self.assertNotIn("--index-url", requirements)
+        self.assertNotIn("git+", requirements)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")

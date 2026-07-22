@@ -1,6 +1,11 @@
 # Real Hermes Verification
 
-The normal test suite uses a fake Hermes executable so the repository can be tested without external credentials or a Hermes install.
+The normal test suite uses a fake Hermes executable so the repository can be
+tested without external credentials or a Hermes install. CI separately installs
+the fully hash-locked Hermes Agent 0.19.0 environment from
+`requirements-hermes-ci.txt` on Ubuntu/Python 3.11. The lock contains Linux
+x86_64 and arm64 wheel hashes; the gate does not run the remote installer or make
+a model-provider request.
 
 Before a release, verify against a real Hermes install:
 
@@ -27,11 +32,17 @@ before stopping the bot:
 ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
 ```
 
-When gateway startup verification is enabled, the script waits for Zeus to report
-the bot as running, then polls Hermes `/health` until the local `api_server`
+When gateway startup verification is enabled, the script starts Zeus with
+`--wait`, confirms Zeus reports the bot as running, then polls Hermes `/health`
+until the local `api_server`
 reports `{"status":"ok","platform":"hermes-agent"}` or the health timeout
 expires. This avoids false negatives when Hermes binds the loopback API shortly
 after the process becomes visible to Zeus.
+
+Successful and failed runs stop the bot and remove the isolated runtime tree.
+Failures retain only a sanitized `summary.txt` containing the fixed result and
+failure-stage labels. Raw logs, rendered profiles, environments, and command
+arguments are never copied into that evidence directory.
 
 Useful overrides:
 
@@ -39,13 +50,18 @@ Useful overrides:
 ZEUS_VERIFY_BOT_ID=my-check-bot
 ZEUS_VERIFY_TEMPLATE=research-bot
 ZEUS_VERIFY_STATE_DIR=.zeus-real-hermes-check
-ZEUS_VERIFY_GATEWAY_SECONDS=5
+ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence
+ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0
 ZEUS_VERIFY_API_KEY=real-hermes-local-check
 ZEUS_VERIFY_API_SERVER_HOST=127.0.0.1
 ZEUS_VERIFY_API_SERVER_PORT=4312
 ZEUS_VERIFY_HEALTH_TIMEOUT_SECONDS=30
 ZEUS_VERIFY_HEALTH_INTERVAL_SECONDS=0.5
 ```
+
+Leave `ZEUS_VERIFY_EXPECTED_HERMES_VERSION` unset for an intentional manual
+compatibility check against another installed version. Such a run is local
+evidence, not an update to the committed baseline.
 
 Expected failure when Hermes is not installed:
 

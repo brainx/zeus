@@ -13,8 +13,8 @@ make check
 
 See the [compatibility policy](docs/COMPATIBILITY.md) for the operating systems,
 Python versions, and Hermes boundary covered by committed automation. The
-real-Hermes check below is a separate release gate because it depends on the
-operator's installed Hermes version.
+committed Ubuntu/Python 3.11 gate uses the hash-locked Hermes Agent 0.19.0
+environment; the manual check below covers the operator's installed version.
 
 ## Quality Bar
 

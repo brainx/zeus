@@ -375,7 +375,6 @@ run hermes doctor
 section "Real Hermes Compatibility"
 run env \
   ZEUS_VERIFY_START_GATEWAY="${ZEUS_VPS_START_GATEWAY:-0}" \
-  ZEUS_VERIFY_GATEWAY_SECONDS="${ZEUS_VPS_GATEWAY_SECONDS:-5}" \
   sh scripts/verify_real_hermes.sh
 
 section "Multi Template Profile Check"

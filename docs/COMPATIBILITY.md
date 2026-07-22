@@ -9,9 +9,10 @@ an untested platform or external Hermes release into a support claim.
 | Gate | Committed runner | Python | Scope |
 | --- | --- | --- | --- |
 | Main CI matrix | Linux `ubuntu-24.04` | Python 3.11, 3.12, and 3.13 | Unit and integration tests, repository contracts, source-and-branch coverage, formatting, lint, typing, Bandit, and ShellCheck |
-| Provisional Python compatibility | Linux `ubuntu-24.04` | Python 3.14 | Full Zeus test suite; non-required and Zeus-only because no Hermes baseline is pinned |
+| Provisional Python compatibility | Linux `ubuntu-24.04` | Python 3.14 | Full Zeus test suite; non-required and Zeus-only because the pinned Hermes baseline requires Python below 3.14 |
 | Subprocess lifecycle | Linux `ubuntu-24.04` | Python 3.11 | Focused multi-process lifecycle and locking behavior |
 | macOS process lifecycle | macOS `macos-26` | Python 3.13 | Focused process, fake-Hermes integration, and gateway-launcher recovery tests |
+| Real Hermes compatibility | Linux `ubuntu-24.04` | Python 3.11 | Hash-locked Hermes Agent 0.19.0 profile rendering, strict diagnostics, loopback gateway readiness, process ownership, and clean shutdown without a model-provider credential |
 | Package build | Linux `ubuntu-24.04` | Python 3.11 | Wheel and source build, installed-wheel smoke test, dependency consistency, and metadata checks |
 | Tagged release build | Linux `ubuntu-latest` | Python 3.11 | Full release gate, artifact checksums, and GitHub release artifacts |
 
@@ -25,7 +26,8 @@ platform guarantee.
 
 Python 3.14 is a provisional Zeus-only lane with `continue-on-error` behavior.
 It does not promote Python 3.14 to required Hermes compatibility: the repository
-has not yet pinned and passed a Hermes baseline on that interpreter.
+pins Hermes Agent 0.19.0, whose package metadata requires Python 3.11 through
+3.13, and runs that compatibility gate only on Python 3.11.
 
 The package metadata declares `requires-python = ">=3.11"`, while committed CI
 currently tests the versions listed above. A version absent from that matrix is
@@ -49,7 +51,7 @@ clean-host runbook for Debian and Ubuntu. It can bootstrap OS packages, install
 Zeus into a virtual environment, run local gates, render multiple profiles, and
 exercise the loopback API. Optional Hermes installation and live probes cross an
 external network and credential boundary, so their logs are evidence for that
-specific host and invocation rather than deterministic CI.
+specific host and invocation rather than the committed CI environment.
 
 Local development checks such as `make check` and `sh scripts/wheel_smoke.sh`
 remain useful evidence, but they do not add the developer's operating system to
@@ -57,18 +59,24 @@ the automated matrix.
 
 ## Hermes boundary
 
-No Hermes version is pinned by this repository. There is no deterministic
-real-Hermes CI gate today. The manual
-[`scripts/verify_real_hermes.sh`](../scripts/verify_real_hermes.sh) check uses
-whichever `hermes` executable is installed on `PATH`: it runs strict diagnostics,
-renders a profile, invokes Hermes doctor, and can optionally start a loopback
-gateway and probe its health.
+The deterministic CI baseline is Hermes Agent 0.19.0 on Ubuntu 24.04 with Python
+3.11. [`requirements-hermes-ci.txt`](../requirements-hermes-ci.txt) pins the
+complete 60-package wheel closure and its selected SHA-256 hashes. CI installs it
+with pip hash checking and binary-only resolution; it never runs the remote
+Hermes installer. The lock also carries Linux arm64 hashes for native local
+container verification without changing the CI package versions.
 
-Record `hermes version` with manual verification evidence. Passing against one
-installed version does not establish compatibility with every Hermes release.
-Before a Hermes baseline becomes required automation, the repository must name
-the exact verified version or immutable source, install it reproducibly, and run
-the real-Hermes gate without provider secrets in logs or command arguments.
+The gate uses no model-provider credential or paid request. It renders a profile,
+runs strict Zeus and Hermes diagnostics, starts the loopback gateway with
+`--wait`, checks Zeus process ownership and Hermes `/health`, then stops the bot
+and removes runtime state. On failure it uploads only a two-line sanitized stage
+summary, never the rendered profile, environment, logs, or process arguments.
+
+The manual [`scripts/verify_real_hermes.sh`](../scripts/verify_real_hermes.sh)
+check still uses whichever `hermes` executable is installed on `PATH` unless
+`ZEUS_VERIFY_EXPECTED_HERMES_VERSION` is set. Record `hermes version` with manual
+evidence. Passing the pinned baseline does not establish compatibility with every
+Hermes release or optional integration.
 
 ## Updating this policy
 

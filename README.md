@@ -235,7 +235,10 @@ ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
 ```
 
 The gateway check enables Hermes' local `api_server` platform on loopback,
-passes a random per-run API key, probes `/health`, and then stops the bot.
+passes an isolated local API key, starts with readiness waiting, verifies process
+ownership, probes `/health`, and then stops the bot. Committed CI runs this flow
+without provider credentials against the fully hash-locked Hermes Agent 0.19.0
+environment documented in the compatibility policy.
 
 For a clean Debian/Ubuntu host, use the fresh VPS harness:
 

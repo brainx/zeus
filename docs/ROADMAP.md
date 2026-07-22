@@ -11,7 +11,8 @@ profiles, processes, lifecycle safety, and reconciliation evidence on one host.
 - Bundled and custom Hermes template validation and rendering.
 - PID ownership checks, lifecycle locking, crash recovery, and restart policy.
 - SQLite lifecycle and reconciliation evidence.
-- Credential-free fake-Hermes demo and manual real-Hermes verification scripts.
+- Credential-free fake-Hermes demo, hash-locked real-Hermes CI, and manual
+  real-Hermes verification scripts.
 - Wheel builds, installed-wheel smoke checks, and GitHub release artifacts.
 
 ## Near term

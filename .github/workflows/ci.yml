@@ -95,6 +95,39 @@ jobs:
             tests.test_fake_hermes_integration \
             tests.test_crash_recovery.GatewayLauncherTests
 
+  real-hermes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: Prepare sanitized failure evidence
+        run: |
+          mkdir -p .tmp/real-hermes-evidence
+          printf '%s\n' 'result=failed' 'failure_stage=ci_setup' > .tmp/real-hermes-evidence/summary.txt
+      - name: Install pinned Hermes compatibility environment
+        run: python -m pip install --require-hashes --only-binary=:all: -r requirements-hermes-ci.txt
+      - name: Install Zeus
+        run: python -m pip install -e .
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Verify real Hermes without provider credentials
+        run: |
+          ZEUS_VERIFY_START_GATEWAY=1 \
+          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \
+          ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \
+          sh scripts/verify_real_hermes.sh
+      - name: Upload sanitized failure evidence
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: real-hermes-failure-evidence
+          path: .tmp/real-hermes-evidence/summary.txt
+          if-no-files-found: error
+          retention-days: 7
+
   package:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
