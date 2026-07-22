@@ -170,6 +170,7 @@ class RepoContractTests(unittest.TestCase):
             "systemd/zeus-reconcile.service",
             "systemd/zeus-reconcile.timer",
             "scripts/repo_check.sh",
+            "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
             "zeus/bundled_templates/__init__.py",
@@ -1067,6 +1068,9 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("attestations: write", workflow)
         self.assertIn("git cat-file -t", workflow)
         self.assertIn("Release tags must be annotated tags.", workflow)
+        self.assertIn("Require GitHub-verified release ref", workflow)
+        self.assertIn("python scripts/check_verified_release_ref.py", workflow)
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
         self.assertIn("actions/attest-build-provenance@", workflow)
         self.assertIn("dist/*.tar.gz", workflow)
         self.assertIn("dist/*.whl", workflow)
@@ -1075,7 +1079,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("actions/download-artifact@", workflow)
         self.assertIn("cd dist && sha256sum -c SHA256SUMS.txt", workflow)
         self.assertIn("annotated version tags", release_docs)
-        self.assertIn("does not cryptographically verify signer identity", release_docs)
+        self.assertIn("GitHub-verified annotated tag", release_docs)
+        self.assertIn("v0.3.0 release predates", release_docs)
         self.assertIn("gh attestation verify", release_docs)
         self.assertIn('build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"', wheel_smoke)
         self.assertIn('fail "ZEUS_WHEEL_SMOKE_BUILD must be 0 or 1"', wheel_smoke)

@@ -46,6 +46,7 @@ systemd/zeus-reconcile.service
 systemd/zeus-reconcile.timer
 scripts/test.sh
 scripts/check_version_tag.py
+scripts/check_verified_release_ref.py
 scripts/wheel_smoke.sh
 scripts/generate_checksums.sh
 scripts/verify_real_hermes.sh

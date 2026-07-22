@@ -31,6 +31,10 @@ jobs:
             exit 1
           }
           python scripts/check_version_tag.py "${GITHUB_REF_NAME}" --require-changelog
+      - name: Require GitHub-verified release ref
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/check_verified_release_ref.py
       - name: Install shellcheck
         run: |
           sudo apt-get update

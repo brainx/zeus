@@ -4,6 +4,8 @@
 
 - Added descriptive CLI help and a state-free `zeus --version` command backed by the package
   version.
+- Required future release tags and their referenced commits to be signed and GitHub-verified
+  before the privileged publishing job can run.
 
 ## 0.3.0
 
