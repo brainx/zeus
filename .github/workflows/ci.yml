@@ -108,7 +108,8 @@ jobs:
           mkdir -p .tmp/real-hermes-evidence
           printf '%s\n' 'result=failed' 'failure_stage=ci_setup' > .tmp/real-hermes-evidence/summary.txt
       - name: Install pinned Hermes compatibility environment
-        run: python -m pip install --require-hashes --only-binary=:all: -r requirements-hermes-ci.txt
+        run: |-
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hermes-ci.txt
       - name: Install Zeus
         run: python -m pip install -e .
       - name: Check installed dependencies
