@@ -45,9 +45,14 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.api_server`: Bounded HTTP concurrency and graceful server lifecycle.
 - `zeus.api_logging`: Locked, fail-open, secret-safe API JSONL output.
 - `zeus.idempotency`: Key validation and canonical request hashing.
+- `zeus.process_identity`: Standard-library process observation and trusted-command checks.
+- `zeus.gateway_marker`: Effect-free schema-v3 marker parsing and exact-generation values.
 - `zeus.hermes_adapter`: Subprocess command construction for Hermes.
 - `zeus.gateway_launcher`: Descriptor-only marker-before-exec helper.
-- `zeus.supervisor`: Gateway lifecycle, PID ownership markers, logs, and status.
+- `zeus.profile_manager`: Atomic profile installation, delete, archive, and rollback transactions.
+- `zeus.gateway_runtime`: Process, marker, readiness, signal, and cleanup effects.
+- `zeus.intent_recovery`: Store-free pending-intent recovery decisions through a structural host.
+- `zeus.supervisor`: Public lifecycle facade, locks, durable intent transitions, and audit ordering.
 - `zeus.api`: Local HTTP routes and compatibility facade.
 - `zeus.cli`: Operator CLI.
 - `zeus.doctor`: Readiness diagnostics.
@@ -89,6 +94,20 @@ state, and neither mode replaces backup and restore procedures.
    failure exits before Hermes and leaves recoverable durable state.
 7. Stop commits its stopped intent before verifying ownership and signaling;
    SIGTERM/SIGKILL authorization is rechecked against the exact process identity.
+
+`Supervisor` owns the per-bot locks, lifecycle correlation context, `StateStore`
+calls, and authoritative transition/audit ordering. `ProfileManager` changes only
+profile and archive paths. `GatewayRuntime` owns the mutable in-process gateway
+registry and host effects but never reads or writes SQLite. `PendingIntentRecovery`
+contains the pending start, stop, and restart decision flow and resolves facade
+methods dynamically through its structural host; it does not acquire locks, mint
+operation IDs, or import the concrete facade or persistence layer.
+
+Status never spawns or signals; it may adopt exact evidence and repair the durable
+projection. Reconcile may recover one effect per pass: a pending restart first
+stops or cleans its exact schema-v3 predecessor and persists that observation,
+then a later pass adopts or launches the replacement with the same pending
+operation ID.
 
 Hermes child processes receive a minimal host environment plus profile `.env`
 values. Operators can allow specific host variables with `ZEUS_ENV_PASSTHROUGH`.

@@ -41,9 +41,11 @@ from zeus.gateway_runtime import (
     PopenLike,
     RuntimeHooks,
     SignalResult,
+    StopEffect,
     gateway_process_launch_kwargs,
 )
 from zeus.hermes_adapter import HermesAdapter
+from zeus.intent_recovery import PendingIntentRecovery
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput
 from zeus.logging_utils import tail_file
 from zeus.models import (
@@ -54,7 +56,6 @@ from zeus.models import (
     DesiredState,
     HermesTemplate,
     RestartPolicy,
-    TemplateError,
     validate_id,
 )
 from zeus.private_io import nofollow_absolute_path
@@ -201,6 +202,7 @@ class Supervisor:
             cleanup_process_group=self._cleanup_process_group,
             hooks_provider=self._runtime_hooks,
         )
+        self._intent_recovery = PendingIntentRecovery()
         self._locks_guard = threading.Lock()
         self._bot_locks: dict[str, threading.RLock] = {}
 
@@ -2087,123 +2089,86 @@ class Supervisor:
         context: _LifecycleContext,
         allow_launch: bool,
     ) -> BotStatusResponse:
-        action = record.pending_action
-        operation_id = record.pending_operation_id
-        if action is None or operation_id is None:
-            return self._pending_action_required(record, "pending lifecycle correlation is invalid")
-        recovery_context = _LifecycleContext(operation_id, context.source, context.request_id)
-        if action == "stop":
-            try:
-                with self._marker_publication_lock(record):
-                    return self._recover_pending_stop_intent_locked(
-                        record,
-                        context=recovery_context,
-                        allow_stop=allow_launch,
-                    )
-            except (BotDeleteError, LaunchPayloadError) as exc:
-                return self._pending_action_required(record, str(exc))
+        return self._intent_recovery.recover(
+            self,
+            record,
+            context=context,
+            allow_launch=allow_launch,
+        )
 
-        if action not in {"start", "restart"}:
-            return self._pending_action_required(record, "pending lifecycle action is invalid")
-        try:
-            probe = self._preflight_start(record, timeout_seconds=None)
-            expected = self.adapter.launcher_payload(
-                record.bot_id,
-                operation_id=operation_id,
-                desired_revision=record.desired_revision,
-                readiness_probe=probe,
-            )
-            marker_template = expected["marker"]
-            if type(marker_template) is not dict:
-                raise ValueError("invalid expected marker")
-            fingerprint = str(marker_template["command_fingerprint"])
-        except (OSError, ValueError, TemplateError, BotDeleteError) as exc:
-            return self._pending_action_required(record, f"launch preflight failed: {exc}")
-        if action == "restart":
-            predecessor_result = self._recover_pending_restart_predecessor(
-                record,
-                context=recovery_context,
-                allow_stop=allow_launch,
-            )
-            if predecessor_result is not None:
-                return predecessor_result
+    @staticmethod
+    def _recovery_lifecycle_context(
+        operation_id: str,
+        context: _LifecycleContext,
+    ) -> _LifecycleContext:
+        return _LifecycleContext(operation_id, context.source, context.request_id)
+
+    def _pending_launch_preflight(
+        self,
+        record: BotRecord,
+        operation_id: str,
+    ) -> tuple[ReadinessProbe | None, str]:
+        probe = self._preflight_start(record, timeout_seconds=None)
+        expected = self.adapter.launcher_payload(
+            record.bot_id,
+            operation_id=operation_id,
+            desired_revision=record.desired_revision,
+            readiness_probe=probe,
+        )
+        marker_template = expected["marker"]
+        if type(marker_template) is not dict:
+            raise ValueError("invalid expected marker")
+        return probe, str(marker_template["command_fingerprint"])
+
+    @staticmethod
+    def _probe_once(probe: ReadinessProbe) -> ReadinessResult:
+        return probe_once(
+            probe.url,
+            timeout_seconds=min(1.0, max(0.2, probe.interval_seconds)),
+            expected_status=probe.expected_status,
+            expected_platform=probe.expected_platform,
+        )
+
+    def _recover_pending_stop_intent(
+        self,
+        record: BotRecord,
+        *,
+        context: _LifecycleContext,
+        allow_stop: bool,
+    ) -> BotStatusResponse:
         try:
             with self._marker_publication_lock(record):
-                marker = self._matching_runtime_marker(
+                return self._recover_pending_stop_intent_locked(
                     record,
-                    expected_fingerprint=fingerprint,
-                    require_live_command=True,
+                    context=context,
+                    allow_stop=allow_stop,
                 )
-                if marker.kind == "live" and marker.payload is not None:
-                    marker_pid = marker.payload["pid"]
-                    if isinstance(marker_pid, bool) or not isinstance(marker_pid, int):
-                        return self._pending_action_required(record, "live marker PID is invalid")
-                    pid = marker_pid
-                    status = BotStatus.starting if probe is not None else BotStatus.running
-                    ready_at = None if probe is not None else datetime.now(UTC)
-                    if probe is not None:
-                        readiness = probe_once(
-                            probe.url,
-                            timeout_seconds=min(1.0, max(0.2, probe.interval_seconds)),
-                            expected_status=probe.expected_status,
-                            expected_platform=probe.expected_platform,
-                        )
-                        if readiness.ready:
-                            status = BotStatus.running
-                            ready_at = datetime.now(UTC)
-                    try:
-                        self._complete_started_intent(
-                            record,
-                            context=recovery_context,
-                            status=status,
-                            pid=pid,
-                            ready_at=ready_at,
-                            reset_restart=True,
-                            reason="recovery adopted registered gateway",
-                        )
-                    except Exception:
-                        return self._pending_action_required(
-                            record, "gateway adoption could not be persisted"
-                        )
-                    return BotStatusResponse(
-                        record.bot_id,
-                        status,
-                        pid,
-                        record.profile_path,
-                        "recovered registered gateway",
-                    )
-                if marker.kind == "untrusted":
-                    return self._pending_action_required(record, marker.reason)
-                if not allow_launch:
-                    return self._pending_action_required(
-                        record, "desired running gateway is missing; reconcile is required"
-                    )
-                if marker.kind == "dead":
-                    generation = self._gateway_generation(marker)
-                    if generation is None or not self._remove_gateway_generation_marker_locked(
-                        record, generation
-                    ):
-                        return self._pending_action_required(
-                            record, "dead gateway marker cleanup failed"
-                        )
-                    if action == "restart":
-                        return BotStatusResponse(
-                            record.bot_id,
-                            BotStatus.starting,
-                            None,
-                            record.profile_path,
-                            "restart pending: removed dead gateway marker; "
-                            "launch on next reconcile",
-                        )
         except (BotDeleteError, LaunchPayloadError) as exc:
             return self._pending_action_required(record, str(exc))
-        return self._start_record(
-            record,
-            reset_restart=action == "restart",
-            message="recovered interrupted gateway launch",
-            context=recovery_context,
-            probe=probe,
-        )
+
+    def _recover_pending_launch(
+        self,
+        record: BotRecord,
+        *,
+        context: _LifecycleContext,
+        probe: ReadinessProbe | None,
+        fingerprint: str,
+        action: str,
+        allow_launch: bool,
+    ) -> BotStatusResponse | None:
+        try:
+            with self._marker_publication_lock(record):
+                return self._intent_recovery.recover_pending_launch_locked(
+                    self,
+                    record,
+                    context=context,
+                    probe=probe,
+                    fingerprint=fingerprint,
+                    action=action,
+                    allow_launch=allow_launch,
+                )
+        except (BotDeleteError, LaunchPayloadError) as exc:
+            return self._pending_action_required(record, str(exc))
 
     def _recover_pending_stop_intent_locked(
         self,
@@ -2212,41 +2177,11 @@ class Supervisor:
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse:
-        pid_state = self._pid_state(record.pid) if record.pid else _PidState.dead
-        if pid_state is _PidState.unknown:
-            return self._pending_action_required(record, "gateway PID liveness is unknown")
-        if not record.pid or pid_state is _PidState.dead:
-            observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-            if not self._remove_owned_launch_marker_locked(record, observed=observed):
-                return self._pending_action_required(
-                    record, "stale gateway marker ownership could not be verified"
-                )
-            try:
-                self._complete_stopped_intent(
-                    record,
-                    context=context,
-                    reason="recovery confirmed gateway stopped",
-                )
-            except Exception:
-                return self._pending_action_required(record, "stopped state could not be persisted")
-            return BotStatusResponse(
-                record.bot_id,
-                BotStatus.stopped,
-                None,
-                record.profile_path,
-                "recovered interrupted stop",
-            )
-        if not allow_stop:
-            if not self._pid_owned(record.profile_path, record.pid, record.bot_id):
-                return self._pending_action_required(
-                    record, "gateway ownership could not be verified"
-                )
-            return self._pending_action_required(record, "stop intent is pending reconciliation")
-        return self._stop_record_effect_locked(
+        return self._intent_recovery.recover_pending_stop_intent_locked(
+            self,
             record,
-            kill_after_timeout=None,
             context=context,
-            complete_stop=True,
+            allow_stop=allow_stop,
         )
 
     def _pending_restart_old_marker(
@@ -2254,27 +2189,10 @@ class Supervisor:
         record: BotRecord,
         observed: _MarkerObservation | None = None,
     ) -> _MarkerObservation | None:
-        """Return a strictly verified marker from the generation before a restart intent."""
-        if observed is None:
-            observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-        if observed.kind != "present" or observed.payload is None:
-            return None
-        payload = observed.payload
-        marker_operation = payload.get("operation_id")
-        marker_revision = payload.get("desired_revision")
-        if (
-            type(marker_operation) is not str
-            or marker_operation == record.pending_operation_id
-            or type(marker_revision) is not int
-            or marker_revision != record.desired_revision - 1
-        ):
-            return None
-        return self._classify_schema3_runtime_marker(
+        return self._intent_recovery.pending_restart_old_marker(
+            self,
             record,
-            payload,
-            expected_pid=record.pid,
-            expected_revision=record.desired_revision - 1,
-            require_live_command=True,
+            observed,
         )
 
     def _recover_pending_restart_predecessor(
@@ -2286,61 +2204,11 @@ class Supervisor:
     ) -> BotStatusResponse | None:
         try:
             with self._marker_publication_lock(record):
-                predecessor = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-                if (
-                    record.pid is not None
-                    and predecessor.kind == "present"
-                    and predecessor.payload is not None
-                    and self._is_compat_runtime_marker(predecessor.payload)
-                ):
-                    return self._pending_action_required(
-                        record,
-                        "schema-v2 or legacy gateway restart requires manual process resolution",
-                    )
-                old_marker = self._pending_restart_old_marker(record, predecessor)
-                if old_marker is not None:
-                    return self._recover_pending_restart_old_gateway(
-                        record,
-                        old_marker,
-                        context=context,
-                        allow_stop=allow_stop,
-                    )
-                if record.pid is None or predecessor.kind != "missing":
-                    return None
-                pid_state = self._pid_state(record.pid)
-                if pid_state is _PidState.unknown:
-                    return self._pending_action_required(
-                        record, "previous gateway PID liveness is unknown"
-                    )
-                if pid_state is _PidState.alive:
-                    return self._pending_action_required(
-                        record, "previous gateway marker is missing"
-                    )
-                if not allow_stop:
-                    return self._pending_action_required(
-                        record, "restart intent is pending reconciliation"
-                    )
-                try:
-                    self._update_lifecycle(
-                        context,
-                        record.bot_id,
-                        BotStatus.stopped,
-                        pid=None,
-                        action="bot.restart.old_process_recovered",
-                        stopped_at=datetime.now(UTC),
-                        last_transition_reason=("recovery confirmed the previous gateway stopped"),
-                        clear_ready_at=True,
-                    )
-                except Exception:
-                    return self._pending_action_required(
-                        record, "previous gateway stop could not be persisted"
-                    )
-                return BotStatusResponse(
-                    record.bot_id,
-                    BotStatus.starting,
-                    None,
-                    record.profile_path,
-                    "restart pending: recovered stopped gateway; launch on next reconcile",
+                return self._intent_recovery.recover_pending_restart_predecessor_locked(
+                    self,
+                    record,
+                    context=context,
+                    allow_stop=allow_stop,
                 )
         except (BotDeleteError, LaunchPayloadError) as exc:
             return self._pending_action_required(record, str(exc))
@@ -2353,64 +2221,12 @@ class Supervisor:
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse:
-        if marker.kind == "untrusted":
-            return self._pending_action_required(
-                record,
-                marker.reason or "previous gateway ownership could not be verified",
-            )
-        if not allow_stop:
-            return self._pending_action_required(record, "restart intent is pending reconciliation")
-        generation = self._gateway_generation(marker)
-        if generation is None:
-            return self._pending_action_required(
-                record, "previous gateway marker correlation is invalid"
-            )
-        if marker.kind == "live":
-            if record.pid is None:
-                return self._pending_action_required(record, "previous gateway PID is not recorded")
-            stopped = self._stop_pending_restart_old_gateway(
-                record,
-                generation,
-                context=context,
-            )
-            if stopped.status is not BotStatus.stopped:
-                return stopped
-            return BotStatusResponse(
-                record.bot_id,
-                BotStatus.starting,
-                None,
-                record.profile_path,
-                "restart pending: previous gateway stopped; launch on next reconcile",
-            )
-        if marker.kind != "dead" or marker.payload is None:
-            return self._pending_action_required(
-                record, "previous gateway marker ownership could not be verified"
-            )
-        if not self._remove_gateway_generation_marker_locked(record, generation):
-            return self._pending_action_required(
-                record, "previous gateway marker cleanup could not be verified"
-            )
-        try:
-            self._update_lifecycle(
-                context,
-                record.bot_id,
-                BotStatus.stopped,
-                pid=None,
-                action="bot.restart.old_process_recovered",
-                stopped_at=datetime.now(UTC),
-                last_transition_reason="recovery confirmed the previous gateway stopped",
-                clear_ready_at=True,
-            )
-        except Exception:
-            return self._pending_action_required(
-                record, "previous gateway stop could not be persisted"
-            )
-        return BotStatusResponse(
-            record.bot_id,
-            BotStatus.starting,
-            None,
-            record.profile_path,
-            "restart pending: recovered stopped gateway; launch on next reconcile",
+        return self._intent_recovery.recover_pending_restart_old_gateway(
+            self,
+            record,
+            marker,
+            context=context,
+            allow_stop=allow_stop,
         )
 
     def _stop_pending_restart_old_gateway(
@@ -2420,61 +2236,28 @@ class Supervisor:
         *,
         context: _LifecycleContext,
     ) -> BotStatusResponse:
-        effect = self._runtime.stop_generation_locked(
+        return self._intent_recovery.stop_pending_restart_old_gateway(
+            self,
+            record,
+            generation,
+            context=context,
+        )
+
+    def _stop_gateway_generation_locked(
+        self,
+        record: BotRecord,
+        generation: _GatewayGeneration,
+    ) -> StopEffect:
+        return self._runtime.stop_generation_locked(
             record,
             generation,
             kill_after_timeout=None,
             classify_exact=self._classify_exact_gateway_generation,
             remove_generation=self._remove_gateway_generation_marker_locked,
         )
-        if effect.outcome != "stopped":
-            if effect.kill_result is not None:
-                self.store.append_audit_event(
-                    "bot.stop_kill",
-                    bot_id=record.bot_id,
-                    pid=generation.pid,
-                    succeeded=bool(effect.kill_succeeded),
-                )
-            reasons = {
-                "term_denied": "could not send SIGTERM to the previous gateway",
-                "kill_denied": "could not send SIGKILL to the previous gateway",
-                "grace_expired": ("previous gateway did not stop before the grace period expired"),
-                "cleanup_unverified": ("previous gateway marker cleanup could not be verified"),
-            }
-            return self._pending_action_required(
-                record,
-                reasons.get(effect.outcome, effect.reason),
-            )
-        if effect.kill_result is not None:
-            self.store.append_audit_event(
-                "bot.stop_kill",
-                bot_id=record.bot_id,
-                pid=generation.pid,
-                succeeded=bool(effect.kill_succeeded),
-            )
-        try:
-            self._update_lifecycle(
-                context,
-                record.bot_id,
-                BotStatus.stopped,
-                pid=None,
-                action="bot.restart.old_process_stopped",
-                stopped_at=datetime.now(UTC),
-                last_transition_reason="restart stopped the previous gateway",
-                clear_ready_at=True,
-            )
-        except Exception:
-            return self._pending_action_required(
-                record, "previous gateway stop could not be persisted"
-            )
-        self.store.append_audit_event("bot.stop", bot_id=record.bot_id, pid=generation.pid)
-        return BotStatusResponse(
-            record.bot_id,
-            BotStatus.stopped,
-            None,
-            record.profile_path,
-            "gateway shutdown completed",
-        )
+
+    def _append_recovery_audit_event(self, action: str, **values: object) -> None:
+        self.store.append_audit_event(action, **values)
 
     def _restart_delay(self, record: BotRecord) -> float:
         delay = record.restart_backoff_seconds * (2**record.restart_attempts)
