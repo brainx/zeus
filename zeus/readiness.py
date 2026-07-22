@@ -99,12 +99,10 @@ def probe_once(
                 return ReadinessResult(False, "readiness response has invalid content length")
             if any(length > MAX_READINESS_RESPONSE_BYTES for length in declared_lengths):
                 return ReadinessResult(False, "readiness response exceeds size limit")
-            # HTTPResponse.read(amt) clamps amt to its internal Content-Length. The
-            # connection-close request lets an honest fixed-length response reach EOF,
-            # while clearing this CPython parser field exposes any understated trailing
-            # data to the same bounded MAX + 1 read. Chunk framing remains handled by
-            # HTTPResponse because chunked responses already have length=None.
-            response.length = None
+            # HTTPResponse.read(amt) clamps fixed-length responses to the declared
+            # Content-Length, so valid HTTP/1.1 keep-alive responses return without
+            # waiting for EOF. Responses without a fixed length remain bounded by amt;
+            # chunk framing is handled by HTTPResponse.
             body = response.read(MAX_READINESS_RESPONSE_BYTES + 1)
         if len(body) > MAX_READINESS_RESPONSE_BYTES:
             return ReadinessResult(False, "readiness response exceeds size limit")

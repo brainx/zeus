@@ -146,6 +146,36 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual("ready", result.message)
         self.assertEqual(_HealthHandler.payload, result.payload)
 
+    def test_probe_once_accepts_fixed_length_http_11_response_without_eof(self) -> None:
+        health_payload = json.dumps(_HealthHandler.payload).encode("utf-8")
+        release_connection = threading.Event()
+
+        class KeepAliveFixedLengthHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                self.request.recv(4096)
+                self.request.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(health_payload)}\r\n".encode("ascii")
+                    + b"Connection: keep-alive\r\n\r\n"
+                    + health_payload
+                )
+                release_connection.wait(1)
+
+        server, _thread = self._run_raw_server(KeepAliveFixedLengthHandler)
+
+        try:
+            result = probe_once(
+                f"http://127.0.0.1:{server.server_address[1]}/health",
+                timeout_seconds=0.2,
+            )
+        finally:
+            release_connection.set()
+
+        self.assertTrue(result.ready)
+        self.assertEqual("ready", result.message)
+        self.assertEqual(_HealthHandler.payload, result.payload)
+
     def test_probe_once_accepts_chunked_health_payload(self) -> None:
         class ChunkedHandler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -283,28 +313,28 @@ class ReadinessTests(unittest.TestCase):
                 self.assertEqual("readiness response exceeds size limit", result.message)
                 self.assertIsNone(result.payload)
 
-    def test_probe_once_rejects_trailing_data_after_false_low_content_length(self) -> None:
+    def test_probe_once_does_not_read_past_fixed_content_length(self) -> None:
         health_payload = json.dumps(_HealthHandler.payload).encode("utf-8")
-        oversized_body = health_payload + b" " * MAX_READINESS_RESPONSE_BYTES
+        connection_data = health_payload + b" " * MAX_READINESS_RESPONSE_BYTES
 
-        class FalseLowContentLengthHandler(BaseHTTPRequestHandler):
+        class FixedLengthWithTrailingConnectionDataHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 self.send_response(200)
                 self.send_header("content-length", str(len(health_payload)))
                 self.end_headers()
                 with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                    self.wfile.write(oversized_body)
+                    self.wfile.write(connection_data)
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
-        server, _thread = self._run_server(FalseLowContentLengthHandler)
+        server, _thread = self._run_server(FixedLengthWithTrailingConnectionDataHandler)
 
         result = probe_once(f"http://127.0.0.1:{server.server_port}/health")
 
-        self.assertFalse(result.ready)
-        self.assertEqual("readiness response exceeds size limit", result.message)
-        self.assertIsNone(result.payload)
+        self.assertTrue(result.ready)
+        self.assertEqual("ready", result.message)
+        self.assertEqual(_HealthHandler.payload, result.payload)
 
     def test_probe_once_requests_exactly_one_max_plus_one_bounded_read(self) -> None:
         class TrackingResponse:
