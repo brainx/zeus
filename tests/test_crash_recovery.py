@@ -3433,7 +3433,14 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired("hermes", timeout)
 
         with tempfile.TemporaryDirectory() as tmp:
-            fingerprints = iter(["test-start:4321", "test-start:4321", "test-start:reused"])
+            fingerprints = iter(
+                [
+                    "test-start:4321",
+                    "test-start:4321",
+                    "test-start:4321",
+                    "test-start:reused",
+                ]
+            )
             store, supervisor = self._fixture(
                 Path(tmp),
                 desired=DesiredState.running,
