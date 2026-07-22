@@ -69,6 +69,12 @@ class SignalResult(Enum):
 
 
 _MAX_EFFECT_TEXT = 512
+_TRANSIENT_POST_EXEC_MARKER_REASONS = frozenset(
+    {
+        "live gateway command is unavailable",
+        "process start fingerprint is unavailable",
+    }
+)
 
 
 def _bounded_text(value: str) -> str:
@@ -359,6 +365,7 @@ class GatewayRuntime:
         expected_fingerprint = str(marker_data["command_fingerprint"])
         process: PopenLike | None = None
         generation: GatewayGeneration | None = None
+        marker_acknowledged = False
         payload_read = payload_write = ack_read = ack_write = -1
         hooks = self._hooks()
         marker_lock = marker_lock or self.marker_publication_lock
@@ -399,18 +406,28 @@ class GatewayRuntime:
             ack_read = -1
             if acknowledgment != b"1":
                 raise RuntimeError("gateway launcher did not acknowledge marker publication")
+            marker_acknowledged = True
             with marker_lock(record):
-                marker = marker_matcher(
-                    record,
-                    expected_fingerprint=expected_fingerprint,
-                    expected_pid=process.pid,
-                    require_live_command=True,
-                )
-                generation = self.gateway_generation(marker)
-                if marker.kind != "live" or generation is None:
-                    raise RuntimeError(
-                        "gateway launcher ownership marker could not be verified: " + marker.reason
+                registration_deadline = time.monotonic() + max(self.startup_grace_seconds, 0)
+                while True:
+                    marker = marker_matcher(
+                        record,
+                        expected_fingerprint=expected_fingerprint,
+                        expected_pid=process.pid,
+                        require_live_command=True,
                     )
+                    generation = self.gateway_generation(marker)
+                    if marker.kind == "live" and generation is not None:
+                        break
+                    if process.poll() is not None:
+                        raise RuntimeError("gateway process exited before marker registration")
+                    remaining = registration_deadline - time.monotonic()
+                    if marker.reason not in _TRANSIENT_POST_EXEC_MARKER_REASONS or remaining <= 0:
+                        raise RuntimeError(
+                            "gateway launcher ownership marker could not be verified: "
+                            + marker.reason
+                        )
+                    time.sleep(min(0.01, remaining))
             self._processes[record.bot_id] = process
         except BaseException as exc:
             for fd in (payload_read, payload_write, ack_read, ack_write):
@@ -426,6 +443,7 @@ class GatewayRuntime:
                     reason=str(exc),
                     error_type=type(exc).__name__,
                 )
+            returncode = process.poll()
             cleanup_complete = self.cleanup_interrupted_launch(
                 record,
                 process,
@@ -433,6 +451,23 @@ class GatewayRuntime:
             )
             if not isinstance(exc, Exception):
                 raise
+            if marker_acknowledged and returncode is not None and cleanup_complete:
+                if generation is None:
+                    generation = GatewayGeneration(
+                        operation_id=operation_id,
+                        desired_revision=record.desired_revision,
+                        pid=process.pid,
+                        command_fingerprint=expected_fingerprint,
+                        proc_start_fingerprint=None,
+                    )
+                return LaunchEffect(
+                    "startup_exited",
+                    pid=process.pid,
+                    generation=generation,
+                    reason="gateway exited during startup grace period",
+                    returncode=returncode,
+                    cleanup_complete=True,
+                )
             return LaunchEffect(
                 "registration_failed_clean" if cleanup_complete else "registration_failed_unknown",
                 pid=None if cleanup_complete else process.pid,

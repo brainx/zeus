@@ -63,6 +63,7 @@ class GatewayRuntimeTests(unittest.TestCase):
         fingerprints: list[str | None] | None = None,
         signals: list[tuple[int, signal.Signals]] | None = None,
         popen_factory=None,
+        startup_grace_seconds: float = 0.0,
         stop_grace_seconds: float = 0.0,
         kill_after_timeout: bool = False,
     ) -> tuple[GatewayRuntime, BotRecord, Path, str]:
@@ -92,7 +93,7 @@ class GatewayRuntimeTests(unittest.TestCase):
             pid_alive_fn=lambda pid: True,
             cmdline_reader=lambda pid: [hermes, "-p", self.bot_id, "gateway", "run"],
             proc_start_fingerprint_reader=read_fingerprint,
-            startup_grace_seconds=0,
+            startup_grace_seconds=startup_grace_seconds,
             stop_grace_seconds=stop_grace_seconds,
             kill_after_timeout=kill_after_timeout,
             cleanup_process_group=False,
@@ -236,6 +237,145 @@ class GatewayRuntimeTests(unittest.TestCase):
             self.assertNotIn(secret, marker_text)
             self.assertNotIn(secret, repr(effect))
             self.assertNotIn(secret, json.dumps(vars(effect), default=str, sort_keys=True))
+
+    def test_launch_reports_exit_when_acknowledged_marker_process_is_already_dead(self) -> None:
+        class ExitedAfterAcknowledgment:
+            pid = self.pid
+
+            def poll(self) -> int:
+                return 42
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, record, profile, _hermes = self._fixture(
+                Path(tmp),
+                popen_factory=lambda *args, **kwargs: ExitedAfterAcknowledgment(),
+            )
+            launching = dataclasses.replace(
+                record,
+                status=BotStatus.starting,
+                pid=None,
+                desired_state=DesiredState.running,
+                desired_revision=1,
+                pending_operation_id=self.operation_id,
+                pending_action="start",
+            )
+            marker, generation = self._schema3_marker(
+                runtime,
+                profile,
+                operation_id=self.operation_id,
+                desired_revision=launching.desired_revision,
+            )
+
+            effect = runtime.launch(
+                launching,
+                probe=None,
+                wait=False,
+                marker_matcher=lambda *args, **kwargs: MarkerObservation(
+                    "dead", payload=marker, reason="marker PID is dead"
+                ),
+                ack_reader=lambda fd: b"1",
+                pipe_writer=lambda fd, payload: None,
+            )
+
+            self.assertEqual("startup_exited", effect.outcome)
+            self.assertEqual(self.pid, effect.pid)
+            self.assertEqual(generation, effect.generation)
+            self.assertEqual(42, effect.returncode)
+            self.assertFalse(runtime.pid_marker_path(str(profile)).exists())
+
+    def test_launch_reports_exit_when_acknowledged_process_identity_disappears(self) -> None:
+        class ExitedAfterAcknowledgment:
+            pid = self.pid
+
+            def poll(self) -> int:
+                return 42
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, record, profile, _hermes = self._fixture(
+                Path(tmp),
+                popen_factory=lambda *args, **kwargs: ExitedAfterAcknowledgment(),
+            )
+            launching = dataclasses.replace(
+                record,
+                status=BotStatus.starting,
+                pid=None,
+                desired_state=DesiredState.running,
+                desired_revision=1,
+                pending_operation_id=self.operation_id,
+                pending_action="start",
+            )
+            self._schema3_marker(
+                runtime,
+                profile,
+                operation_id=self.operation_id,
+                desired_revision=launching.desired_revision,
+            )
+
+            effect = runtime.launch(
+                launching,
+                probe=None,
+                wait=False,
+                marker_matcher=lambda *args, **kwargs: MarkerObservation(
+                    "untrusted", reason="process start fingerprint is unavailable"
+                ),
+                ack_reader=lambda fd: b"1",
+                pipe_writer=lambda fd, payload: None,
+            )
+
+            self.assertEqual("startup_exited", effect.outcome)
+            self.assertEqual(self.pid, effect.pid)
+            self.assertIsNotNone(effect.generation)
+            self.assertEqual(42, effect.returncode)
+            self.assertFalse(runtime.pid_marker_path(str(profile)).exists())
+
+    def test_launch_retries_transient_post_exec_identity_before_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, record, profile, _hermes = self._fixture(
+                Path(tmp),
+                startup_grace_seconds=0.1,
+            )
+            launching = dataclasses.replace(
+                record,
+                status=BotStatus.starting,
+                pid=None,
+                desired_state=DesiredState.running,
+                desired_revision=1,
+                pending_operation_id=self.operation_id,
+                pending_action="start",
+            )
+            marker, generation = self._schema3_marker(
+                runtime,
+                profile,
+                operation_id=self.operation_id,
+                desired_revision=launching.desired_revision,
+            )
+            observations = iter(
+                (
+                    MarkerObservation(
+                        "untrusted", reason="process start fingerprint is unavailable"
+                    ),
+                    MarkerObservation("live", payload=marker),
+                )
+            )
+            calls = 0
+
+            def marker_matcher(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                return next(observations)
+
+            effect = runtime.launch(
+                launching,
+                probe=None,
+                wait=False,
+                marker_matcher=marker_matcher,
+                ack_reader=lambda fd: b"1",
+                pipe_writer=lambda fd, payload: None,
+            )
+
+            self.assertEqual("running", effect.outcome)
+            self.assertEqual(generation, effect.generation)
+            self.assertEqual(2, calls)
 
     def test_exact_generation_rejects_changed_correlation_and_process_identity(self) -> None:
         mutations = {
