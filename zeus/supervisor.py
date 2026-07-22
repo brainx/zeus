@@ -8,7 +8,6 @@ import os
 import platform
 import re
 import select
-import shutil
 import signal
 import stat
 import subprocess  # nosec B404
@@ -71,6 +70,7 @@ from zeus.models import (
 )
 from zeus.private_io import UnsafeFileError, nofollow_absolute_path, open_private_append
 from zeus.process_lock import BotProcessLock, LockTimeoutError
+from zeus.profile_manager import ProfileArchive, ProfileDeletion, ProfileManager
 from zeus.readiness import ReadinessProbe, ReadinessResult, probe_once, readiness_probe_from_env
 from zeus.reconciliation import (
     BotReconcileResult,
@@ -81,7 +81,6 @@ from zeus.reconciliation import (
     ReconcileRunSummary,
     ReconcileSnapshotDriftError,
 )
-from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
 
 
@@ -205,6 +204,10 @@ class Supervisor:
         self.adapter = HermesAdapter(
             hermes_bin=hermes_bin,
             hermes_root=configured_hermes_root.resolve(),
+        )
+        self._profile_manager = ProfileManager(
+            self.adapter.hermes_root,
+            self.store.database_path.parent / "archive",
         )
         self._marker_profiles_root = configured_hermes_root / "profiles"
         self.popen_factory = popen_factory
@@ -411,8 +414,7 @@ class Supervisor:
                     )
                 self._assert_unregistered_profile_inactive(bot_id, profile_path)
 
-            renderer = ProfileRenderer(self.adapter.hermes_root)
-            renderer.preflight(request, template)
+            self._profile_manager.preflight(request, template)
             stopped_record: BotRecord | None = None
             if existing is not None:
                 active = self._record_may_be_active(existing)
@@ -423,7 +425,7 @@ class Supervisor:
                     stopped_record = existing
 
             try:
-                with renderer.transaction(request, template) as record:
+                with self._profile_manager.install_transaction(request, template) as record:
                     self._remove_pid_marker(record.profile_path)
                     self.store.upsert_bot_with_event(
                         record,
@@ -475,10 +477,10 @@ class Supervisor:
                 stopped = self._stop_locked(safe_bot_id, context=context)
                 if stopped.status != BotStatus.stopped:
                     raise BotDeleteError(f"could not stop bot before delete: {stopped.message}")
-            profile_tombstone: Path | None = None
+            profile_deletion: ProfileDeletion | None = None
             try:
                 if remove_profile:
-                    profile_tombstone = self._stage_profile_deletion(
+                    profile_deletion = self._profile_manager.stage_delete(
                         safe_bot_id, record.profile_path
                     )
                 else:
@@ -495,11 +497,12 @@ class Supervisor:
                 )
                 if not deleted:
                     raise KeyError(f"unknown bot: {safe_bot_id}")
-            except BaseException:
-                if profile_tombstone is not None:
-                    self._restore_tombstoned_profile(
-                        safe_bot_id, record.profile_path, profile_tombstone
-                    )
+            except BaseException as operation_error:
+                if profile_deletion is not None:
+                    try:
+                        self._profile_manager.rollback_delete(profile_deletion)
+                    except BotDeleteError as rollback_error:
+                        raise rollback_error from operation_error
                 if was_active:
                     try:
                         self._recover_previously_active_bot(record, "deletion", context=context)
@@ -509,15 +512,14 @@ class Supervisor:
                         ) from recovery_error
                 raise
             cleanup_pending = False
-            if profile_tombstone is not None:
-                try:
-                    shutil.rmtree(profile_tombstone)
-                except OSError as exc:
+            if profile_deletion is not None:
+                cleanup_error = self._profile_manager.finish_delete(profile_deletion)
+                if cleanup_error is not None:
                     cleanup_pending = True
                     self.store.append_audit_event(
                         "bot.delete_cleanup_pending",
                         bot_id=safe_bot_id,
-                        error=type(exc).__name__,
+                        error=type(cleanup_error).__name__,
                     )
             self.store.append_audit_event(
                 "bot.delete",
@@ -557,16 +559,9 @@ class Supervisor:
                 if stopped.status != BotStatus.stopped:
                     raise BotArchiveError(f"could not stop bot before archive: {stopped.message}")
 
-            archive_path: Path | None = None
+            profile_archive: ProfileArchive | None = None
             try:
-                if profile_path.exists():
-                    archive_root = self.store.database_path.parent / "archive"
-                    archive_root.mkdir(parents=True, exist_ok=True)
-                    candidate = archive_root / (
-                        f"{safe_bot_id}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
-                    )
-                    shutil.move(str(profile_path), str(candidate))
-                    archive_path = candidate
+                profile_archive = self._profile_manager.stage_archive(safe_bot_id, profile_path)
                 deleted = self.store.delete_bot_with_event(
                     safe_bot_id,
                     event=self._event(
@@ -578,9 +573,12 @@ class Supervisor:
                 )
                 if not deleted:
                     raise KeyError(f"unknown bot: {safe_bot_id}")
-            except BaseException:
-                if archive_path is not None:
-                    self._restore_archived_profile(safe_bot_id, record.profile_path, archive_path)
+            except BaseException as operation_error:
+                if profile_archive is not None:
+                    try:
+                        self._profile_manager.rollback_archive(profile_archive)
+                    except BotArchiveError as rollback_error:
+                        raise rollback_error from operation_error
                 if was_active:
                     try:
                         self._recover_previously_active_bot(record, "archive", context=context)
@@ -589,6 +587,7 @@ class Supervisor:
                             "bot archive failed and the previous bot could not be restarted"
                         ) from recovery_error
                 raise
+            archive_path = profile_archive.archive_path if profile_archive is not None else None
             self.store.append_audit_event(
                 "bot.archive",
                 bot_id=safe_bot_id,
@@ -3156,27 +3155,13 @@ class Supervisor:
             )
 
     def _safe_profile_path(self, bot_id: str, profile_path: str) -> Path:
-        safe_bot_id = validate_id(bot_id, "bot_id")
-        profile = Path(profile_path).resolve()
-        profiles_root = (Path(self.adapter.hermes_root) / "profiles").resolve()
-        try:
-            relative = profile.relative_to(profiles_root)
-        except ValueError as exc:
-            raise BotDeleteError("bot profile path is outside the Hermes profiles root") from exc
-        if len(relative.parts) != 1 or relative.parts[0] != safe_bot_id:
-            raise BotDeleteError("bot profile path does not match bot id")
-        return profile
+        return self._profile_manager.validate_profile_path(bot_id, profile_path)
 
     def _stage_profile_deletion(self, bot_id: str, profile_path: str) -> Path | None:
-        profile = self._safe_profile_path(bot_id, profile_path)
-        if not profile.exists():
+        deletion = self._profile_manager.stage_delete(bot_id, profile_path)
+        if deletion is None:
             return None
-        tombstone = profile.with_name(f".{profile.name}.deleting-{os.getpid()}-{time.time_ns()}")
-        try:
-            os.replace(profile, tombstone)
-        except OSError as exc:
-            raise BotDeleteError("could not stage the bot profile for deletion") from exc
-        return tombstone
+        return deletion.tombstone_path
 
     def _restore_tombstoned_profile(
         self,
@@ -3184,18 +3169,13 @@ class Supervisor:
         profile_path: str,
         tombstone: Path,
     ) -> None:
-        profile = self._safe_profile_path(bot_id, profile_path)
-        if profile.exists() or profile.is_symlink():
-            raise BotDeleteError(
-                "bot state deletion failed and the profile could not be restored because "
-                "its original path is occupied"
+        profile = self._profile_manager._pin_profile_path(bot_id, profile_path)
+        self._profile_manager.rollback_delete(
+            ProfileDeletion(
+                profile_path=profile,
+                tombstone_path=tombstone,
             )
-        try:
-            os.replace(tombstone, profile)
-        except OSError as exc:
-            raise BotDeleteError(
-                "bot state deletion failed and the profile could not be restored"
-            ) from exc
+        )
 
     def _restore_archived_profile(
         self,
@@ -3203,18 +3183,13 @@ class Supervisor:
         profile_path: str,
         archive_path: Path,
     ) -> None:
-        profile = self._safe_profile_path(bot_id, profile_path)
-        if profile.exists() or profile.is_symlink():
-            raise BotArchiveError(
-                "bot state deletion failed and the archived profile could not be restored "
-                "because its original path is occupied"
+        profile = self._profile_manager._pin_profile_path(bot_id, profile_path)
+        self._profile_manager.rollback_archive(
+            ProfileArchive(
+                profile_path=profile,
+                archive_path=archive_path,
             )
-        try:
-            shutil.move(str(archive_path), str(profile))
-        except OSError as exc:
-            raise BotArchiveError(
-                "bot state deletion failed and the archived profile could not be restored"
-            ) from exc
+        )
 
     def _readiness_probe_for_bot(
         self, bot_id: str, *, timeout_seconds: float | None = None
