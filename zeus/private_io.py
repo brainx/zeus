@@ -29,7 +29,9 @@ _REQUIRED_FUNCTIONS = (
 )
 _OPEN_DIR_FD_PROBE = os.open
 _MKDIR_DIR_FD_PROBE = os.mkdir
-_LSTAT_DIR_FD_PROBE = os.lstat
+# CPython advertises descriptor-relative lstat through os.stat on Linux even
+# though os.lstat itself accepts dir_fd. Actual inspections still use lstat.
+_LSTAT_DIR_FD_PROBE = os.stat
 
 
 class UnsafeFileError(OSError):

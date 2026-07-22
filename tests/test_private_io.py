@@ -223,6 +223,16 @@ class PrivateIOTests(unittest.TestCase):
 
         self.assertFalse(path.parent.exists())
 
+    def test_linux_stat_capability_advertises_descriptor_relative_lstat(self) -> None:
+        path = self.root / "private"
+        linux_capabilities = frozenset({os.open, os.mkdir, os.stat})
+
+        with patch.object(private_io.os, "supports_dir_fd", linux_capabilities):
+            ensure_private_directory(path)
+
+        self.assertTrue(path.is_dir())
+        self.assertEqual(0o700, stat.S_IMODE(path.stat().st_mode))
+
     def test_validate_private_directory_requires_existing_directory(self) -> None:
         path = self.root / "missing"
 
