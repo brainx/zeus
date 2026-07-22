@@ -147,8 +147,25 @@ class FreshVPSVerifierTests(unittest.TestCase):
         bootstrap_bin.mkdir()
         for name in ("curl", "sh"):
             (bootstrap_bin / name).symlink_to(self.stub_bin / name)
-        for name in ("dirname", "env", "seq", "tee", "uname"):
-            (bootstrap_bin / name).symlink_to(Path("/usr/bin") / name)
+        for name in (
+            "bash",
+            "cat",
+            "chmod",
+            "date",
+            "dirname",
+            "env",
+            "ln",
+            "mkdir",
+            "rm",
+            "seq",
+            "sleep",
+            "tee",
+            "uname",
+        ):
+            executable = shutil.which(name)
+            if executable is None:
+                self.fail(f"required fixture executable is unavailable: {name}")
+            (bootstrap_bin / name).symlink_to(executable)
 
         sudo = bootstrap_bin / "sudo"
         sudo.write_text('#!/bin/bash\nset -eu\nexec "$@"\n', encoding="utf-8")
@@ -170,7 +187,7 @@ class FreshVPSVerifierTests(unittest.TestCase):
             encoding="utf-8",
         )
         apt_get.chmod(0o700)
-        return f"{bootstrap_bin}:/bin"
+        return str(bootstrap_bin)
 
     def _run(
         self,
@@ -218,6 +235,12 @@ class FreshVPSVerifierTests(unittest.TestCase):
         self.assertIn("ZEUS_VPS_HERMES_INSTALLER_SHA256", result.stdout + result.stderr)
         self.assertFalse(self.installer_executed.exists())
         self.assertFalse(any(INSTALLER_URL in record["argv"] for record in self._curl_records()))
+
+    def test_pythonless_bootstrap_path_contains_only_explicit_stubs(self) -> None:
+        bootstrap_path = self._pythonless_bootstrap_path()
+
+        self.assertEqual([str(self.root / "bootstrap-bin")], bootstrap_path.split(os.pathsep))
+        self.assertIsNone(shutil.which("python3", path=bootstrap_path))
 
     def test_missing_python_is_bootstrapped_before_private_evidence(self) -> None:
         bootstrap_path = self._pythonless_bootstrap_path()
