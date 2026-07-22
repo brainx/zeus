@@ -35,6 +35,21 @@ markers, locks, or the best-effort audit JSONL atomic with the database, replace
 backups, or overcome storage that lies about flushes. Continue the backup and
 restore procedures below under either mode.
 
+## API Liveness and Readiness
+
+Use `GET /health` for public process liveness. It does not authenticate or touch
+SQLite, so it can remain healthy while persistent state is unavailable.
+
+Use `GET /ready` (or `GET /v1/ready`) for load-balancer and service readiness.
+This ordinary read endpoint requires `x-zeus-api-key`, except on a loopback bind
+when `ZEUS_ALLOW_UNAUTH_READS=1` is explicitly enabled. It opens the existing
+database read-only, requires the current schema version, and runs `SELECT 1`.
+It never creates or migrates a database and does not require bots to be running.
+
+A ready service returns `{"schema_version":6,"status":"ready"}`. State-store
+failures return `503` with `error.code=not_ready`. If state initialization fails
+before the API binds, the process exits instead of serving `/ready`.
+
 ## Backup
 
 Back up `ZEUS_STATE_DIR` regularly. For the sample systemd deployment, that is

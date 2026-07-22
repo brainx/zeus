@@ -33,7 +33,7 @@ from zeus.reconciliation import (
     ReconcileOutcome,
     ReconcileRunSummary,
 )
-from zeus.state import StateStore
+from zeus.state import SCHEMA_VERSION, StateReadinessError, StateStore
 
 JsonPayload = dict[str, Any] | list[Any]
 
@@ -154,6 +154,28 @@ def raw_http_response(
         conn.close()
 
 
+def raw_http_exchange(
+    port: int,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        response = conn.getresponse()
+        response_body = response.read()
+        return (
+            response.status,
+            {name.lower(): value for name, value in response.getheaders()},
+            response_body,
+        )
+    finally:
+        conn.close()
+
+
 def json_request_body(payload: JsonPayload) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
@@ -237,6 +259,136 @@ def raw_post_without_content_length(port: int, body: bytes) -> tuple[int, dict[s
 
 
 class ApiBehaviorTests(unittest.TestCase):
+    def test_health_exact_bytes_are_public_and_never_probe_readiness(self) -> None:
+        with (
+            patch.object(
+                StateStore,
+                "check_readiness",
+                side_effect=AssertionError("health must not probe state"),
+            ) as readiness,
+            api_server_with_state() as (port, state_dir),
+        ):
+            exchanges = [raw_http_exchange(port, "GET", path) for path in ("/health", "/v1/health")]
+            rows = wait_for_access_rows(state_dir, 2)
+
+        for status, headers, body in exchanges:
+            self.assertEqual(200, status)
+            self.assertEqual(b'{"status": "ok"}', body)
+            self.assertEqual("application/json", headers["content-type"])
+            self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+        readiness.assert_not_called()
+        self.assertEqual(["/health", "/health"], [row["route"] for row in rows])
+        self.assertEqual(["not_required", "not_required"], [row["auth_outcome"] for row in rows])
+
+    def test_readiness_auth_query_alias_and_override_contract(self) -> None:
+        with patch.object(StateStore, "check_readiness", return_value=SCHEMA_VERSION) as readiness:
+            with api_server() as port:
+                missing_config_status, _ = request_json(port, "GET", "/ready")
+            self.assertEqual(503, missing_config_status)
+            readiness.assert_not_called()
+
+            configured = {
+                "ZEUS_API_KEY": "secret",
+                "ZEUS_API_AUTH_FAILURE_RATE_PER_MINUTE": "1",
+                "ZEUS_API_AUTH_FAILURE_BURST": "2",
+            }
+            with api_server(configured) as port:
+                missing_status, _ = request_json(port, "GET", "/ready")
+                wrong_status, _ = request_json(
+                    port,
+                    "GET",
+                    "/ready",
+                    headers={"x-zeus-api-key": "wrong"},
+                )
+                limited_status, limited_headers, limited_body = request_json_with_headers(
+                    port,
+                    "GET",
+                    "/ready",
+                    headers={"x-zeus-api-key": "wrong"},
+                )
+                query_status, query_body = request_json(
+                    port,
+                    "GET",
+                    "/ready?debug=1",
+                    headers={"x-zeus-api-key": "secret"},
+                )
+                ready_status, ready_headers, ready_body = raw_http_exchange(
+                    port,
+                    "GET",
+                    "/ready",
+                    headers={"x-zeus-api-key": "secret"},
+                )
+                alias_status, _alias_headers, alias_body = raw_http_exchange(
+                    port,
+                    "GET",
+                    "/v1/ready",
+                    headers={"x-zeus-api-key": "secret"},
+                )
+
+            self.assertEqual((401, 401, 429), (missing_status, wrong_status, limited_status))
+            self.assertEqual("auth_rate_limited", limited_body["error"]["code"])
+            self.assertGreaterEqual(int(limited_headers["retry-after"]), 1)
+            self.assertEqual(400, query_status)
+            self.assertEqual("invalid_request", query_body["error"]["code"])
+            expected = b'{"schema_version": 6, "status": "ready"}'
+            self.assertEqual((200, expected), (ready_status, ready_body))
+            self.assertEqual((200, expected), (alias_status, alias_body))
+            self.assertRegex(ready_headers["x-request-id"], r"^[0-9a-f]{32}$")
+            self.assertEqual(2, readiness.call_count)
+
+            with api_server({"ZEUS_ALLOW_UNAUTH_READS": "1"}) as port:
+                override_status, override_body = request_json(port, "GET", "/ready")
+            self.assertEqual(200, override_status)
+            self.assertEqual({"schema_version": SCHEMA_VERSION, "status": "ready"}, override_body)
+            self.assertEqual(3, readiness.call_count)
+
+    def test_readiness_expected_failure_is_sanitized_and_not_logged_as_exception(self) -> None:
+        with (
+            patch.object(
+                StateStore,
+                "check_readiness",
+                side_effect=StateReadinessError("private sqlite detail"),
+            ),
+            api_server_with_state({"ZEUS_API_KEY": "secret"}) as (port, state_dir),
+        ):
+            status, headers, body = raw_http_exchange(
+                port,
+                "GET",
+                "/ready",
+                headers={"x-zeus-api-key": "secret"},
+            )
+            rows = wait_for_access_rows(state_dir, 1)
+
+        self.assertEqual(503, status)
+        self.assertEqual(
+            b'{"error": {"code": "not_ready", '
+            b'"message": "state store is not ready", "status": 503}}',
+            body,
+        )
+        self.assertNotIn("retry-after", headers)
+        self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(["api.access"], [row["event"] for row in rows])
+        self.assertEqual("/ready", rows[0]["route"])
+        self.assertEqual("not_ready", rows[0]["error_code"])
+        self.assertNotIn("private sqlite detail", json.dumps(rows))
+
+    def test_readiness_aliases_probe_the_real_current_store(self) -> None:
+        with api_server({"ZEUS_API_KEY": "secret"}) as port:
+            responses = [
+                raw_http_exchange(
+                    port,
+                    "GET",
+                    path,
+                    headers={"x-zeus-api-key": "secret"},
+                )
+                for path in ("/ready", "/v1/ready")
+            ]
+
+        for status, headers, body in responses:
+            self.assertEqual(200, status)
+            self.assertEqual(b'{"schema_version": 6, "status": "ready"}', body)
+            self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+
     def test_exception_status_payload_and_header_contracts(self) -> None:
         cases = (
             (

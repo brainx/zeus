@@ -108,6 +108,8 @@ class ApiLoggingTests(unittest.TestCase):
     def test_route_templates_hide_bot_ids_and_normalize_v1(self) -> None:
         self.assertEqual("/bots/{bot_id}/start", route_template("/v1/bots/secret-bot/start"))
         self.assertEqual("/bots/{bot_id}/history", route_template("/v1/bots/secret-bot/history"))
+        self.assertEqual("/ready", route_template("/ready"))
+        self.assertEqual("/ready", route_template("/v1/ready"))
         self.assertIsNone(route_template("/not-a-route"))
 
     def test_api_log_writer_writes_parseable_redacted_lines(self) -> None:

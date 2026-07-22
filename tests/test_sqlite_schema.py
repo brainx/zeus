@@ -11,7 +11,8 @@ from unittest.mock import MagicMock, call, patch
 
 from zeus.config import SQLiteSynchronous
 from zeus.schema import SCHEMA_VERSION, SchemaManager, _preflight_schema_compatibility
-from zeus.sqlite_db import SQLiteDatabase
+from zeus.sqlite_db import SQLiteDatabase, StateReadinessError
+from zeus.state import StateReadinessError as FacadeStateReadinessError
 from zeus.state import StateStore
 
 _ORIGINAL_SQLITE_CONNECT = sqlite3.connect
@@ -577,6 +578,120 @@ class _TracingSQLiteDatabase(SQLiteDatabase):
 
 
 class SQLiteSchemaTests(unittest.TestCase):
+    def test_readiness_uses_one_read_only_connection_and_exact_current_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "zeus.db"
+            StateStore(database_path).init()
+            database = SQLiteDatabase(database_path, synchronous=SQLiteSynchronous.FULL)
+            expected_uri = f"{database_path.resolve().as_uri()}?mode=ro"
+            calls: list[tuple[object, bool]] = []
+            traces: list[str] = []
+            real_connect = sqlite3.connect
+
+            def connect_spy(*args: object, **kwargs: object) -> sqlite3.Connection:
+                calls.append((args[0], bool(kwargs.get("uri", False))))
+                conn = real_connect(*args, **kwargs)
+                conn.set_trace_callback(traces.append)
+                return conn
+
+            with patch("zeus.sqlite_db.sqlite3.connect", side_effect=connect_spy):
+                version = database.check_readiness()
+
+        self.assertEqual(SCHEMA_VERSION, version)
+        self.assertEqual([(expected_uri, True)], calls)
+        self.assertEqual(
+            [
+                statement
+                for statement in traces
+                if "sqlite_master" in statement
+                or "schema_version" in statement
+                or statement == "SELECT 1"
+            ],
+            traces,
+        )
+        self.assertEqual("SELECT 1", traces[-1])
+        self.assertFalse(
+            any(statement.lstrip().upper().startswith("PRAGMA") for statement in traces)
+        )
+
+    def test_readiness_rejects_missing_malformed_old_and_new_state_without_writes(self) -> None:
+        cases = (
+            "missing",
+            "missing_table",
+            "empty",
+            "malformed_text",
+            "malformed_real",
+            "old",
+            "new",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in cases:
+                with self.subTest(case=case):
+                    database_path = root / case / "zeus.db"
+                    if case != "missing":
+                        database_path.parent.mkdir(parents=True)
+                        with closing(sqlite3.connect(database_path)) as conn:
+                            if case != "missing_table":
+                                conn.execute("CREATE TABLE schema_version (version)")
+                            if case == "malformed_text":
+                                conn.execute("INSERT INTO schema_version VALUES ('six')")
+                            elif case == "malformed_real":
+                                conn.execute("INSERT INTO schema_version VALUES (6.5)")
+                            elif case == "old":
+                                conn.execute(
+                                    "INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION - 1,)
+                                )
+                            elif case == "new":
+                                conn.execute(
+                                    "INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION + 1,)
+                                )
+                            conn.commit()
+                    parent_existed = database_path.parent.exists()
+                    before = _database_snapshot(database_path) if database_path.exists() else None
+
+                    with self.assertRaisesRegex(StateReadinessError, "state store is not ready"):
+                        SQLiteDatabase(database_path).check_readiness()
+
+                    self.assertEqual(parent_existed, database_path.parent.exists())
+                    self.assertEqual(
+                        before,
+                        _database_snapshot(database_path) if database_path.exists() else None,
+                    )
+                    if case == "missing":
+                        self.assertFalse(database_path.exists())
+
+    def test_readiness_normalizes_operational_error_closes_connection_and_chains_cause(
+        self,
+    ) -> None:
+        connection = MagicMock(spec=sqlite3.Connection)
+        connection.row_factory = None
+        connection.execute.side_effect = [
+            MagicMock(fetchone=MagicMock(return_value=(1,))),
+            MagicMock(fetchone=MagicMock(return_value={"version": SCHEMA_VERSION})),
+            sqlite3.OperationalError("injected readiness failure"),
+        ]
+        with (
+            patch("zeus.sqlite_db.sqlite3.connect", return_value=connection),
+            self.assertRaises(StateReadinessError) as raised,
+        ):
+            SQLiteDatabase("state/zeus.db").check_readiness()
+
+        self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+        self.assertEqual("state store is not ready", str(raised.exception))
+        connection.close.assert_called_once_with()
+
+    def test_state_store_readiness_wrapper_and_error_reexport(self) -> None:
+        database = MagicMock(spec=SQLiteDatabase)
+        database.check_readiness.return_value = SCHEMA_VERSION
+        with patch("zeus.state.SQLiteDatabase", return_value=database):
+            store = StateStore("state/zeus.db")
+            result = store.check_readiness()
+
+        self.assertIs(StateReadinessError, FacadeStateReadinessError)
+        self.assertEqual(SCHEMA_VERSION, result)
+        database.check_readiness.assert_called_once_with()
+
     def test_new_schema_components_construct_without_opening_the_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "nested" / "zeus.db"

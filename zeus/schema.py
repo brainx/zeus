@@ -16,7 +16,7 @@ class _SchemaDatabase(Protocol):
     def immediate(self) -> AbstractContextManager[sqlite3.Connection]: ...
 
 
-def _assert_schema_compatible(conn: sqlite3.Connection) -> None:
+def _read_schema_version(conn: sqlite3.Connection) -> int | None:
     table = conn.execute(
         """
         SELECT 1 FROM sqlite_master
@@ -24,13 +24,29 @@ def _assert_schema_compatible(conn: sqlite3.Connection) -> None:
         """
     ).fetchone()
     if table is None:
-        return
+        return None
     row = conn.execute("SELECT version FROM schema_version ORDER BY rowid LIMIT 1").fetchone()
-    if row is not None and int(row["version"]) > SCHEMA_VERSION:
+    if row is None:
+        return None
+    version = row["version"]
+    if type(version) is not int:
+        raise TypeError("database schema version must be an integer")
+    return version
+
+
+def _assert_schema_compatible(conn: sqlite3.Connection) -> None:
+    version = _read_schema_version(conn)
+    if version is not None and version > SCHEMA_VERSION:
         raise RuntimeError(
-            f"database schema version {int(row['version'])} is newer than supported "
-            f"version {SCHEMA_VERSION}"
+            f"database schema version {version} is newer than supported version {SCHEMA_VERSION}"
         )
+
+
+def _assert_schema_current(conn: sqlite3.Connection) -> int:
+    version = _read_schema_version(conn)
+    if version != SCHEMA_VERSION:
+        raise RuntimeError("database schema is not current")
+    return version
 
 
 def _preflight_schema_compatibility(database_path: Path) -> None:
@@ -108,9 +124,9 @@ class SchemaManager:
             )
             """
         )
-        row = conn.execute("SELECT version FROM schema_version ORDER BY rowid LIMIT 1").fetchone()
-        current_version = int(row["version"]) if row else 0
-        if row is None:
+        stored_version = _read_schema_version(conn)
+        current_version = stored_version or 0
+        if stored_version is None:
             conn.execute("INSERT INTO schema_version (version) VALUES (0)")
         if current_version > SCHEMA_VERSION:
             raise RuntimeError(

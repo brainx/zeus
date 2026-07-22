@@ -32,6 +32,7 @@ from zeus.reconciliation import (
 from zeus.schema import SCHEMA_VERSION as SCHEMA_VERSION
 from zeus.schema import SchemaManager
 from zeus.sqlite_db import SQLiteDatabase
+from zeus.sqlite_db import StateReadinessError as StateReadinessError
 
 
 class StateStore:
@@ -53,6 +54,9 @@ class StateStore:
 
     def connect(self) -> sqlite3.Connection:
         return self._database.connect()
+
+    def check_readiness(self) -> int:
+        return self._database.check_readiness()
 
     def init(self) -> None:
         self._schema.init()

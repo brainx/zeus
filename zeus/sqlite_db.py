@@ -6,12 +6,20 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from zeus.config import SQLiteSynchronous
-from zeus.schema import _assert_schema_compatible, _preflight_schema_compatibility
+from zeus.schema import (
+    _assert_schema_compatible,
+    _assert_schema_current,
+    _preflight_schema_compatibility,
+)
 
 _SYNCHRONOUS_PRAGMA = {
     SQLiteSynchronous.NORMAL: "PRAGMA synchronous=NORMAL",
     SQLiteSynchronous.FULL: "PRAGMA synchronous=FULL",
 }
+
+
+class StateReadinessError(RuntimeError):
+    pass
 
 
 class SQLiteDatabase:
@@ -39,6 +47,19 @@ class SQLiteDatabase:
         except Exception:
             conn.close()
             raise
+
+    def check_readiness(self) -> int:
+        uri = f"{self.database_path.resolve().as_uri()}?mode=ro"
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as conn:
+                conn.row_factory = sqlite3.Row
+                version = _assert_schema_current(conn)
+                row = conn.execute("SELECT 1").fetchone()
+                if row is None or type(row[0]) is not int or row[0] != 1:
+                    raise RuntimeError("state store probe returned an invalid result")
+                return version
+        except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise StateReadinessError("state store is not ready") from exc
 
     @contextmanager
     def immediate(self) -> Iterator[sqlite3.Connection]:

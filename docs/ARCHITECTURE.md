@@ -62,7 +62,8 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 Zeus uses persistent SQLite WAL mode. `SQLiteDatabase` installs the selected
 `ZEUS_SQLITE_SYNCHRONOUS` policy on every returned operational connection after
 both newer-schema guards, foreign-key enforcement, and WAL setup. The raw
-read-only schema preflight cannot commit and is intentionally not configured.
+read-only schema preflight and readiness probe cannot commit and are
+intentionally not configured with durability PRAGMAs.
 
 Committed transactions survive an application or Zeus process crash under both
 NORMAL and FULL. With NORMAL, SQLite omits a WAL sync on most commits, so a host

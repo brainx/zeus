@@ -43,7 +43,7 @@ from zeus.reconciliation import (
     ReconcileOutcome,
 )
 from zeus.request_context import RequestContext, new_request_id, route_template
-from zeus.state import MAX_IDEMPOTENCY_RESPONSE_BYTES, StateStore
+from zeus.state import MAX_IDEMPOTENCY_RESPONSE_BYTES, StateReadinessError, StateStore
 from zeus.supervisor import Supervisor
 from zeus.templates import TemplateStore
 
@@ -289,7 +289,21 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             else:
                 self._validate_query_parameters(set())
                 self._require_key(read=not self._get_requires_strict_auth(path))
-            if path == "/doctor":
+            if path == "/ready":
+                try:
+                    schema_version = store.check_readiness()
+                except StateReadinessError:
+                    self._json_error_response(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "not_ready",
+                        "state store is not ready",
+                    )
+                    return
+                self._json(
+                    HTTPStatus.OK,
+                    {"schema_version": schema_version, "status": "ready"},
+                )
+            elif path == "/doctor":
                 self._json(HTTPStatus.OK, run_doctor(settings).to_dict())
             elif path == "/templates":
                 self._json(HTTPStatus.OK, [template_to_dict(t) for t in TemplateStore().list()])

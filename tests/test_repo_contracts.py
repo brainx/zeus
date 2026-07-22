@@ -1058,6 +1058,43 @@ class RepoContractTests(unittest.TestCase):
             history["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
         )
 
+    def test_readiness_openapi_and_operator_documentation_contract(self) -> None:
+        spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
+        api_docs = Path("docs/API.md").read_text(encoding="utf-8")
+        operations = Path("docs/OPERATIONS.md").read_text(encoding="utf-8")
+
+        self.assertIn("/ready", spec["paths"])
+        self.assertNotIn("/v1/ready", spec["paths"])
+        self.assertEqual([], spec["paths"]["/health"]["get"]["security"])
+        readiness = spec["paths"]["/ready"]["get"]
+        self.assertEqual([{"ZeusApiKey": []}], readiness["security"])
+        self.assertEqual({"200", "400", "401", "429", "503"}, set(readiness["responses"]))
+        self.assertEqual(
+            "#/components/schemas/ReadinessResponse",
+            readiness["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        )
+        retry_after = readiness["responses"]["429"]["headers"]["Retry-After"]
+        self.assertNotIn("$ref", retry_after)
+        self.assertEqual({"type": "integer", "minimum": 1}, retry_after["schema"])
+        for response in readiness["responses"].values():
+            self.assertEqual(
+                {"$ref": "#/components/headers/XRequestID"},
+                response["headers"]["X-Request-ID"],
+            )
+
+        schema = spec["components"]["schemas"]["ReadinessResponse"]
+        self.assertEqual(["schema_version", "status"], schema["required"])
+        self.assertEqual(SCHEMA_VERSION, schema["properties"]["schema_version"]["const"])
+        self.assertEqual("ready", schema["properties"]["status"]["const"])
+        error_codes = spec["components"]["schemas"]["Error"]["properties"]["error"]["properties"][
+            "code"
+        ]["enum"]
+        self.assertIn("not_ready", error_codes)
+        for text in (api_docs, operations):
+            self.assertIn("/ready", text)
+            self.assertIn("/health", text)
+            self.assertIn("ZEUS_ALLOW_UNAUTH_READS", text)
+
     def test_wave_two_replay_and_recovery_contracts_are_documented(self) -> None:
         spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
         api_docs = Path("docs/API.md").read_text(encoding="utf-8")
