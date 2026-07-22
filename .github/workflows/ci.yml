@@ -14,7 +14,8 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -50,8 +51,23 @@ jobs:
           coverage run -m unittest discover -s tests
           coverage report
 
+  python-3-14:
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+      - name: Install package and test tools
+        run: python -m pip install -e ".[dev]"
+      - name: Run Zeus test suite
+        run: sh scripts/test.sh
+
   lifecycle-subprocess:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -62,8 +78,60 @@ jobs:
       - name: Run subprocess lifecycle tests
         run: python -m unittest tests.test_subprocess_lifecycle
 
+  macos-process-lifecycle:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+      - name: Install package and test tools
+        run: python -m pip install -e ".[dev]"
+      - name: Run focused process lifecycle tests
+        run: |
+          python -m unittest -v \
+            tests.test_subprocess_lifecycle \
+            tests.test_fake_hermes_integration \
+            tests.test_crash_recovery.GatewayLauncherTests
+
+  real-hermes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - name: Prepare sanitized failure evidence
+        run: |
+          mkdir -p .tmp/real-hermes-evidence
+          printf '%s\n' 'result=failed' 'failure_stage=ci_setup' > .tmp/real-hermes-evidence/summary.txt
+      - name: Install pinned Hermes compatibility environment
+        run: |-
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-hermes-ci.txt
+      - name: Install Zeus
+        run: python -m pip install -e .
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Verify real Hermes without provider credentials
+        run: |
+          ZEUS_VERIFY_START_GATEWAY=1 \
+          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \
+          ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \
+          sh scripts/verify_real_hermes.sh
+      - name: Upload sanitized failure evidence
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: real-hermes-failure-evidence
+          path: .tmp/real-hermes-evidence/summary.txt
+          if-no-files-found: error
+          retention-days: 7
+
   package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -71,11 +139,13 @@ jobs:
           python-version: "3.11"
       - name: Install package build tools
         run: python -m pip install -e ".[dev]"
+      - name: Check installed dependencies
+        run: python -m pip check
       - name: Build package
         run: |
           rm -rf dist
           python -m build
-      - name: Smoke test built wheel
+      - name: Verify installed wheel behavior
         run: ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh
       - name: Check package metadata
         run: twine check dist/*

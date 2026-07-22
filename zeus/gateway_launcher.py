@@ -1,22 +1,34 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import math
 import os
 import platform
-import re
 import stat
 import subprocess  # nosec B404
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import NoReturn
-from urllib.parse import urlparse
 
-from zeus.models import ID_RE
+from zeus.gateway_marker import (
+    MarkerValidationError,
+    _finish_launch_marker,
+    _parse_launch_marker_argv,
+    _parse_launch_marker_correlation,
+    _parse_launch_marker_identity,
+)
+from zeus.gateway_marker import (
+    command_fingerprint as _command_fingerprint,
+)
+from zeus.gateway_marker import (
+    is_owned_runtime_marker as _marker_is_owned_runtime_marker,
+)
+
+command_fingerprint = _command_fingerprint
 
 if os.name == "posix":
     import fcntl
@@ -30,9 +42,6 @@ MARKER_NAME = "zeus-gateway.pid.json"
 MARKER_PUBLICATION_LOCK_NAME = ".zeus-gateway-marker.lock"
 MARKER_PUBLICATION_LOCK_TIMEOUT_SECONDS = 30.0
 
-_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
-
 
 class _UnspecifiedProcessStart:
     pass
@@ -40,34 +49,14 @@ class _UnspecifiedProcessStart:
 
 _UNSPECIFIED_PROCESS_START = _UnspecifiedProcessStart()
 _ROOT_KEYS = frozenset({"profile_path", "marker_path", "marker", "argv", "env"})
-_MARKER_KEYS = frozenset(
-    {
-        "schema",
-        "bot_id",
-        "component",
-        "action",
-        "operation_id",
-        "desired_revision",
-        "argv",
-        "resolved_hermes_bin",
-        "command_fingerprint",
-        "readiness_probe",
-    }
-)
-_RUNTIME_MARKER_KEYS = _MARKER_KEYS | frozenset({"pid", "started_at"})
-_RUNTIME_MARKER_FINGERPRINT_KEYS = _RUNTIME_MARKER_KEYS | frozenset({"proc_start_fingerprint"})
-_PROBE_KEYS = frozenset(
-    {"url", "expected_status", "expected_platform", "timeout_seconds", "interval_seconds"}
-)
 
 
 class LaunchPayloadError(ValueError):
     pass
 
 
-def command_fingerprint(argv: list[str]) -> str:
-    encoded = json.dumps(argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+class _ConfirmedMissing(LaunchPayloadError):
+    """A missing path component whose absence was rechecked on retained descriptors."""
 
 
 def _exact_dict(value: object, keys: frozenset[str], name: str) -> dict[str, object]:
@@ -126,77 +115,44 @@ def _validate_path(value: object, name: str) -> Path:
     return path
 
 
-def _valid_probe_number(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return False
-    return math.isfinite(float(value)) and 0 < float(value) <= 3600
-
-
-def _validate_readiness_probe(value: object) -> object:
-    if value is None:
-        return None
-    probe = _exact_dict(value, _PROBE_KEYS, "readiness_probe")
-    url = _exact_string(probe["url"], "readiness URL", max_length=2048)
-    parsed = urlparse(url)
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise LaunchPayloadError("readiness URL must be loopback HTTP")
-    _exact_string(probe["expected_status"], "expected status", max_length=128)
-    _exact_string(probe["expected_platform"], "expected platform", max_length=128)
-    if not _valid_probe_number(probe["timeout_seconds"]) or not _valid_probe_number(
-        probe["interval_seconds"]
-    ):
-        raise LaunchPayloadError("readiness timing is invalid")
-    return probe
-
-
 def _validate_payload(value: object) -> tuple[Path, dict[str, object], list[str], dict[str, str]]:
     payload = _exact_dict(value, _ROOT_KEYS, "payload")
     profile_path = _validate_path(payload["profile_path"], "profile_path")
     marker_path = _validate_path(payload["marker_path"], "marker_path")
-    marker = _exact_dict(payload["marker"], _MARKER_KEYS, "marker")
-    bot_id = _exact_string(marker["bot_id"], "bot_id", max_length=63)
-    if ID_RE.fullmatch(bot_id) is None:
-        raise LaunchPayloadError("bot_id is invalid")
+    try:
+        marker, bot_id = _parse_launch_marker_identity(payload["marker"])
+    except MarkerValidationError as exc:
+        raise LaunchPayloadError(str(exc)) from exc
     if profile_path.name != bot_id or profile_path.parent.name != "profiles":
         raise LaunchPayloadError("profile_path is outside the bot profile boundary")
     if marker_path != profile_path / "logs" / MARKER_NAME:
         raise LaunchPayloadError("marker_path is outside the bot profile boundary")
 
-    if marker["schema"] != 3 or type(marker["schema"]) is not int:
-        raise LaunchPayloadError("marker schema is invalid")
-    if marker["component"] != "gateway" or marker["action"] != "run":
-        raise LaunchPayloadError("marker command intent is invalid")
-    operation_id = _exact_string(marker["operation_id"], "operation_id", max_length=32)
-    if _OPERATION_ID_RE.fullmatch(operation_id) is None:
-        raise LaunchPayloadError("operation_id is invalid")
-    revision = marker["desired_revision"]
-    if type(revision) is not int or not 1 <= revision <= 2**63 - 1:
-        raise LaunchPayloadError("desired_revision is invalid")
-
+    try:
+        operation_id, revision = _parse_launch_marker_correlation(marker)
+    except MarkerValidationError as exc:
+        raise LaunchPayloadError(str(exc)) from exc
     argv = _validate_argv(payload["argv"])
-    marker_argv = _validate_argv(marker["argv"])
-    if argv != marker_argv:
+    try:
+        marker_argv = _parse_launch_marker_argv(marker)
+    except MarkerValidationError as exc:
+        raise LaunchPayloadError(str(exc)) from exc
+    if argv != list(marker_argv):
         raise LaunchPayloadError("marker argv does not match exec argv")
-    if len(argv) != 5 or argv[1:] != ["-p", bot_id, "gateway", "run"]:
-        raise LaunchPayloadError("argv is not a Hermes gateway command")
-    resolved_hermes = _validate_path(marker["resolved_hermes_bin"], "resolved_hermes_bin")
-    if argv[0] != str(resolved_hermes):
-        raise LaunchPayloadError("exec argv does not use the resolved Hermes binary")
-    fingerprint = _exact_string(marker["command_fingerprint"], "command_fingerprint", max_length=64)
-    if _FINGERPRINT_RE.fullmatch(fingerprint) is None or fingerprint != command_fingerprint(argv):
-        raise LaunchPayloadError("command fingerprint is invalid")
-    _validate_readiness_probe(marker["readiness_probe"])
+    try:
+        parsed_marker = _finish_launch_marker(
+            marker,
+            bot_id=bot_id,
+            operation_id=operation_id,
+            revision=revision,
+            argv=marker_argv,
+        )
+    except MarkerValidationError as exc:
+        raise LaunchPayloadError(str(exc)) from exc
     env = _validate_env(payload["env"])
     if env.get("HERMES_HOME") != str(profile_path.parent.parent):
         raise LaunchPayloadError("HERMES_HOME does not match the bot profile root")
-    return profile_path, marker, argv, env
+    return profile_path, parsed_marker.to_payload(), argv, env
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -239,6 +195,108 @@ def _same_file(before: os.stat_result, after: os.stat_result) -> bool:
     return before.st_dev == after.st_dev and before.st_ino == after.st_ino
 
 
+def _caused_by_missing_path(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, FileNotFoundError):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _validate_open_directory_binding(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    description: str,
+) -> os.stat_result:
+    try:
+        opened = os.fstat(directory_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise LaunchPayloadError(f"{description} changed while it was used") from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or not _same_file(opened, current)
+    ):
+        raise LaunchPayloadError(f"{description} changed while it was used")
+    return opened
+
+
+@dataclass
+class _OpenedProfile:
+    descriptors: list[int]
+    names: tuple[str, ...]
+
+    @property
+    def fd(self) -> int:
+        if not self.descriptors:
+            raise LaunchPayloadError("profile descriptor chain is closed")
+        return self.descriptors[-1]
+
+    def validate_bindings(self, *, require_profile_owner: bool = True) -> None:
+        if len(self.descriptors) != len(self.names) + 1:
+            raise LaunchPayloadError("profile descriptor chain is invalid")
+        try:
+            opened_root = os.fstat(self.descriptors[0])
+            current_root = os.stat("/", follow_symlinks=False)
+        except OSError as exc:
+            raise LaunchPayloadError("filesystem root changed while it was used") from exc
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or not stat.S_ISDIR(current_root.st_mode)
+            or not _same_file(opened_root, current_root)
+        ):
+            raise LaunchPayloadError("filesystem root changed while it was used")
+        for parent_fd, name, directory_fd in zip(
+            self.descriptors[:-1],
+            self.names,
+            self.descriptors[1:],
+            strict=True,
+        ):
+            _validate_open_directory_binding(
+                parent_fd,
+                name,
+                directory_fd,
+                "profile path component",
+            )
+        try:
+            profile_stat = os.fstat(self.fd)
+        except OSError as exc:
+            raise LaunchPayloadError("profile directory changed while it was used") from exc
+        if require_profile_owner and hasattr(os, "geteuid") and profile_stat.st_uid != os.geteuid():
+            raise LaunchPayloadError("profile directory has an unexpected owner")
+
+    def confirm_missing(self, name: str) -> None:
+        for _attempt in range(2):
+            self.validate_bindings(require_profile_owner=False)
+            try:
+                os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise LaunchPayloadError("missing profile entry cannot be confirmed") from exc
+            raise LaunchPayloadError("profile entry appeared while absence was confirmed")
+        self.validate_bindings(require_profile_owner=False)
+
+    def detach_fd(self) -> int:
+        result = self.fd
+        ancestors = self.descriptors[:-1]
+        self.descriptors = []
+        for descriptor in reversed(ancestors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        return result
+
+    def close(self) -> None:
+        descriptors = self.descriptors
+        self.descriptors = []
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
 def _open_directory_at(parent_fd: int, name: str) -> int:
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -250,34 +308,57 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
         opened_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
     except OSError as exc:
         raise LaunchPayloadError("profile path component cannot be opened safely") from exc
-    after = os.fstat(opened_fd)
-    if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
-        os.close(opened_fd)
-        raise LaunchPayloadError("profile path changed while it was opened")
-    return opened_fd
+    try:
+        after = os.fstat(opened_fd)
+        if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
+            raise LaunchPayloadError("profile path changed while it was opened")
+        return opened_fd
+    except LaunchPayloadError:
+        with contextlib.suppress(OSError):
+            os.close(opened_fd)
+        raise
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(opened_fd)
+        raise LaunchPayloadError("profile path could not be validated safely") from exc
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(opened_fd)
+        raise
 
 
-def _open_profile(profile_path: Path) -> int:
+def _open_profile_chain(profile_path: Path) -> _OpenedProfile:
     if not profile_path.is_absolute() or not profile_path.parts or profile_path.parts[0] != "/":
         raise LaunchPayloadError("profile path must be absolute")
     try:
-        current_fd = os.open("/", _directory_flags())
+        root_fd = os.open("/", _directory_flags())
     except OSError as exc:
         raise LaunchPayloadError("filesystem root cannot be opened safely") from exc
+    descriptors = [root_fd]
+    names: list[str] = []
     try:
         for component in profile_path.parts[1:]:
-            next_fd = _open_directory_at(current_fd, component)
-            os.close(current_fd)
-            current_fd = next_fd
-        profile_stat = os.fstat(current_fd)
-        if hasattr(os, "geteuid") and profile_stat.st_uid != os.geteuid():
-            raise LaunchPayloadError("profile directory has an unexpected owner")
-        result = current_fd
-        current_fd = -1
-        return result
-    finally:
-        if current_fd >= 0:
-            os.close(current_fd)
+            try:
+                next_fd = _open_directory_at(descriptors[-1], component)
+            except LaunchPayloadError as exc:
+                if _caused_by_missing_path(exc):
+                    _OpenedProfile(descriptors, tuple(names)).confirm_missing(component)
+                    raise _ConfirmedMissing("profile path component is missing") from exc
+                raise
+            descriptors.append(next_fd)
+            names.append(component)
+        opened = _OpenedProfile(descriptors, tuple(names))
+        opened.validate_bindings()
+        return opened
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        raise
+
+
+def _open_profile(profile_path: Path) -> int:
+    return _open_profile_chain(profile_path).detach_fd()
 
 
 class _MarkerPublicationLock:
@@ -400,14 +481,25 @@ def _open_logs(profile_fd: int, *, create: bool) -> int:
         logs_fd = _open_directory_at(profile_fd, "logs")
     except OSError as exc:
         raise LaunchPayloadError("marker directory cannot be opened safely") from exc
-    logs_stat = os.fstat(logs_fd)
-    if not stat.S_ISDIR(logs_stat.st_mode):
-        os.close(logs_fd)
-        raise LaunchPayloadError("marker directory is not a directory")
-    if hasattr(os, "geteuid") and logs_stat.st_uid != os.geteuid():
-        os.close(logs_fd)
-        raise LaunchPayloadError("marker directory has an unexpected owner")
-    return logs_fd
+    try:
+        logs_stat = os.fstat(logs_fd)
+        if not stat.S_ISDIR(logs_stat.st_mode):
+            raise LaunchPayloadError("marker directory is not a directory")
+        if hasattr(os, "geteuid") and logs_stat.st_uid != os.geteuid():
+            raise LaunchPayloadError("marker directory has an unexpected owner")
+        return logs_fd
+    except LaunchPayloadError:
+        with contextlib.suppress(OSError):
+            os.close(logs_fd)
+        raise
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(logs_fd)
+        raise LaunchPayloadError("marker directory could not be validated safely") from exc
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(logs_fd)
+        raise
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -481,50 +573,13 @@ def _is_owned_runtime_marker(
     pid: int,
     expected_fingerprint: str,
 ) -> bool:
-    if type(value) is not dict or frozenset(value) not in {
-        _RUNTIME_MARKER_KEYS,
-        _RUNTIME_MARKER_FINGERPRINT_KEYS,
-    }:
-        return False
-    marker = value
-    if (
-        type(marker["schema"]) is not int
-        or marker["schema"] != 3
-        or marker["bot_id"] != bot_id
-        or marker["component"] != "gateway"
-        or marker["action"] != "run"
-        or marker["operation_id"] != operation_id
-        or type(marker["desired_revision"]) is not int
-        or marker["desired_revision"] != desired_revision
-        or type(marker["pid"]) is not int
-        or marker["pid"] != pid
-        or marker["command_fingerprint"] != expected_fingerprint
-    ):
-        return False
-    started_at = marker["started_at"]
-    if (
-        isinstance(started_at, bool)
-        or not isinstance(started_at, int | float)
-        or not math.isfinite(float(started_at))
-        or float(started_at) <= 0
-    ):
-        return False
-    if "proc_start_fingerprint" in marker:
-        fingerprint = marker["proc_start_fingerprint"]
-        if type(fingerprint) is not str or not fingerprint or len(fingerprint) > 512:
-            return False
-    try:
-        argv = _validate_argv(marker["argv"])
-        resolved_hermes = _validate_path(marker["resolved_hermes_bin"], "resolved_hermes_bin")
-        _validate_readiness_probe(marker["readiness_probe"])
-    except LaunchPayloadError:
-        return False
-    return (
-        len(argv) == 5
-        and argv[1:] == ["-p", bot_id, "gateway", "run"]
-        and argv[0] == str(resolved_hermes)
-        and _FINGERPRINT_RE.fullmatch(expected_fingerprint) is not None
-        and command_fingerprint(argv) == expected_fingerprint
+    return _marker_is_owned_runtime_marker(
+        value,
+        bot_id=bot_id,
+        operation_id=operation_id,
+        desired_revision=desired_revision,
+        pid=pid,
+        expected_fingerprint=expected_fingerprint,
     )
 
 
@@ -535,16 +590,104 @@ def _open_regular_marker(logs_fd: int) -> tuple[int, os.stat_result]:
         raise LaunchPayloadError("marker is unavailable") from exc
     if not stat.S_ISREG(before.st_mode):
         raise LaunchPayloadError("marker is not a regular file")
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if type(nonblocking) is not int or nonblocking == 0:
+        raise LaunchPayloadError("bounded marker reads are unavailable")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= nonblocking
     try:
         marker_fd = os.open(MARKER_NAME, flags, dir_fd=logs_fd)
     except OSError as exc:
         raise LaunchPayloadError("marker cannot be opened safely") from exc
-    after = os.fstat(marker_fd)
-    if not stat.S_ISREG(after.st_mode) or not _same_file(before, after):
-        os.close(marker_fd)
-        raise LaunchPayloadError("marker changed while it was opened")
-    return marker_fd, after
+    try:
+        after = os.fstat(marker_fd)
+        if not stat.S_ISREG(after.st_mode) or not _same_file(before, after):
+            raise LaunchPayloadError("marker changed while it was opened")
+        return marker_fd, after
+    except LaunchPayloadError:
+        with contextlib.suppress(OSError):
+            os.close(marker_fd)
+        raise
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(marker_fd)
+        raise LaunchPayloadError("marker could not be validated safely") from exc
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(marker_fd)
+        raise
+
+
+def _validate_open_marker_binding(
+    logs_fd: int,
+    marker_fd: int,
+    marker_stat: os.stat_result,
+) -> os.stat_result:
+    try:
+        opened_marker = os.fstat(marker_fd)
+        current_marker = os.stat(MARKER_NAME, dir_fd=logs_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise LaunchPayloadError("marker changed while it was read") from exc
+    snapshots = (marker_stat, opened_marker, current_marker)
+    if not all(stat.S_ISREG(snapshot.st_mode) for snapshot in snapshots) or not all(
+        _same_file(marker_stat, snapshot) for snapshot in snapshots[1:]
+    ):
+        raise LaunchPayloadError("marker changed while it was read")
+    if hasattr(os, "geteuid") and any(snapshot.st_uid != os.geteuid() for snapshot in snapshots):
+        raise LaunchPayloadError("marker has an unexpected owner")
+    if any(snapshot.st_nlink != 1 for snapshot in snapshots):
+        raise LaunchPayloadError("marker has unexpected links")
+    return current_marker
+
+
+def _validate_marker_bindings(
+    profile: _OpenedProfile,
+    logs_fd: int,
+    marker_fd: int,
+    marker_stat: os.stat_result,
+) -> os.stat_result:
+    current_marker = marker_stat
+    for _attempt in range(2):
+        profile.validate_bindings()
+        logs_stat = _validate_open_directory_binding(
+            profile.fd,
+            "logs",
+            logs_fd,
+            "marker directory",
+        )
+        if hasattr(os, "geteuid") and logs_stat.st_uid != os.geteuid():
+            raise LaunchPayloadError("marker directory has an unexpected owner")
+        current_marker = _validate_open_marker_binding(
+            logs_fd,
+            marker_fd,
+            marker_stat,
+        )
+    return current_marker
+
+
+def _confirm_marker_missing(profile: _OpenedProfile, logs_fd: int) -> None:
+    for _attempt in range(2):
+        profile.validate_bindings()
+        _validate_open_directory_binding(
+            profile.fd,
+            "logs",
+            logs_fd,
+            "marker directory",
+        )
+        try:
+            os.stat(MARKER_NAME, dir_fd=logs_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise LaunchPayloadError("missing marker cannot be confirmed") from exc
+        raise LaunchPayloadError("marker appeared while absence was confirmed")
+    profile.validate_bindings()
+    _validate_open_directory_binding(
+        profile.fd,
+        "logs",
+        logs_fd,
+        "marker directory",
+    )
 
 
 def _remove_marker_if_owned_locked(

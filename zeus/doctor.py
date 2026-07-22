@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
+import stat
 import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
@@ -10,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from zeus.config import Settings, is_loopback_host
+from zeus.private_io import inspect_private_directory, nofollow_absolute_path
 from zeus.state import StateStore
 from zeus.templates import TemplateStore
 
@@ -100,20 +103,79 @@ def _check_templates() -> DoctorCheck:
     )
 
 
+def _existing_runtime_directory_check(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[bool, DoctorCheck | None]:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        try:
+            exists = inspect_private_directory(path, missing_ok=True)
+        except OSError:
+            return True, DoctorCheck(
+                "runtime_paths",
+                "fail",
+                f"{label} {path} could not be validated safely",
+            )
+        if exists:
+            return True, DoctorCheck(
+                "runtime_paths",
+                "fail",
+                f"{label} {path} changed while it was inspected",
+            )
+        return False, None
+    except OSError:
+        return True, DoctorCheck(
+            "runtime_paths",
+            "fail",
+            f"{label} {path} could not be inspected safely",
+        )
+    if not stat.S_ISDIR(metadata.st_mode):
+        return True, DoctorCheck(
+            "runtime_paths",
+            "fail",
+            f"{label} path {path} must be a directory and not a symlink",
+        )
+    if metadata.st_uid != os.geteuid():
+        return True, DoctorCheck(
+            "runtime_paths",
+            "fail",
+            f"{label} {path} must be owned by the current user",
+        )
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        return True, DoctorCheck(
+            "runtime_paths",
+            "fail",
+            f"{label} {path} must not be accessible to other users or groups",
+        )
+    try:
+        inspect_private_directory(path)
+    except OSError:
+        return True, DoctorCheck(
+            "runtime_paths",
+            "fail",
+            f"{label} {path} could not be validated safely",
+        )
+    return True, None
+
+
 def _check_runtime_paths(settings: Settings) -> DoctorCheck:
-    state_dir = settings.state_dir.resolve()
-    if state_dir.exists() and not state_dir.is_dir():
-        return DoctorCheck(
-            "runtime_paths",
-            "fail",
-            f"State path {state_dir} must be a directory",
+    state_dir = nofollow_absolute_path(settings.state_dir)
+    state_exists, failure = _existing_runtime_directory_check(
+        state_dir,
+        label="State directory",
+    )
+    if failure is not None:
+        return failure
+    if state_exists:
+        _, failure = _existing_runtime_directory_check(
+            state_dir / "logs",
+            label="State logs directory",
         )
-    if state_dir.exists() and state_dir.stat().st_mode & 0o007:
-        return DoctorCheck(
-            "runtime_paths",
-            "fail",
-            f"State directory {state_dir} must not be accessible to other users",
-        )
+        if failure is not None:
+            return failure
     workspace = Path.cwd().resolve()
     gitignore = workspace / ".gitignore"
     if not gitignore.exists():
@@ -253,7 +315,10 @@ def _check_api_auth(settings: Settings) -> DoctorCheck:
 
 
 def _check_bots(settings: Settings) -> list[DoctorCheck]:
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        synchronous=settings.sqlite_synchronous,
+    )
     if not settings.database_path.exists():
         return [DoctorCheck("bots", "pass", "No bot registry exists yet")]
     try:

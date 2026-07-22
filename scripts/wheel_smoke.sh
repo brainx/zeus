@@ -3,14 +3,22 @@
 # Maintained by BrainX: https://github.com/brainx
 set -eu
 
-repo_root="$(pwd)"
+repo_root="$(pwd -P)"
 tmp_dir="$repo_root/.tmp/wheel-smoke"
 build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"
+venv_python=""
+venv_zeus=""
+venv_fake_hermes=""
+state_dir="$tmp_dir/state"
+demo_started=0
 fail() {
   echo "wheel smoke failed: $*" >&2
   exit 1
 }
 cleanup() {
+  if [ "$demo_started" = "1" ] && [ -n "$venv_zeus" ] && [ -x "$venv_zeus" ]; then
+    ZEUS_STATE_DIR="$state_dir" "$venv_zeus" demo down --json >/dev/null 2>&1 || true
+  fi
   rm -rf "$tmp_dir"
 }
 trap cleanup EXIT INT TERM
@@ -39,20 +47,63 @@ wheel_path="$1"
 "$python_cmd" -m venv "$tmp_dir/venv"
 venv_python="$tmp_dir/venv/bin/python"
 venv_zeus="$tmp_dir/venv/bin/zeus"
-"$venv_python" -m pip install "$wheel_path"
+venv_fake_hermes="$tmp_dir/venv/bin/zeus-fake-hermes"
+PIP_NO_INDEX=1 "$venv_python" -m pip install --no-deps "$wheel_path"
 
 cd "$tmp_dir"
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1
+export PATH="$tmp_dir/venv/bin:$PATH"
+export ZEUS_STATE_DIR="$state_dir"
+
+installed_fake_hermes="$(command -v zeus-fake-hermes || true)"
+[ "$installed_fake_hermes" = "$venv_fake_hermes" ] ||
+  fail "PATH did not select the installed zeus-fake-hermes entry point"
+
+[ ! -e "$state_dir" ] || fail "state directory exists before stateless CLI checks"
+"$venv_zeus" --help >zeus-help.txt
+grep -F "usage: zeus" zeus-help.txt >/dev/null
+metadata_version=$("$venv_python" -c \
+  'from importlib.metadata import version; print(version("zeus-hermes-orchestrator"))')
+module_version=$("$venv_python" -c 'import zeus; print(zeus.__version__)')
+cli_version=$("$venv_zeus" --version)
+module_path=$("$venv_python" -c \
+  'from pathlib import Path; import zeus; print(Path(zeus.__file__).resolve())')
+[ "$metadata_version" = "$module_version" ] ||
+  fail "distribution and module versions differ: $metadata_version != $module_version"
+[ "$cli_version" = "zeus $metadata_version" ] ||
+  fail "CLI version does not match package metadata: $cli_version"
+case "$module_path" in
+  "$tmp_dir"/venv/*) ;;
+  *) fail "zeus imported outside the isolated virtual environment: $module_path" ;;
+esac
+[ ! -e "$state_dir" ] || fail "help or version checks created runtime state"
+
+"$venv_python" -m pip check
 "$venv_zeus" template list >template-list.txt
 "$venv_zeus" doctor --json >doctor.json
-"$venv_python" -c "import zeus; print(zeus.__version__)"
-ZEUS_STATE_DIR="$tmp_dir/state" "$venv_zeus" demo up --json >demo-up.json
-ZEUS_STATE_DIR="$tmp_dir/state" "$venv_zeus" demo status --json >demo-status.json
-ZEUS_STATE_DIR="$tmp_dir/state" "$venv_zeus" demo down --json >demo-down.json
+for template_id in \
+  coding-bot \
+  deepseek-coding-bot \
+  docs-writer-bot \
+  gateway-operator \
+  log-triage-bot \
+  research-bot \
+  support-gateway; do
+  grep "^${template_id}[[:space:]]" template-list.txt >/dev/null ||
+    fail "installed wheel is missing bundled template: $template_id"
+done
 
-grep "coding-bot" template-list.txt >/dev/null
-grep "deepseek-coding-bot" template-list.txt >/dev/null
 grep '"checks"' doctor.json >/dev/null
+demo_started=1
+"$venv_zeus" demo up --json >demo-up.json
+"$venv_zeus" demo status --json >demo-status.json
+"$venv_zeus" demo down --json >demo-down.json
+demo_started=0
+
 grep '"fake_hermes_bin"' demo-up.json >/dev/null
+grep -F "\"fake_hermes_bin\": \"$venv_fake_hermes\"" demo-up.json >/dev/null
+grep '"status": "running"' demo-up.json >/dev/null
 grep '"status": "running"' demo-status.json >/dev/null
 grep '"status": "stopped"' demo-down.json >/dev/null
 

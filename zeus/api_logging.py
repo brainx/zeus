@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
+from zeus.private_io import append_private_bytes
 from zeus.request_context import AUTH_OUTCOMES, IDEMPOTENCY_OUTCOMES, route_template
 
 _HTTP_METHODS = frozenset({"GET", "POST", "UNSUPPORTED"})
@@ -140,37 +140,10 @@ class ApiLogWriter:
         if not self.enabled:
             return
         try:
-            line = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            line = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
             with self._lock:
-                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                directory_flags = os.O_RDONLY
-                directory_flags |= getattr(os, "O_DIRECTORY", 0)
-                directory_flags |= getattr(os, "O_CLOEXEC", 0)
-                directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-                file_flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-                file_flags |= getattr(os, "O_CLOEXEC", 0)
-                file_flags |= getattr(os, "O_NOFOLLOW", 0)
-                directory_fd: int | None = None
-                file_fd: int | None = None
-                try:
-                    directory_fd = os.open(self.path.parent, directory_flags)
-                    os.fchmod(directory_fd, 0o700)
-                    file_fd = os.open(
-                        self.path.name,
-                        file_flags,
-                        0o600,
-                        dir_fd=directory_fd,
-                    )
-                    os.fchmod(file_fd, 0o600)
-                    with os.fdopen(file_fd, "a", encoding="utf-8") as handle:
-                        file_fd = None
-                        handle.write(line)
-                finally:
-                    try:
-                        if file_fd is not None:
-                            os.close(file_fd)
-                    finally:
-                        if directory_fd is not None:
-                            os.close(directory_fd)
+                append_private_bytes(self.path, line)
         except (OSError, TypeError, ValueError):
             return

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -13,6 +14,12 @@ from typing import Any
 
 from zeus.envfile import dump_env
 from zeus.models import BotCreateRequest, BotRecord, HermesTemplate, TemplateError
+from zeus.private_io import (
+    UnsafeFileError,
+    nofollow_absolute_path,
+    pin_private_directory,
+    validate_private_directory,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -95,7 +102,19 @@ class ProfileRenderer:
         staging = Path(tempfile.mkdtemp(prefix=f".{request.bot_id}.staging-", dir=profiles_root))
         try:
             _write_staged_profile(staging, profile, rendered_files)
-            backup = _install_staged_profile(staging, profile)
+            backup: Path | None = None
+            installed = False
+            try:
+                with pin_private_directory(nofollow_absolute_path(staging / "logs")) as pinned:
+                    backup = _install_staged_profile(staging, profile)
+                    installed = True
+                    pinned.validate_at(nofollow_absolute_path(profile / "logs"))
+            except UnsafeFileError as exc:
+                if installed:
+                    _rollback_installed_profile(profile, backup)
+                raise TemplateError(
+                    "installed profile logs directory could not be verified safely"
+                ) from exc
         finally:
             try:
                 _remove_path(staging)
@@ -133,8 +152,8 @@ def _write_staged_profile(
         )
 
     _ensure_staged_directory(staging / "cron")
-    for relative_path in ("logs", "skills"):
-        _ensure_preserved_directory(staging / relative_path)
+    _ensure_private_logs_directory(staging / "logs")
+    _ensure_preserved_directory(staging / "skills")
 
     for relative_path, content in rendered_files.items():
         _write_staged_file(staging / relative_path, content)
@@ -155,6 +174,27 @@ def _ensure_preserved_directory(path: Path) -> None:
         return
     if not path.is_dir():
         raise TemplateError(f"profile path must be a directory: {path.name}")
+
+
+def _ensure_private_logs_directory(path: Path) -> None:
+    try:
+        if _path_exists(path):
+            metadata = os.lstat(path)
+            if stat.S_ISLNK(metadata.st_mode):
+                path.unlink()
+            elif not stat.S_ISDIR(metadata.st_mode):
+                raise TemplateError(f"profile path must be a directory: {path.name}")
+        if not _path_exists(path):
+            path.mkdir(mode=0o700)
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise TemplateError("profile logs directory could not be prepared safely") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise TemplateError("profile logs directory must be owned by the current user")
+    try:
+        validate_private_directory(nofollow_absolute_path(path))
+    except OSError as exc:
+        raise TemplateError("profile logs directory could not be made private") from exc
 
 
 def _write_staged_file(path: Path, content: str) -> None:

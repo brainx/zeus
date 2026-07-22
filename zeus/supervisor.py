@@ -1,30 +1,19 @@
 from __future__ import annotations
 
 import contextlib
-import errno
-import json
-import math
 import os
 import platform
 import re
-import select
-import shlex
-import shutil
 import signal
-import stat
 import subprocess  # nosec B404
-import sys
 import threading
-import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from enum import Enum
 from pathlib import Path
-from typing import Protocol, TypeGuard
-from urllib.parse import urlparse
 
+from zeus import process_identity as _process_identity
 from zeus.errors import (
     BotArchiveError,
     BotDeleteError,
@@ -32,21 +21,31 @@ from zeus.errors import (
     BotReplaceError,
     BotRunningError,
 )
-from zeus.fs_utils import atomic_write_json
 from zeus.gateway_launcher import (
-    MAX_PAYLOAD_BYTES,
     LaunchPayloadError,
-    _is_owned_runtime_marker,
-    _open_logs,
-    _open_profile,
-    _open_regular_marker,
     _read_bounded_file,
-    _reject_duplicate_keys,
     _remove_marker_if_owned_locked,
-    marker_publication_lock,
-    remove_marker_if_owned,
+)
+from zeus.gateway_marker import (
+    GatewayGeneration,
+    is_compat_runtime_marker,
+    readiness_probe_from_payload,
+    readiness_probe_to_payload,
+)
+from zeus.gateway_runtime import (
+    GatewayRuntime,
+    KillFn,
+    MarkerObservation,
+    OwnershipCheck,
+    PopenFactory,
+    PopenLike,
+    RuntimeHooks,
+    SignalResult,
+    StopEffect,
+    gateway_process_launch_kwargs,
 )
 from zeus.hermes_adapter import HermesAdapter
+from zeus.intent_recovery import PendingIntentRecovery
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput
 from zeus.logging_utils import tail_file
 from zeus.models import (
@@ -57,11 +56,12 @@ from zeus.models import (
     DesiredState,
     HermesTemplate,
     RestartPolicy,
-    TemplateError,
     validate_id,
 )
+from zeus.private_io import nofollow_absolute_path
 from zeus.process_lock import BotProcessLock, LockTimeoutError
-from zeus.readiness import ReadinessProbe, ReadinessResult, probe_once, readiness_probe_from_env
+from zeus.profile_manager import ProfileArchive, ProfileDeletion, ProfileManager
+from zeus.readiness import ReadinessProbe, ReadinessResult, probe_once
 from zeus.reconciliation import (
     BotReconcileResult,
     FleetReconciler,
@@ -71,54 +71,31 @@ from zeus.reconciliation import (
     ReconcileRunSummary,
     ReconcileSnapshotDriftError,
 )
-from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
 
+PidAliveFn = _process_identity.PidAliveFn
+CmdlineReader = _process_identity.CmdlineReader
+ProcStartFingerprintReader = _process_identity.ProcStartFingerprintReader
 
-class PopenLike(Protocol):
-    pid: int
-
-    def poll(self) -> int | None: ...
-
-
-PopenFactory = Callable[..., PopenLike]
-KillFn = Callable[[int, signal.Signals], None]
-PidAliveFn = Callable[[int], bool]
-CmdlineReader = Callable[[int], list[str] | None]
-ProcStartFingerprintReader = Callable[[int], str | None]
-
-
-@dataclass(frozen=True)
-class OwnershipCheck:
-    verified: bool
-    reason: str
-    classification: str | None = None
+_CommandCheck = _process_identity.CommandCheck
+_PidState = _process_identity.PidState
+_looks_like_python_interpreter = _process_identity.looks_like_python_interpreter
+_read_linux_cmdline = _process_identity.read_linux_cmdline
+_read_linux_process_start_fingerprint = _process_identity.read_linux_process_start_fingerprint
+_resolve_executable = _process_identity.resolve_executable
+_resolve_launcher_exec_target = _process_identity.resolve_launcher_exec_target
+_safe_command_shape = _process_identity.safe_command_shape
+_trusted_hermes_paths = _process_identity.trusted_hermes_paths
+_verify_gateway_command = _process_identity.verify_gateway_command
 
 
-@dataclass(frozen=True)
-class _CommandCheck:
-    verified: bool
-    reason: str
-    classification: str | None = None
-
-
-class _PidState(Enum):
-    alive = "alive"
-    dead = "dead"
-    unknown = "unknown"
-
-
-class _SignalResult(Enum):
-    sent = "sent"
-    missing = "missing"
-    denied = "denied"
+_SignalResult = SignalResult
 
 
 class _ReadinessProbeUnset:
     pass
 
 
-_PYTHON_INTERPRETER_RE = re.compile(r"^python(?:\d+(?:\.\d+)?)?$")
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _LIFECYCLE_SOURCES = frozenset({"api", "cli", "reconcile", "recovery", "system"})
 _READINESS_PROBE_UNSET = _ReadinessProbeUnset()
@@ -131,20 +108,10 @@ class _LifecycleContext:
     request_id: str | None
 
 
-@dataclass(frozen=True)
-class _MarkerObservation:
-    kind: str
-    payload: dict[str, object] | None = None
-    reason: str = ""
+_MarkerObservation = MarkerObservation
 
 
-@dataclass(frozen=True)
-class _GatewayGeneration:
-    operation_id: str
-    desired_revision: int
-    pid: int
-    command_fingerprint: str
-    proc_start_fingerprint: str | None
+_GatewayGeneration = GatewayGeneration
 
 
 @dataclass(frozen=True)
@@ -156,26 +123,24 @@ class _ReconcileLaunch:
 
 
 def _gateway_process_launch_kwargs() -> dict[str, object]:
-    if os.name == "posix":
-        return {"start_new_session": True}
-    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    return {"creationflags": creationflags} if creationflags else {}
+    return gateway_process_launch_kwargs()
 
 
 def _nofollow_absolute_path(path: Path) -> Path:
-    absolute = Path(os.path.abspath(path.expanduser()))
-    if (
-        sys.platform == "darwin"
-        and len(absolute.parts) > 1
-        and absolute.parts[1]
-        in {
-            "etc",
-            "tmp",
-            "var",
-        }
-    ):
-        return Path("/private", *absolute.parts[1:])
-    return absolute
+    return nofollow_absolute_path(path)
+
+
+def _same_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _caused_by_missing_path(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, FileNotFoundError):
+            return True
+        current = current.__cause__
+    return False
 
 
 class Supervisor:
@@ -204,27 +169,193 @@ class Supervisor:
             hermes_bin=hermes_bin,
             hermes_root=configured_hermes_root.resolve(),
         )
+        self._profile_manager = ProfileManager(
+            self.adapter.hermes_root,
+            self.store.database_path.parent / "archive",
+        )
         self._marker_profiles_root = configured_hermes_root / "profiles"
-        self.popen_factory = popen_factory
-        self.kill_fn = kill_fn
-        self.pid_alive_fn = pid_alive_fn
-        self.cmdline_reader = cmdline_reader or _read_process_cmdline
         self.startup_grace_seconds = startup_grace_seconds
-        self.stop_grace_seconds = stop_grace_seconds
-        self.kill_after_timeout = kill_after_timeout
         self.lock_dir = self.store.database_path.parent / "locks" / "bots"
-        self.lock_timeout_seconds = lock_timeout_seconds
         self.readiness_timeout_seconds = readiness_timeout_seconds
         self.readiness_interval_seconds = readiness_interval_seconds
         self.allow_legacy_pid_markers = allow_legacy_pid_markers
         self.restart_backoff_cap_seconds = restart_backoff_cap_seconds
-        self.proc_start_fingerprint_reader = (
-            proc_start_fingerprint_reader or _read_process_start_fingerprint
-        )
         self._cleanup_process_group = os.name == "posix" and popen_factory is subprocess.Popen
-        self._processes: dict[str, PopenLike] = {}
+        self._runtime = GatewayRuntime(
+            self.adapter,
+            self._profile_manager,
+            self._marker_profiles_root,
+            popen_factory=popen_factory,
+            kill_fn=kill_fn,
+            pid_alive_fn=pid_alive_fn,
+            cmdline_reader=cmdline_reader or _read_process_cmdline,
+            proc_start_fingerprint_reader=(
+                proc_start_fingerprint_reader or _read_process_start_fingerprint
+            ),
+            startup_grace_seconds=startup_grace_seconds,
+            stop_grace_seconds=stop_grace_seconds,
+            kill_after_timeout=kill_after_timeout,
+            lock_timeout_seconds=lock_timeout_seconds,
+            readiness_timeout_seconds=readiness_timeout_seconds,
+            readiness_interval_seconds=readiness_interval_seconds,
+            allow_legacy_pid_markers=allow_legacy_pid_markers,
+            cleanup_process_group=self._cleanup_process_group,
+            hooks_provider=self._runtime_hooks,
+        )
+        self._intent_recovery = PendingIntentRecovery()
         self._locks_guard = threading.Lock()
         self._bot_locks: dict[str, threading.RLock] = {}
+
+    def _runtime_hooks(self) -> RuntimeHooks:
+        return RuntimeHooks(
+            pipe=os.pipe,
+            close=os.close,
+            read_bounded_file=_read_bounded_file,
+            remove_marker_if_owned_locked=_remove_marker_if_owned_locked,
+            probe_once=probe_once,
+        )
+
+    def _get_runtime_proxy(self, name: str) -> object:
+        runtime = self.__dict__.get("_runtime")
+        if runtime is not None:
+            return getattr(runtime, name)
+        return self.__dict__.get(f"_runtime_proxy_{name}")
+
+    def _set_runtime_proxy(self, name: str, value: object) -> None:
+        runtime = self.__dict__.get("_runtime")
+        history = self.__dict__.setdefault(f"_runtime_proxy_history_{name}", [])
+        if isinstance(history, list):
+            if len(history) >= 32:
+                del history[0]
+            history.append(
+                getattr(runtime, name)
+                if runtime is not None
+                else self.__dict__.get(f"_runtime_proxy_{name}")
+            )
+        if runtime is not None:
+            setattr(runtime, name, value)
+        else:
+            self.__dict__[f"_runtime_proxy_{name}"] = value
+
+    def _delete_runtime_proxy(self, name: str) -> None:
+        history = self.__dict__.get(f"_runtime_proxy_history_{name}")
+        if not isinstance(history, list) or not history:
+            self.__dict__.pop(f"_runtime_proxy_{name}", None)
+            return
+        previous = history.pop()
+        runtime = self.__dict__.get("_runtime")
+        if runtime is not None:
+            setattr(runtime, name, previous)
+        else:
+            self.__dict__[f"_runtime_proxy_{name}"] = previous
+
+    @property
+    def popen_factory(self) -> PopenFactory:
+        return self._get_runtime_proxy("popen_factory")  # type: ignore[return-value]
+
+    @popen_factory.setter
+    def popen_factory(self, value: PopenFactory) -> None:
+        self._set_runtime_proxy("popen_factory", value)
+
+    @popen_factory.deleter
+    def popen_factory(self) -> None:
+        self._delete_runtime_proxy("popen_factory")
+
+    @property
+    def kill_fn(self) -> KillFn:
+        return self._get_runtime_proxy("kill_fn")  # type: ignore[return-value]
+
+    @kill_fn.setter
+    def kill_fn(self, value: KillFn) -> None:
+        self._set_runtime_proxy("kill_fn", value)
+
+    @kill_fn.deleter
+    def kill_fn(self) -> None:
+        self._delete_runtime_proxy("kill_fn")
+
+    @property
+    def pid_alive_fn(self) -> PidAliveFn | None:
+        return self._get_runtime_proxy("pid_alive_fn")  # type: ignore[return-value]
+
+    @pid_alive_fn.setter
+    def pid_alive_fn(self, value: PidAliveFn | None) -> None:
+        self._set_runtime_proxy("pid_alive_fn", value)
+
+    @pid_alive_fn.deleter
+    def pid_alive_fn(self) -> None:
+        self._delete_runtime_proxy("pid_alive_fn")
+
+    @property
+    def cmdline_reader(self) -> CmdlineReader:
+        return self._get_runtime_proxy("cmdline_reader")  # type: ignore[return-value]
+
+    @cmdline_reader.setter
+    def cmdline_reader(self, value: CmdlineReader) -> None:
+        self._set_runtime_proxy("cmdline_reader", value)
+
+    @cmdline_reader.deleter
+    def cmdline_reader(self) -> None:
+        self._delete_runtime_proxy("cmdline_reader")
+
+    @property
+    def proc_start_fingerprint_reader(self) -> ProcStartFingerprintReader:
+        return self._get_runtime_proxy("proc_start_fingerprint_reader")  # type: ignore[return-value]
+
+    @proc_start_fingerprint_reader.setter
+    def proc_start_fingerprint_reader(self, value: ProcStartFingerprintReader) -> None:
+        self._set_runtime_proxy("proc_start_fingerprint_reader", value)
+
+    @proc_start_fingerprint_reader.deleter
+    def proc_start_fingerprint_reader(self) -> None:
+        self._delete_runtime_proxy("proc_start_fingerprint_reader")
+
+    @property
+    def _processes(self) -> dict[str, PopenLike]:
+        return self._get_runtime_proxy("_processes")  # type: ignore[return-value]
+
+    @_processes.setter
+    def _processes(self, value: dict[str, PopenLike]) -> None:
+        self._set_runtime_proxy("_processes", value)
+
+    @_processes.deleter
+    def _processes(self) -> None:
+        self._delete_runtime_proxy("_processes")
+
+    @property
+    def stop_grace_seconds(self) -> float:
+        return self._get_runtime_proxy("stop_grace_seconds")  # type: ignore[return-value]
+
+    @stop_grace_seconds.setter
+    def stop_grace_seconds(self, value: float) -> None:
+        self._set_runtime_proxy("stop_grace_seconds", value)
+
+    @stop_grace_seconds.deleter
+    def stop_grace_seconds(self) -> None:
+        self._delete_runtime_proxy("stop_grace_seconds")
+
+    @property
+    def kill_after_timeout(self) -> bool:
+        return self._get_runtime_proxy("kill_after_timeout")  # type: ignore[return-value]
+
+    @kill_after_timeout.setter
+    def kill_after_timeout(self, value: bool) -> None:
+        self._set_runtime_proxy("kill_after_timeout", value)
+
+    @kill_after_timeout.deleter
+    def kill_after_timeout(self) -> None:
+        self._delete_runtime_proxy("kill_after_timeout")
+
+    @property
+    def lock_timeout_seconds(self) -> float:
+        return self._get_runtime_proxy("lock_timeout_seconds")  # type: ignore[return-value]
+
+    @lock_timeout_seconds.setter
+    def lock_timeout_seconds(self, value: float) -> None:
+        self._set_runtime_proxy("lock_timeout_seconds", value)
+
+    @lock_timeout_seconds.deleter
+    def lock_timeout_seconds(self) -> None:
+        self._delete_runtime_proxy("lock_timeout_seconds")
 
     def _lifecycle_context(self, source: str, request_id: str | None) -> _LifecycleContext:
         if source not in _LIFECYCLE_SOURCES:
@@ -362,15 +493,7 @@ class Supervisor:
         self,
         record: BotRecord,
     ) -> contextlib.AbstractContextManager[object]:
-        profile_path = self._safe_profile_path(record.bot_id, record.profile_path)
-        if not os.path.lexists(profile_path):
-            # A schema-v3 launcher cannot publish beneath an absent profile, so
-            # marker absence is already stable without creating profile state.
-            return contextlib.nullcontext()
-        return marker_publication_lock(
-            profile_path,
-            timeout_seconds=self.lock_timeout_seconds,
-        )
+        return self._runtime.marker_publication_lock(record)
 
     def create_bot(
         self,
@@ -409,8 +532,7 @@ class Supervisor:
                     )
                 self._assert_unregistered_profile_inactive(bot_id, profile_path)
 
-            renderer = ProfileRenderer(self.adapter.hermes_root)
-            renderer.preflight(request, template)
+            self._profile_manager.preflight(request, template)
             stopped_record: BotRecord | None = None
             if existing is not None:
                 active = self._record_may_be_active(existing)
@@ -421,7 +543,7 @@ class Supervisor:
                     stopped_record = existing
 
             try:
-                with renderer.transaction(request, template) as record:
+                with self._profile_manager.install_transaction(request, template) as record:
                     self._remove_pid_marker(record.profile_path)
                     self.store.upsert_bot_with_event(
                         record,
@@ -473,10 +595,10 @@ class Supervisor:
                 stopped = self._stop_locked(safe_bot_id, context=context)
                 if stopped.status != BotStatus.stopped:
                     raise BotDeleteError(f"could not stop bot before delete: {stopped.message}")
-            profile_tombstone: Path | None = None
+            profile_deletion: ProfileDeletion | None = None
             try:
                 if remove_profile:
-                    profile_tombstone = self._stage_profile_deletion(
+                    profile_deletion = self._profile_manager.stage_delete(
                         safe_bot_id, record.profile_path
                     )
                 else:
@@ -493,11 +615,12 @@ class Supervisor:
                 )
                 if not deleted:
                     raise KeyError(f"unknown bot: {safe_bot_id}")
-            except BaseException:
-                if profile_tombstone is not None:
-                    self._restore_tombstoned_profile(
-                        safe_bot_id, record.profile_path, profile_tombstone
-                    )
+            except BaseException as operation_error:
+                if profile_deletion is not None:
+                    try:
+                        self._profile_manager.rollback_delete(profile_deletion)
+                    except BotDeleteError as rollback_error:
+                        raise rollback_error from operation_error
                 if was_active:
                     try:
                         self._recover_previously_active_bot(record, "deletion", context=context)
@@ -507,15 +630,14 @@ class Supervisor:
                         ) from recovery_error
                 raise
             cleanup_pending = False
-            if profile_tombstone is not None:
-                try:
-                    shutil.rmtree(profile_tombstone)
-                except OSError as exc:
+            if profile_deletion is not None:
+                cleanup_error = self._profile_manager.finish_delete(profile_deletion)
+                if cleanup_error is not None:
                     cleanup_pending = True
                     self.store.append_audit_event(
                         "bot.delete_cleanup_pending",
                         bot_id=safe_bot_id,
-                        error=type(exc).__name__,
+                        error=type(cleanup_error).__name__,
                     )
             self.store.append_audit_event(
                 "bot.delete",
@@ -555,16 +677,9 @@ class Supervisor:
                 if stopped.status != BotStatus.stopped:
                     raise BotArchiveError(f"could not stop bot before archive: {stopped.message}")
 
-            archive_path: Path | None = None
+            profile_archive: ProfileArchive | None = None
             try:
-                if profile_path.exists():
-                    archive_root = self.store.database_path.parent / "archive"
-                    archive_root.mkdir(parents=True, exist_ok=True)
-                    candidate = archive_root / (
-                        f"{safe_bot_id}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
-                    )
-                    shutil.move(str(profile_path), str(candidate))
-                    archive_path = candidate
+                profile_archive = self._profile_manager.stage_archive(safe_bot_id, profile_path)
                 deleted = self.store.delete_bot_with_event(
                     safe_bot_id,
                     event=self._event(
@@ -576,9 +691,12 @@ class Supervisor:
                 )
                 if not deleted:
                     raise KeyError(f"unknown bot: {safe_bot_id}")
-            except BaseException:
-                if archive_path is not None:
-                    self._restore_archived_profile(safe_bot_id, record.profile_path, archive_path)
+            except BaseException as operation_error:
+                if profile_archive is not None:
+                    try:
+                        self._profile_manager.rollback_archive(profile_archive)
+                    except BotArchiveError as rollback_error:
+                        raise rollback_error from operation_error
                 if was_active:
                     try:
                         self._recover_previously_active_bot(record, "archive", context=context)
@@ -587,6 +705,7 @@ class Supervisor:
                             "bot archive failed and the previous bot could not be restarted"
                         ) from recovery_error
                 raise
+            archive_path = profile_archive.archive_path if profile_archive is not None else None
             self.store.append_audit_event(
                 "bot.archive",
                 bot_id=safe_bot_id,
@@ -742,140 +861,71 @@ class Supervisor:
                     record.profile_path,
                     f"restart aborted: launch preflight failed: {exc}",
                 )
-        payload = self.adapter.launcher_payload(
-            bot_id,
-            operation_id=operation_id,
-            desired_revision=record.desired_revision,
-            readiness_probe=probe,
+        effect = self._runtime.launch(
+            record,
+            probe=probe,
+            wait=wait,
+            marker_lock=self._marker_publication_lock,
+            marker_matcher=self._matching_runtime_marker,
+            ack_reader=self._read_launcher_ack,
+            pipe_writer=self._write_pipe_payload,
         )
-        marker_data = payload["marker"]
-        if type(marker_data) is not dict:
-            raise RuntimeError("launcher produced an invalid marker payload")
-        expected_fingerprint = str(marker_data["command_fingerprint"])
-        log_path = self.log_path(record.profile_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        process: PopenLike | None = None
-        payload_read = payload_write = ack_read = ack_write = -1
-        try:
-            encoded_payload = json.dumps(
-                payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-            if not encoded_payload or len(encoded_payload) > MAX_PAYLOAD_BYTES:
-                raise ValueError("launcher payload is too large")
-            payload_read, payload_write = os.pipe()
-            ack_read, ack_write = os.pipe()
-            launcher_argv = self.adapter.launcher_command(payload_read, ack_write)
-            with log_path.open("ab") as log_file:
-                process = self.popen_factory(
-                    launcher_argv,
-                    env=dict(os.environ),
-                    stdout=log_file,
-                    stderr=log_file,
-                    pass_fds=(payload_read, ack_write),
-                    close_fds=True,
-                    **_gateway_process_launch_kwargs(),
-                )
-            os.close(payload_read)
-            payload_read = -1
-            os.close(ack_write)
-            ack_write = -1
-            self._write_pipe_payload(payload_write, encoded_payload)
-            os.close(payload_write)
-            payload_write = -1
-            acknowledgment = self._read_launcher_ack(ack_read)
-            os.close(ack_read)
-            ack_read = -1
-            if acknowledgment != b"1":
-                raise RuntimeError("gateway launcher did not acknowledge marker publication")
-            with self._marker_publication_lock(record):
-                marker = self._matching_runtime_marker(
+        if effect.outcome == "launch_failed":
+            failure_message = f"failed to start gateway: {effect.reason}"
+            try:
+                self._complete_failed_intent(
                     record,
-                    expected_fingerprint=expected_fingerprint,
-                    expected_pid=process.pid,
-                    require_live_command=True,
-                )
-                if marker.kind != "live":
-                    raise RuntimeError(
-                        "gateway launcher ownership marker could not be verified: " + marker.reason
-                    )
-            self._processes[bot_id] = process
-        except BaseException as exc:
-            for fd in (payload_read, payload_write, ack_read, ack_write):
-                if fd >= 0:
-                    with contextlib.suppress(OSError):
-                        os.close(fd)
-            if process is None:
-                if not isinstance(exc, (OSError, ValueError)):
-                    raise
-                self._processes.pop(bot_id, None)
-                failure_message = f"failed to start gateway: {exc}"
-                try:
-                    self._complete_failed_intent(
-                        record,
-                        context=context,
-                        pid=None,
-                        message=failure_message,
-                        reason="gateway process launch failed",
-                    )
-                except Exception:
-                    return self._pending_action_required(
-                        record, "launch failure could not be persisted"
-                    )
-                self.store.append_audit_event(
-                    "bot.start_failed",
-                    bot_id=bot_id,
-                    error=type(exc).__name__,
-                    message=str(exc),
-                )
-                return BotStatusResponse(
-                    bot_id=bot_id,
-                    status=BotStatus.failed,
+                    context=context,
                     pid=None,
-                    profile_path=record.profile_path,
                     message=failure_message,
+                    reason="gateway process launch failed",
                 )
-            cleanup_complete = self._cleanup_interrupted_intent_launch(
-                record,
-                process,
-                expected_fingerprint=expected_fingerprint,
+            except Exception:
+                return self._pending_action_required(
+                    record, "launch failure could not be persisted"
+                )
+            self.store.append_audit_event(
+                "bot.start_failed",
+                bot_id=bot_id,
+                error=effect.error_type,
+                message=effect.reason,
             )
-            if not isinstance(exc, Exception):
-                raise
-            if cleanup_complete:
-                return BotStatusResponse(
-                    bot_id=bot_id,
-                    status=BotStatus.failed,
-                    pid=None,
-                    profile_path=record.profile_path,
-                    message="gateway start registration failed; spawned process was stopped",
-                )
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message=failure_message,
+            )
+        if effect.outcome == "registration_failed_clean":
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message="gateway start registration failed; spawned process was stopped",
+            )
+        if effect.outcome == "registration_failed_unknown":
             return BotStatusResponse(
                 bot_id=bot_id,
                 status=BotStatus.unknown,
-                pid=process.pid,
+                pid=effect.pid,
                 profile_path=record.profile_path,
                 message=(
                     "gateway start registration failed and spawned process cleanup "
                     "could not be confirmed"
                 ),
             )
-        if process is None:  # Defensive guard for custom process factories.
-            raise RuntimeError("gateway process factory returned no process")
-        returncode = self._poll_startup(process)
-        if returncode is not None:
-            remove_marker_if_owned(
-                self._safe_profile_path(record.bot_id, record.profile_path),
-                operation_id=operation_id,
-                desired_revision=record.desired_revision,
-                pid=process.pid,
-                command_fingerprint=expected_fingerprint,
+        generation = effect.generation
+        if generation is None:
+            raise RuntimeError("gateway runtime returned no launch generation")
+        pid = effect.pid if effect.pid is not None else generation.pid
+        if effect.outcome == "startup_exited":
+            returncode = effect.returncode
+            failure_message = (
+                f"gateway exited during startup grace period with return code {returncode}"
             )
-            self._processes.pop(bot_id, None)
-            message = f"gateway exited during startup grace period with return code {returncode}"
-            terminal = replace(record, pid=process.pid)
+            terminal = replace(record, pid=pid)
             try:
                 self._complete_failed_intent(
                     terminal,
@@ -883,17 +933,15 @@ class Supervisor:
                     pid=None,
                     stopped_at=datetime.now(UTC),
                     last_exit_code=returncode,
-                    message=message,
+                    message=failure_message,
                     reason="gateway exited during startup grace period",
                 )
             except Exception:
-                return self._launch_completion_failure_response(
-                    record, process, expected_fingerprint=expected_fingerprint
-                )
+                return self._launch_completion_failure_response(record, generation)
             self.store.append_audit_event(
                 "bot.start_failed",
                 bot_id=bot_id,
-                pid=process.pid,
+                pid=pid,
                 returncode=returncode,
             )
             return BotStatusResponse(
@@ -901,143 +949,125 @@ class Supervisor:
                 status=BotStatus.failed,
                 pid=None,
                 profile_path=record.profile_path,
-                message=message,
+                message=failure_message,
             )
-        if probe is not None:
-            if wait:
-                readiness = self._wait_for_readiness(process, probe)
-                if process.poll() is not None:
-                    returncode = process.poll()
-                    remove_marker_if_owned(
-                        self._safe_profile_path(record.bot_id, record.profile_path),
-                        operation_id=operation_id,
-                        desired_revision=record.desired_revision,
-                        pid=process.pid,
-                        command_fingerprint=expected_fingerprint,
-                    )
-                    self._processes.pop(bot_id, None)
-                    try:
-                        self._complete_failed_intent(
-                            record,
-                            context=context,
-                            pid=None,
-                            stopped_at=datetime.now(UTC),
-                            last_exit_code=returncode,
-                            message="gateway process exited during readiness check",
-                            reason="readiness process exited",
-                        )
-                    except Exception:
-                        return self._launch_completion_failure_response(
-                            record, process, expected_fingerprint=expected_fingerprint
-                        )
-                    self.store.append_audit_event(
-                        "bot.start_failed",
-                        bot_id=bot_id,
-                        pid=process.pid,
-                        returncode=returncode,
-                        reason="readiness_process_exited",
-                    )
-                    return BotStatusResponse(
-                        bot_id=bot_id,
-                        status=BotStatus.failed,
-                        pid=None,
-                        profile_path=record.profile_path,
-                        message="gateway process exited during readiness check",
-                    )
-                if readiness.ready:
-                    try:
-                        self._complete_started_intent(
-                            record,
-                            context=context,
-                            status=BotStatus.running,
-                            pid=process.pid,
-                            ready_at=datetime.now(UTC),
-                            reset_restart=reset_restart,
-                            reason="gateway readiness probe passed",
-                        )
-                    except Exception:
-                        return self._launch_completion_failure_response(
-                            record, process, expected_fingerprint=expected_fingerprint
-                        )
-                    self.store.append_audit_event("bot.start", bot_id=bot_id, pid=process.pid)
-                    return BotStatusResponse(
-                        bot_id=bot_id,
-                        status=BotStatus.running,
-                        pid=process.pid,
-                        profile_path=record.profile_path,
-                        message="gateway ready",
-                    )
-                try:
-                    self._complete_started_intent(
-                        record,
-                        context=context,
-                        status=BotStatus.starting,
-                        pid=process.pid,
-                        last_error=readiness.message,
-                        reason="readiness probe timed out",
-                    )
-                except Exception:
-                    return self._launch_completion_failure_response(
-                        record, process, expected_fingerprint=expected_fingerprint
-                    )
-                self.store.append_audit_event(
-                    "bot.start_readiness_pending",
-                    bot_id=bot_id,
-                    pid=process.pid,
-                    url=probe.url,
-                    message=readiness.message,
+        if effect.outcome == "readiness_exited":
+            try:
+                self._complete_failed_intent(
+                    record,
+                    context=context,
+                    pid=None,
+                    stopped_at=datetime.now(UTC),
+                    last_exit_code=effect.returncode,
+                    message="gateway process exited during readiness check",
+                    reason="readiness process exited",
                 )
-                return BotStatusResponse(
-                    bot_id=bot_id,
-                    status=BotStatus.starting,
-                    pid=process.pid,
-                    profile_path=record.profile_path,
-                    message="readiness timeout; gateway process still alive",
+            except Exception:
+                return self._launch_completion_failure_response(record, generation)
+            self.store.append_audit_event(
+                "bot.start_failed",
+                bot_id=bot_id,
+                pid=pid,
+                returncode=effect.returncode,
+                reason="readiness_process_exited",
+            )
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.failed,
+                pid=None,
+                profile_path=record.profile_path,
+                message="gateway process exited during readiness check",
+            )
+        if effect.outcome == "ready":
+            try:
+                self._complete_started_intent(
+                    record,
+                    context=context,
+                    status=BotStatus.running,
+                    pid=pid,
+                    ready_at=datetime.now(UTC),
+                    reset_restart=reset_restart,
+                    reason="gateway readiness probe passed",
                 )
+            except Exception:
+                return self._launch_completion_failure_response(record, generation)
+            self.store.append_audit_event("bot.start", bot_id=bot_id, pid=pid)
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.running,
+                pid=pid,
+                profile_path=record.profile_path,
+                message="gateway ready",
+            )
+        if effect.outcome == "readiness_timeout":
             try:
                 self._complete_started_intent(
                     record,
                     context=context,
                     status=BotStatus.starting,
-                    pid=process.pid,
-                    reason="gateway process started; readiness probe pending",
+                    pid=pid,
+                    last_error=effect.readiness_message,
+                    reason="readiness probe timed out",
                 )
             except Exception:
-                return self._launch_completion_failure_response(
-                    record, process, expected_fingerprint=expected_fingerprint
-                )
+                return self._launch_completion_failure_response(record, generation)
             self.store.append_audit_event(
                 "bot.start_readiness_pending",
                 bot_id=bot_id,
-                pid=process.pid,
-                url=probe.url,
+                pid=pid,
+                url=probe.url if probe is not None else None,
+                message=effect.readiness_message,
             )
             return BotStatusResponse(
                 bot_id=bot_id,
                 status=BotStatus.starting,
-                pid=process.pid,
+                pid=pid,
+                profile_path=record.profile_path,
+                message="readiness timeout; gateway process still alive",
+            )
+        if effect.outcome == "readiness_pending":
+            try:
+                self._complete_started_intent(
+                    record,
+                    context=context,
+                    status=BotStatus.starting,
+                    pid=pid,
+                    reason="gateway process started; readiness probe pending",
+                )
+            except Exception:
+                return self._launch_completion_failure_response(record, generation)
+            self.store.append_audit_event(
+                "bot.start_readiness_pending",
+                bot_id=bot_id,
+                pid=pid,
+                url=probe.url if probe is not None else None,
+            )
+            return BotStatusResponse(
+                bot_id=bot_id,
+                status=BotStatus.starting,
+                pid=pid,
                 profile_path=record.profile_path,
                 message="started; readiness probe pending",
             )
+        if effect.outcome != "running":
+            raise RuntimeError(f"unknown gateway launch outcome: {effect.outcome}")
         try:
             self._complete_started_intent(
                 record,
                 context=context,
                 status=BotStatus.running,
-                pid=process.pid,
+                pid=pid,
                 ready_at=datetime.now(UTC),
                 reset_restart=reset_restart,
                 reason="gateway process started without readiness probe",
             )
         except Exception:
-            return self._launch_completion_failure_response(
-                record, process, expected_fingerprint=expected_fingerprint
-            )
-        self.store.append_audit_event("bot.start", bot_id=bot_id, pid=process.pid)
+            return self._launch_completion_failure_response(record, generation)
+        self.store.append_audit_event("bot.start", bot_id=bot_id, pid=pid)
         return BotStatusResponse(
             bot_id=bot_id,
             status=BotStatus.running,
-            pid=process.pid,
+            pid=pid,
             profile_path=record.profile_path,
             message=message,
         )
@@ -1045,45 +1075,13 @@ class Supervisor:
     def _preflight_start(
         self, record: BotRecord, *, timeout_seconds: float | None
     ) -> ReadinessProbe | None:
-        expected_profile = (Path(self.adapter.hermes_root) / "profiles" / record.bot_id).resolve()
-        if Path(record.profile_path).resolve() != expected_profile:
-            raise TemplateError("registered bot profile does not match the Hermes profile path")
-        safe_profile = self._safe_profile_path(record.bot_id, record.profile_path)
-        if not safe_profile.is_dir() or safe_profile.is_symlink():
-            raise TemplateError("registered bot profile is not a safe directory")
-        _argv, env = self.adapter.command(record.bot_id, "gateway", "run")
-        probe = self._readiness_probe(env, timeout_seconds=timeout_seconds)
-        self.adapter.launcher_payload(
-            record.bot_id,
-            operation_id="0" * 32,
-            desired_revision=max(1, record.desired_revision + 1),
-            readiness_probe=probe,
-        )
-        return probe
+        return self._runtime.preflight_start(record, timeout_seconds=timeout_seconds)
 
     def _write_pipe_payload(self, fd: int, payload: bytes) -> None:
-        offset = 0
-        while offset < len(payload):
-            written = os.write(fd, payload[offset:])
-            if written <= 0:
-                raise OSError("short launcher payload write")
-            offset += written
+        self._runtime.write_pipe_payload(fd, payload)
 
     def _read_launcher_ack(self, fd: int) -> bytes:
-        deadline = time.monotonic() + 5.0
-        acknowledgment = bytearray()
-        while len(acknowledgment) <= 1:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("gateway launcher acknowledgment timed out")
-            readable, _writable, _exceptional = select.select([fd], [], [], remaining)
-            if not readable:
-                raise TimeoutError("gateway launcher acknowledgment timed out")
-            chunk = os.read(fd, 2 - len(acknowledgment))
-            if not chunk:
-                return bytes(acknowledgment)
-            acknowledgment.extend(chunk)
-        return bytes(acknowledgment)
+        return self._runtime.read_launcher_ack(fd)
 
     def _complete_started_intent(
         self,
@@ -1162,37 +1160,18 @@ class Supervisor:
         *,
         expected_fingerprint: str,
     ) -> bool:
-        cleanup_errors: list[str] = []
-        stopped = self._terminate_spawned_process(process, cleanup_errors)
-        if not stopped:
-            return False
-        self._processes.pop(record.bot_id, None)
-        operation_id = record.pending_operation_id
-        if operation_id is None:
-            return False
-        remove_marker_if_owned(
-            self._safe_profile_path(record.bot_id, record.profile_path),
-            operation_id=operation_id,
-            desired_revision=record.desired_revision,
-            pid=process.pid,
-            command_fingerprint=expected_fingerprint,
-        )
-        return (
-            self._read_strict_runtime_marker(record.bot_id, record.profile_path).kind == "missing"
+        return self._runtime.cleanup_interrupted_launch(
+            record,
+            process,
+            expected_fingerprint=expected_fingerprint,
         )
 
     def _launch_completion_failure_response(
         self,
         record: BotRecord,
-        process: PopenLike,
-        *,
-        expected_fingerprint: str,
+        generation: _GatewayGeneration,
     ) -> BotStatusResponse:
-        cleaned = self._cleanup_interrupted_intent_launch(
-            record,
-            process,
-            expected_fingerprint=expected_fingerprint,
-        )
+        cleaned = self._runtime.cleanup_registered_launch(record, generation)
         if cleaned:
             return BotStatusResponse(
                 record.bot_id,
@@ -1204,7 +1183,7 @@ class Supervisor:
         return BotStatusResponse(
             record.bot_id,
             BotStatus.unknown,
-            process.pid,
+            generation.pid,
             record.profile_path,
             "gateway start completion is unknown and cleanup could not be confirmed",
         )
@@ -1212,54 +1191,7 @@ class Supervisor:
     def _read_strict_runtime_marker(
         self, bot_id: str, registered_profile_path: str
     ) -> _MarkerObservation:
-        profile_path = _nofollow_absolute_path(Path(registered_profile_path))
-        expected_profile = self._marker_profiles_root / bot_id
-        if not profile_path.is_absolute() or profile_path != expected_profile:
-            return _MarkerObservation(
-                "untrusted",
-                reason="registered profile path does not match the trusted Hermes profile",
-            )
-        profile_fd = logs_fd = marker_fd = -1
-        try:
-            profile_fd = _open_profile(profile_path)
-        except (OSError, ValueError) as exc:
-            if isinstance(exc.__cause__, FileNotFoundError):
-                return _MarkerObservation("missing", reason="marker is missing")
-            return _MarkerObservation(
-                "untrusted", reason=f"registered profile cannot be opened safely: {exc}"
-            )
-        try:
-            try:
-                logs_fd = _open_logs(profile_fd, create=False)
-            except ValueError as exc:
-                if isinstance(exc.__cause__, FileNotFoundError):
-                    return _MarkerObservation("missing", reason="marker is missing")
-                return _MarkerObservation(
-                    "untrusted", reason=f"marker directory cannot be opened safely: {exc}"
-                )
-            try:
-                marker_fd, marker_stat = _open_regular_marker(logs_fd)
-                raw = _read_bounded_file(marker_fd)
-                value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-            except FileNotFoundError:
-                return _MarkerObservation("missing", reason="marker is missing")
-            except ValueError as exc:
-                if isinstance(exc.__cause__, FileNotFoundError):
-                    return _MarkerObservation("missing", reason="marker is missing")
-                return _MarkerObservation("untrusted", reason=f"marker is invalid: {exc}")
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                return _MarkerObservation("untrusted", reason=f"marker is invalid: {exc}")
-        except FileNotFoundError:
-            return _MarkerObservation("missing", reason="marker is missing")
-        finally:
-            for fd in (marker_fd, logs_fd, profile_fd):
-                if fd >= 0:
-                    os.close(fd)
-        if type(value) is not dict:
-            return _MarkerObservation("untrusted", reason="marker is not an object")
-        if marker_stat.st_nlink != 1:
-            return _MarkerObservation("untrusted", reason="marker has unexpected hard links")
-        return _MarkerObservation("present", payload=value)
+        return self._runtime.read_strict_runtime_marker(bot_id, registered_profile_path)
 
     def _matching_runtime_marker(
         self,
@@ -1269,20 +1201,12 @@ class Supervisor:
         expected_pid: int | None = None,
         require_live_command: bool,
     ) -> _MarkerObservation:
-        observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-        if observed.kind != "present" or observed.payload is None:
-            return observed
-        operation_id = record.pending_operation_id
-        if operation_id is None:
-            return _MarkerObservation("untrusted", reason="pending operation is missing")
-        return self._classify_schema3_runtime_marker(
+        return self._runtime.matching_runtime_marker(
             record,
-            observed.payload,
-            expected_pid=expected_pid,
-            expected_operation_id=operation_id,
-            expected_revision=record.desired_revision,
             expected_fingerprint=expected_fingerprint,
+            expected_pid=expected_pid,
             require_live_command=require_live_command,
+            read_marker=self._read_strict_runtime_marker,
         )
 
     def _classify_schema3_runtime_marker(
@@ -1296,94 +1220,32 @@ class Supervisor:
         expected_fingerprint: str | None = None,
         require_live_command: bool,
     ) -> _MarkerObservation:
-        pid_value = payload.get("pid")
-        if type(pid_value) is not int or pid_value <= 0:
-            return _MarkerObservation("untrusted", reason="marker PID is invalid")
-        pid = pid_value
-        if expected_pid is not None and pid != expected_pid:
-            return _MarkerObservation("untrusted", reason="marker PID does not match")
-        operation_id = payload.get("operation_id")
-        revision = payload.get("desired_revision")
-        fingerprint = payload.get("command_fingerprint")
-        if (
-            type(operation_id) is not str
-            or type(revision) is not int
-            or type(fingerprint) is not str
-        ):
-            return _MarkerObservation("untrusted", reason="marker correlation is invalid")
-        if expected_operation_id is not None and operation_id != expected_operation_id:
-            return _MarkerObservation("untrusted", reason="marker operation does not match")
-        if expected_revision is not None and revision != expected_revision:
-            return _MarkerObservation("untrusted", reason="marker revision does not match")
-        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
-            return _MarkerObservation("untrusted", reason="marker command does not match")
-        if not _is_owned_runtime_marker(
+        return self._runtime.classify_schema3_runtime_marker(
+            record,
             payload,
-            bot_id=record.bot_id,
-            operation_id=operation_id,
-            desired_revision=revision,
-            pid=pid,
-            expected_fingerprint=fingerprint,
-        ):
-            return _MarkerObservation("untrusted", reason="marker schema or command does not match")
-        expected_hermes = self._resolved_hermes_bin()
-        if expected_hermes is None or payload.get("resolved_hermes_bin") != expected_hermes:
-            return _MarkerObservation("untrusted", reason="marker executable is not trusted")
-        if not require_live_command:
-            start_identity_error = self._process_start_identity_error(payload, pid)
-            if start_identity_error is not None:
-                return _MarkerObservation("untrusted", reason=start_identity_error)
-            return _MarkerObservation("live", payload=payload)
-        pid_state = self._pid_state(pid)
-        if pid_state is _PidState.unknown:
-            return _MarkerObservation("untrusted", reason="marker PID liveness is unknown")
-        if pid_state is _PidState.dead:
-            if self._process_start_fingerprint_required() and not self._valid_marker_start(
-                payload.get("proc_start_fingerprint")
-            ):
-                return _MarkerObservation(
-                    "untrusted", reason="process start fingerprint is unavailable"
-                )
-            return _MarkerObservation("dead", payload=payload, reason="marker PID is dead")
-        start_identity_error = self._process_start_identity_error(payload, pid)
-        if start_identity_error is not None:
-            return _MarkerObservation("untrusted", reason=start_identity_error)
-        live_argv = self.cmdline_reader(pid)
-        if not live_argv:
-            return _MarkerObservation("untrusted", reason="live gateway command is unavailable")
-        command_check = _verify_gateway_command(
-            live_argv,
-            record.bot_id,
-            self._trusted_hermes_bins(),
-            require_trusted_path=True,
+            expected_pid=expected_pid,
+            expected_operation_id=expected_operation_id,
+            expected_revision=expected_revision,
+            expected_fingerprint=expected_fingerprint,
+            require_live_command=require_live_command,
         )
-        if not command_check.verified:
-            return _MarkerObservation("untrusted", reason="live gateway command does not match")
-        return _MarkerObservation("live", payload=payload)
 
     def _process_start_identity_error(self, payload: dict[str, object], pid: int) -> str | None:
-        marker_start = payload.get("proc_start_fingerprint")
-        live_start = self.proc_start_fingerprint_reader(pid)
-        if self._process_start_fingerprint_required():
-            if not self._valid_marker_start(marker_start) or not self._valid_marker_start(
-                live_start
-            ):
-                return "process start fingerprint is unavailable"
-            if marker_start != live_start:
-                return "process start fingerprint does not match"
-        elif live_start and marker_start != live_start:
-            return "process start fingerprint does not match"
-        elif marker_start and live_start != marker_start:
-            return "process start fingerprint is unavailable"
-        return None
+        if "_runtime" in self.__dict__:
+            return self._runtime.process_start_identity_error(payload, pid)
+        return _process_identity.process_start_identity_error(
+            payload.get("proc_start_fingerprint"),
+            self.proc_start_fingerprint_reader(pid),
+            fingerprint_required=self._process_start_fingerprint_required(),
+        )
 
     @staticmethod
     def _valid_marker_start(value: object) -> bool:
-        return type(value) is str and bool(value) and len(value) <= 512
+        return _process_identity.valid_process_start_fingerprint(value)
 
     @staticmethod
     def _process_start_fingerprint_required() -> bool:
-        return platform.system() in {"Darwin", "Linux"}
+        return _process_identity.process_start_fingerprint_required(platform.system())
 
     def _classify_existing_runtime_marker(
         self,
@@ -1391,14 +1253,10 @@ class Supervisor:
         *,
         expected_pid: int | None = None,
     ) -> _MarkerObservation:
-        observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-        if observed.kind != "present" or observed.payload is None:
-            return observed
-        return self._classify_schema3_runtime_marker(
+        return self._runtime.classify_existing_runtime_marker(
             record,
-            observed.payload,
             expected_pid=expected_pid,
-            require_live_command=True,
+            read_marker=self._read_strict_runtime_marker,
         )
 
     def _remove_exact_schema3_marker(
@@ -1406,61 +1264,23 @@ class Supervisor:
         record: BotRecord,
         marker: _MarkerObservation,
     ) -> bool:
-        if marker.kind != "dead":
-            return False
-        generation = self._gateway_generation(marker)
-        if generation is None:
-            return False
-        return self._remove_gateway_generation_marker(record, generation)
+        return self._runtime.remove_exact_schema3_marker(record, marker)
 
     def _gateway_generation(
         self,
         marker: _MarkerObservation,
     ) -> _GatewayGeneration | None:
-        payload = marker.payload
-        if marker.kind not in {"live", "dead"} or payload is None:
-            return None
-        operation_id = payload.get("operation_id")
-        revision = payload.get("desired_revision")
-        pid = payload.get("pid")
-        fingerprint = payload.get("command_fingerprint")
-        process_start = payload.get("proc_start_fingerprint")
-        if (
-            type(operation_id) is not str
-            or type(revision) is not int
-            or type(pid) is not int
-            or type(fingerprint) is not str
-            or (process_start is not None and type(process_start) is not str)
-        ):
-            return None
-        return _GatewayGeneration(
-            operation_id=operation_id,
-            desired_revision=revision,
-            pid=pid,
-            command_fingerprint=fingerprint,
-            proc_start_fingerprint=process_start,
-        )
+        return self._runtime.gateway_generation(marker)
 
     def _classify_exact_gateway_generation(
         self,
         record: BotRecord,
         generation: _GatewayGeneration,
     ) -> _MarkerObservation:
-        observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-        if observed.kind != "present" or observed.payload is None:
-            return _MarkerObservation("untrusted", reason="previous gateway marker changed")
-        if observed.payload.get("proc_start_fingerprint") != generation.proc_start_fingerprint:
-            return _MarkerObservation(
-                "untrusted", reason="previous gateway process identity changed"
-            )
-        return self._classify_schema3_runtime_marker(
+        return self._runtime.classify_exact_gateway_generation(
             record,
-            observed.payload,
-            expected_pid=generation.pid,
-            expected_operation_id=generation.operation_id,
-            expected_revision=generation.desired_revision,
-            expected_fingerprint=generation.command_fingerprint,
-            require_live_command=True,
+            generation,
+            read_marker=self._read_strict_runtime_marker,
         )
 
     def _remove_gateway_generation_marker(
@@ -1468,29 +1288,14 @@ class Supervisor:
         record: BotRecord,
         generation: _GatewayGeneration,
     ) -> bool:
-        return remove_marker_if_owned(
-            self._safe_profile_path(record.bot_id, record.profile_path),
-            operation_id=generation.operation_id,
-            desired_revision=generation.desired_revision,
-            pid=generation.pid,
-            command_fingerprint=generation.command_fingerprint,
-            expected_proc_start_fingerprint=generation.proc_start_fingerprint,
-            lock_timeout_seconds=self.lock_timeout_seconds,
-        )
+        return self._runtime.remove_gateway_generation_marker(record, generation)
 
     def _remove_gateway_generation_marker_locked(
         self,
         record: BotRecord,
         generation: _GatewayGeneration,
     ) -> bool:
-        return _remove_marker_if_owned_locked(
-            self._safe_profile_path(record.bot_id, record.profile_path),
-            operation_id=generation.operation_id,
-            desired_revision=generation.desired_revision,
-            pid=generation.pid,
-            command_fingerprint=generation.command_fingerprint,
-            expected_proc_start_fingerprint=generation.proc_start_fingerprint,
-        )
+        return self._runtime.remove_gateway_generation_marker_locked(record, generation)
 
     def _pending_action_required(self, record: BotRecord, reason: str) -> BotStatusResponse:
         return BotStatusResponse(
@@ -1569,25 +1374,32 @@ class Supervisor:
         context: _LifecycleContext,
         complete_stop: bool,
     ) -> BotStatusResponse:
-        bot_id = record.bot_id
-        observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-        if (
-            observed.kind == "present"
-            and observed.payload is not None
-            and self._is_compat_runtime_marker(observed.payload)
-        ):
-            return self._pending_action_required(
-                record,
-                "schema-v2 or legacy gateway stop requires manual process resolution",
-            )
-        pid_state = self._pid_state(record.pid) if record.pid else _PidState.dead
-        if record.pid and pid_state == _PidState.unknown:
-            return self._pending_action_required(record, "gateway PID liveness is unknown")
-        if not record.pid or pid_state == _PidState.dead:
-            if not self._remove_owned_launch_marker_locked(record, observed=observed):
-                return self._pending_action_required(
-                    record, "stale gateway marker ownership could not be verified"
+        effect = self._runtime.stop_locked(
+            record,
+            kill_after_timeout=kill_after_timeout,
+            read_marker=self._read_strict_runtime_marker,
+            classify_existing=self._classify_existing_runtime_marker,
+            classify_exact=self._classify_exact_gateway_generation,
+            remove_owned=self._remove_owned_launch_marker_locked,
+            remove_generation=self._remove_gateway_generation_marker_locked,
+        )
+        if effect.outcome not in {"not_running", "stopped"}:
+            if effect.kill_result is not None:
+                self.store.append_audit_event(
+                    "bot.stop_kill",
+                    bot_id=record.bot_id,
+                    pid=effect.pid,
+                    succeeded=bool(effect.kill_succeeded),
                 )
+            if effect.outcome == "grace_expired":
+                reason = (
+                    "gateway did not stop before grace period expired; "
+                    "Hermes async delegations may still be running"
+                )
+            else:
+                reason = effect.reason
+            return self._pending_action_required(record, reason)
+        if effect.outcome == "not_running":
             if complete_stop:
                 try:
                     self._complete_stopped_intent(
@@ -1599,80 +1411,26 @@ class Supervisor:
                     return self._pending_action_required(
                         record, "stopped state could not be persisted"
                     )
-            self.store.append_audit_event("bot.stop", bot_id=bot_id, pid=record.pid)
+            self.store.append_audit_event("bot.stop", bot_id=record.bot_id, pid=record.pid)
             return BotStatusResponse(
-                bot_id=bot_id,
+                bot_id=record.bot_id,
                 status=BotStatus.stopped,
                 pid=None,
                 profile_path=record.profile_path,
                 message="not running",
             )
-
-        marker = self._classify_existing_runtime_marker(record, expected_pid=record.pid)
-        generation = self._gateway_generation(marker)
-        if marker.kind != "live" or generation is None:
-            return self._pending_action_required(
-                record,
-                "refusing to stop process because PID ownership could not be verified",
-            )
-        term_marker = self._classify_exact_gateway_generation(record, generation)
-        if term_marker.kind != "live":
-            return self._pending_action_required(
-                record,
-                term_marker.reason or "gateway ownership changed before SIGTERM",
-            )
-
-        term_result = self._send_signal(record.pid, signal.SIGTERM)
-        if term_result == _SignalResult.denied:
-            return self._pending_action_required(record, "could not send SIGTERM to the gateway")
-        stopped = term_result == _SignalResult.missing
-        if not stopped:
-            stopped = self._wait_for_exit(bot_id, record.pid)
-        should_kill = self.kill_after_timeout if kill_after_timeout is None else kill_after_timeout
-        if not stopped and should_kill:
-            kill_marker = self._classify_exact_gateway_generation(record, generation)
-            if kill_marker.kind != "live":
-                return self._pending_action_required(
-                    record,
-                    kill_marker.reason or "gateway ownership changed before SIGKILL",
-                )
-            kill_result = self._send_signal(record.pid, signal.SIGKILL)
-            if kill_result == _SignalResult.denied:
-                self.store.append_audit_event(
-                    "bot.stop_kill",
-                    bot_id=bot_id,
-                    pid=record.pid,
-                    succeeded=False,
-                )
-                return self._pending_action_required(
-                    record, "could not send SIGKILL to the gateway"
-                )
-            stopped = kill_result == _SignalResult.missing
-            if not stopped:
-                stopped = self._wait_for_exit(bot_id, record.pid)
+        if effect.kill_result is not None:
             self.store.append_audit_event(
                 "bot.stop_kill",
-                bot_id=bot_id,
-                pid=record.pid,
-                succeeded=stopped,
+                bot_id=record.bot_id,
+                pid=effect.pid,
+                succeeded=bool(effect.kill_succeeded),
             )
-        if not stopped:
-            message = (
-                "gateway did not stop before grace period expired; "
-                "Hermes async delegations may still be running"
-            )
-            return self._pending_action_required(record, message)
-
-        if not self._remove_gateway_generation_marker_locked(record, generation):
-            return self._pending_action_required(
-                record, "stopped gateway marker cleanup could not be verified"
-            )
-        self._processes.pop(bot_id, None)
         if not complete_stop:
             try:
                 self._update_lifecycle(
                     context,
-                    bot_id,
+                    record.bot_id,
                     BotStatus.stopped,
                     pid=None,
                     action="bot.restart.old_process_stopped",
@@ -1693,9 +1451,9 @@ class Supervisor:
                 )
             except Exception:
                 return self._pending_action_required(record, "stopped state could not be persisted")
-        self.store.append_audit_event("bot.stop", bot_id=bot_id, pid=record.pid)
+        self.store.append_audit_event("bot.stop", bot_id=record.bot_id, pid=record.pid)
         return BotStatusResponse(
-            bot_id=bot_id,
+            bot_id=record.bot_id,
             status=BotStatus.stopped,
             pid=None,
             profile_path=record.profile_path,
@@ -1734,27 +1492,7 @@ class Supervisor:
         *,
         observed: _MarkerObservation | None = None,
     ) -> bool:
-        if observed is None:
-            observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-        if observed.kind == "missing":
-            return True
-        if observed.kind != "present" or observed.payload is None or record.pid is None:
-            return False
-        if record.pending_action not in {"stop", "restart"}:
-            return False
-        marker = self._classify_schema3_runtime_marker(
-            record,
-            observed.payload,
-            expected_pid=record.pid,
-            expected_revision=record.desired_revision - 1,
-            require_live_command=True,
-        )
-        generation = self._gateway_generation(marker)
-        return (
-            marker.kind == "dead"
-            and generation is not None
-            and self._remove_gateway_generation_marker_locked(record, generation)
-        )
+        return self._runtime.remove_owned_launch_marker_locked(record, observed=observed)
 
     def restart(
         self,
@@ -2342,8 +2080,7 @@ class Supervisor:
 
     @staticmethod
     def _is_compat_runtime_marker(payload: dict[str, object]) -> bool:
-        schema = payload.get("schema")
-        return (type(schema) is int and schema == 2) or schema is None
+        return is_compat_runtime_marker(payload)
 
     def _recover_pending_intent(
         self,
@@ -2352,123 +2089,86 @@ class Supervisor:
         context: _LifecycleContext,
         allow_launch: bool,
     ) -> BotStatusResponse:
-        action = record.pending_action
-        operation_id = record.pending_operation_id
-        if action is None or operation_id is None:
-            return self._pending_action_required(record, "pending lifecycle correlation is invalid")
-        recovery_context = _LifecycleContext(operation_id, context.source, context.request_id)
-        if action == "stop":
-            try:
-                with self._marker_publication_lock(record):
-                    return self._recover_pending_stop_intent_locked(
-                        record,
-                        context=recovery_context,
-                        allow_stop=allow_launch,
-                    )
-            except (BotDeleteError, LaunchPayloadError) as exc:
-                return self._pending_action_required(record, str(exc))
+        return self._intent_recovery.recover(
+            self,
+            record,
+            context=context,
+            allow_launch=allow_launch,
+        )
 
-        if action not in {"start", "restart"}:
-            return self._pending_action_required(record, "pending lifecycle action is invalid")
-        try:
-            probe = self._preflight_start(record, timeout_seconds=None)
-            expected = self.adapter.launcher_payload(
-                record.bot_id,
-                operation_id=operation_id,
-                desired_revision=record.desired_revision,
-                readiness_probe=probe,
-            )
-            marker_template = expected["marker"]
-            if type(marker_template) is not dict:
-                raise ValueError("invalid expected marker")
-            fingerprint = str(marker_template["command_fingerprint"])
-        except (OSError, ValueError, TemplateError, BotDeleteError) as exc:
-            return self._pending_action_required(record, f"launch preflight failed: {exc}")
-        if action == "restart":
-            predecessor_result = self._recover_pending_restart_predecessor(
-                record,
-                context=recovery_context,
-                allow_stop=allow_launch,
-            )
-            if predecessor_result is not None:
-                return predecessor_result
+    @staticmethod
+    def _recovery_lifecycle_context(
+        operation_id: str,
+        context: _LifecycleContext,
+    ) -> _LifecycleContext:
+        return _LifecycleContext(operation_id, context.source, context.request_id)
+
+    def _pending_launch_preflight(
+        self,
+        record: BotRecord,
+        operation_id: str,
+    ) -> tuple[ReadinessProbe | None, str]:
+        probe = self._preflight_start(record, timeout_seconds=None)
+        expected = self.adapter.launcher_payload(
+            record.bot_id,
+            operation_id=operation_id,
+            desired_revision=record.desired_revision,
+            readiness_probe=probe,
+        )
+        marker_template = expected["marker"]
+        if type(marker_template) is not dict:
+            raise ValueError("invalid expected marker")
+        return probe, str(marker_template["command_fingerprint"])
+
+    @staticmethod
+    def _probe_once(probe: ReadinessProbe) -> ReadinessResult:
+        return probe_once(
+            probe.url,
+            timeout_seconds=min(1.0, max(0.2, probe.interval_seconds)),
+            expected_status=probe.expected_status,
+            expected_platform=probe.expected_platform,
+        )
+
+    def _recover_pending_stop_intent(
+        self,
+        record: BotRecord,
+        *,
+        context: _LifecycleContext,
+        allow_stop: bool,
+    ) -> BotStatusResponse:
         try:
             with self._marker_publication_lock(record):
-                marker = self._matching_runtime_marker(
+                return self._recover_pending_stop_intent_locked(
                     record,
-                    expected_fingerprint=fingerprint,
-                    require_live_command=True,
+                    context=context,
+                    allow_stop=allow_stop,
                 )
-                if marker.kind == "live" and marker.payload is not None:
-                    marker_pid = marker.payload["pid"]
-                    if isinstance(marker_pid, bool) or not isinstance(marker_pid, int):
-                        return self._pending_action_required(record, "live marker PID is invalid")
-                    pid = marker_pid
-                    status = BotStatus.starting if probe is not None else BotStatus.running
-                    ready_at = None if probe is not None else datetime.now(UTC)
-                    if probe is not None:
-                        readiness = probe_once(
-                            probe.url,
-                            timeout_seconds=min(1.0, max(0.2, probe.interval_seconds)),
-                            expected_status=probe.expected_status,
-                            expected_platform=probe.expected_platform,
-                        )
-                        if readiness.ready:
-                            status = BotStatus.running
-                            ready_at = datetime.now(UTC)
-                    try:
-                        self._complete_started_intent(
-                            record,
-                            context=recovery_context,
-                            status=status,
-                            pid=pid,
-                            ready_at=ready_at,
-                            reset_restart=True,
-                            reason="recovery adopted registered gateway",
-                        )
-                    except Exception:
-                        return self._pending_action_required(
-                            record, "gateway adoption could not be persisted"
-                        )
-                    return BotStatusResponse(
-                        record.bot_id,
-                        status,
-                        pid,
-                        record.profile_path,
-                        "recovered registered gateway",
-                    )
-                if marker.kind == "untrusted":
-                    return self._pending_action_required(record, marker.reason)
-                if not allow_launch:
-                    return self._pending_action_required(
-                        record, "desired running gateway is missing; reconcile is required"
-                    )
-                if marker.kind == "dead":
-                    generation = self._gateway_generation(marker)
-                    if generation is None or not self._remove_gateway_generation_marker_locked(
-                        record, generation
-                    ):
-                        return self._pending_action_required(
-                            record, "dead gateway marker cleanup failed"
-                        )
-                    if action == "restart":
-                        return BotStatusResponse(
-                            record.bot_id,
-                            BotStatus.starting,
-                            None,
-                            record.profile_path,
-                            "restart pending: removed dead gateway marker; "
-                            "launch on next reconcile",
-                        )
         except (BotDeleteError, LaunchPayloadError) as exc:
             return self._pending_action_required(record, str(exc))
-        return self._start_record(
-            record,
-            reset_restart=action == "restart",
-            message="recovered interrupted gateway launch",
-            context=recovery_context,
-            probe=probe,
-        )
+
+    def _recover_pending_launch(
+        self,
+        record: BotRecord,
+        *,
+        context: _LifecycleContext,
+        probe: ReadinessProbe | None,
+        fingerprint: str,
+        action: str,
+        allow_launch: bool,
+    ) -> BotStatusResponse | None:
+        try:
+            with self._marker_publication_lock(record):
+                return self._intent_recovery.recover_pending_launch_locked(
+                    self,
+                    record,
+                    context=context,
+                    probe=probe,
+                    fingerprint=fingerprint,
+                    action=action,
+                    allow_launch=allow_launch,
+                )
+        except (BotDeleteError, LaunchPayloadError) as exc:
+            return self._pending_action_required(record, str(exc))
 
     def _recover_pending_stop_intent_locked(
         self,
@@ -2477,41 +2177,11 @@ class Supervisor:
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse:
-        pid_state = self._pid_state(record.pid) if record.pid else _PidState.dead
-        if pid_state is _PidState.unknown:
-            return self._pending_action_required(record, "gateway PID liveness is unknown")
-        if not record.pid or pid_state is _PidState.dead:
-            observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-            if not self._remove_owned_launch_marker_locked(record, observed=observed):
-                return self._pending_action_required(
-                    record, "stale gateway marker ownership could not be verified"
-                )
-            try:
-                self._complete_stopped_intent(
-                    record,
-                    context=context,
-                    reason="recovery confirmed gateway stopped",
-                )
-            except Exception:
-                return self._pending_action_required(record, "stopped state could not be persisted")
-            return BotStatusResponse(
-                record.bot_id,
-                BotStatus.stopped,
-                None,
-                record.profile_path,
-                "recovered interrupted stop",
-            )
-        if not allow_stop:
-            if not self._pid_owned(record.profile_path, record.pid, record.bot_id):
-                return self._pending_action_required(
-                    record, "gateway ownership could not be verified"
-                )
-            return self._pending_action_required(record, "stop intent is pending reconciliation")
-        return self._stop_record_effect_locked(
+        return self._intent_recovery.recover_pending_stop_intent_locked(
+            self,
             record,
-            kill_after_timeout=None,
             context=context,
-            complete_stop=True,
+            allow_stop=allow_stop,
         )
 
     def _pending_restart_old_marker(
@@ -2519,27 +2189,10 @@ class Supervisor:
         record: BotRecord,
         observed: _MarkerObservation | None = None,
     ) -> _MarkerObservation | None:
-        """Return a strictly verified marker from the generation before a restart intent."""
-        if observed is None:
-            observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-        if observed.kind != "present" or observed.payload is None:
-            return None
-        payload = observed.payload
-        marker_operation = payload.get("operation_id")
-        marker_revision = payload.get("desired_revision")
-        if (
-            type(marker_operation) is not str
-            or marker_operation == record.pending_operation_id
-            or type(marker_revision) is not int
-            or marker_revision != record.desired_revision - 1
-        ):
-            return None
-        return self._classify_schema3_runtime_marker(
+        return self._intent_recovery.pending_restart_old_marker(
+            self,
             record,
-            payload,
-            expected_pid=record.pid,
-            expected_revision=record.desired_revision - 1,
-            require_live_command=True,
+            observed,
         )
 
     def _recover_pending_restart_predecessor(
@@ -2551,61 +2204,11 @@ class Supervisor:
     ) -> BotStatusResponse | None:
         try:
             with self._marker_publication_lock(record):
-                predecessor = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
-                if (
-                    record.pid is not None
-                    and predecessor.kind == "present"
-                    and predecessor.payload is not None
-                    and self._is_compat_runtime_marker(predecessor.payload)
-                ):
-                    return self._pending_action_required(
-                        record,
-                        "schema-v2 or legacy gateway restart requires manual process resolution",
-                    )
-                old_marker = self._pending_restart_old_marker(record, predecessor)
-                if old_marker is not None:
-                    return self._recover_pending_restart_old_gateway(
-                        record,
-                        old_marker,
-                        context=context,
-                        allow_stop=allow_stop,
-                    )
-                if record.pid is None or predecessor.kind != "missing":
-                    return None
-                pid_state = self._pid_state(record.pid)
-                if pid_state is _PidState.unknown:
-                    return self._pending_action_required(
-                        record, "previous gateway PID liveness is unknown"
-                    )
-                if pid_state is _PidState.alive:
-                    return self._pending_action_required(
-                        record, "previous gateway marker is missing"
-                    )
-                if not allow_stop:
-                    return self._pending_action_required(
-                        record, "restart intent is pending reconciliation"
-                    )
-                try:
-                    self._update_lifecycle(
-                        context,
-                        record.bot_id,
-                        BotStatus.stopped,
-                        pid=None,
-                        action="bot.restart.old_process_recovered",
-                        stopped_at=datetime.now(UTC),
-                        last_transition_reason=("recovery confirmed the previous gateway stopped"),
-                        clear_ready_at=True,
-                    )
-                except Exception:
-                    return self._pending_action_required(
-                        record, "previous gateway stop could not be persisted"
-                    )
-                return BotStatusResponse(
-                    record.bot_id,
-                    BotStatus.starting,
-                    None,
-                    record.profile_path,
-                    "restart pending: recovered stopped gateway; launch on next reconcile",
+                return self._intent_recovery.recover_pending_restart_predecessor_locked(
+                    self,
+                    record,
+                    context=context,
+                    allow_stop=allow_stop,
                 )
         except (BotDeleteError, LaunchPayloadError) as exc:
             return self._pending_action_required(record, str(exc))
@@ -2618,64 +2221,12 @@ class Supervisor:
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse:
-        if marker.kind == "untrusted":
-            return self._pending_action_required(
-                record,
-                marker.reason or "previous gateway ownership could not be verified",
-            )
-        if not allow_stop:
-            return self._pending_action_required(record, "restart intent is pending reconciliation")
-        generation = self._gateway_generation(marker)
-        if generation is None:
-            return self._pending_action_required(
-                record, "previous gateway marker correlation is invalid"
-            )
-        if marker.kind == "live":
-            if record.pid is None:
-                return self._pending_action_required(record, "previous gateway PID is not recorded")
-            stopped = self._stop_pending_restart_old_gateway(
-                record,
-                generation,
-                context=context,
-            )
-            if stopped.status is not BotStatus.stopped:
-                return stopped
-            return BotStatusResponse(
-                record.bot_id,
-                BotStatus.starting,
-                None,
-                record.profile_path,
-                "restart pending: previous gateway stopped; launch on next reconcile",
-            )
-        if marker.kind != "dead" or marker.payload is None:
-            return self._pending_action_required(
-                record, "previous gateway marker ownership could not be verified"
-            )
-        if not self._remove_gateway_generation_marker_locked(record, generation):
-            return self._pending_action_required(
-                record, "previous gateway marker cleanup could not be verified"
-            )
-        try:
-            self._update_lifecycle(
-                context,
-                record.bot_id,
-                BotStatus.stopped,
-                pid=None,
-                action="bot.restart.old_process_recovered",
-                stopped_at=datetime.now(UTC),
-                last_transition_reason="recovery confirmed the previous gateway stopped",
-                clear_ready_at=True,
-            )
-        except Exception:
-            return self._pending_action_required(
-                record, "previous gateway stop could not be persisted"
-            )
-        return BotStatusResponse(
-            record.bot_id,
-            BotStatus.starting,
-            None,
-            record.profile_path,
-            "restart pending: recovered stopped gateway; launch on next reconcile",
+        return self._intent_recovery.recover_pending_restart_old_gateway(
+            self,
+            record,
+            marker,
+            context=context,
+            allow_stop=allow_stop,
         )
 
     def _stop_pending_restart_old_gateway(
@@ -2685,87 +2236,28 @@ class Supervisor:
         *,
         context: _LifecycleContext,
     ) -> BotStatusResponse:
-        current = self._classify_exact_gateway_generation(record, generation)
-        if current.kind == "dead":
-            stopped = True
-        elif current.kind == "live":
-            term_result = self._send_signal(generation.pid, signal.SIGTERM)
-            if term_result == _SignalResult.denied:
-                return self._pending_action_required(
-                    record, "could not send SIGTERM to the previous gateway"
-                )
-            stopped = term_result == _SignalResult.missing
-            if not stopped:
-                stopped = self._wait_for_exit(record.bot_id, generation.pid)
-        else:
-            return self._pending_action_required(
-                record, current.reason or "previous gateway marker changed"
-            )
-
-        if not stopped and self.kill_after_timeout:
-            current = self._classify_exact_gateway_generation(record, generation)
-            if current.kind == "dead":
-                stopped = True
-            elif current.kind != "live":
-                return self._pending_action_required(
-                    record,
-                    current.reason or "previous gateway ownership changed before SIGKILL",
-                )
-            else:
-                kill_result = self._send_signal(generation.pid, signal.SIGKILL)
-                if kill_result == _SignalResult.denied:
-                    self.store.append_audit_event(
-                        "bot.stop_kill",
-                        bot_id=record.bot_id,
-                        pid=generation.pid,
-                        succeeded=False,
-                    )
-                    return self._pending_action_required(
-                        record, "could not send SIGKILL to the previous gateway"
-                    )
-                stopped = kill_result == _SignalResult.missing
-                if not stopped:
-                    stopped = self._wait_for_exit(record.bot_id, generation.pid)
-                self.store.append_audit_event(
-                    "bot.stop_kill",
-                    bot_id=record.bot_id,
-                    pid=generation.pid,
-                    succeeded=stopped,
-                )
-
-        if not stopped:
-            return self._pending_action_required(
-                record,
-                "previous gateway did not stop before the grace period expired",
-            )
-        if not self._remove_gateway_generation_marker_locked(record, generation):
-            return self._pending_action_required(
-                record, "previous gateway marker cleanup could not be verified"
-            )
-        self._processes.pop(record.bot_id, None)
-        try:
-            self._update_lifecycle(
-                context,
-                record.bot_id,
-                BotStatus.stopped,
-                pid=None,
-                action="bot.restart.old_process_stopped",
-                stopped_at=datetime.now(UTC),
-                last_transition_reason="restart stopped the previous gateway",
-                clear_ready_at=True,
-            )
-        except Exception:
-            return self._pending_action_required(
-                record, "previous gateway stop could not be persisted"
-            )
-        self.store.append_audit_event("bot.stop", bot_id=record.bot_id, pid=generation.pid)
-        return BotStatusResponse(
-            record.bot_id,
-            BotStatus.stopped,
-            None,
-            record.profile_path,
-            "gateway shutdown completed",
+        return self._intent_recovery.stop_pending_restart_old_gateway(
+            self,
+            record,
+            generation,
+            context=context,
         )
+
+    def _stop_gateway_generation_locked(
+        self,
+        record: BotRecord,
+        generation: _GatewayGeneration,
+    ) -> StopEffect:
+        return self._runtime.stop_generation_locked(
+            record,
+            generation,
+            kill_after_timeout=None,
+            classify_exact=self._classify_exact_gateway_generation,
+            remove_generation=self._remove_gateway_generation_marker_locked,
+        )
+
+    def _append_recovery_audit_event(self, action: str, **values: object) -> None:
+        self.store.append_audit_event(action, **values)
 
     def _restart_delay(self, record: BotRecord) -> float:
         delay = record.restart_backoff_seconds * (2**record.restart_attempts)
@@ -3113,48 +2605,21 @@ class Supervisor:
         if result.status not in {BotStatus.starting, BotStatus.running}:
             raise RuntimeError(f"previous bot restart failed after {operation}: {result.message}")
 
-    def _assert_unregistered_profile_inactive(self, bot_id: str, profile_path: Path) -> None:
-        marker_path = self.pid_marker_path(str(profile_path))
-        if not marker_path.exists():
-            return
-        try:
-            payload = json.loads(marker_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise BotRunningError(
-                "unregistered bot profile has an unreadable PID marker; refusing replacement"
-            ) from exc
-        pid = payload.get("pid") if isinstance(payload, dict) else None
-        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-            raise BotRunningError(
-                "unregistered bot profile has an invalid PID marker; refusing replacement"
-            )
-        if self._pid_state(pid) != _PidState.dead:
-            raise BotRunningError(
-                f"unregistered bot profile may still own gateway PID {pid}; refusing replacement"
-            )
+    def _assert_unregistered_profile_inactive(
+        self,
+        bot_id: str,
+        profile_path: Path,
+    ) -> None:
+        self._runtime.assert_unregistered_profile_inactive(bot_id, profile_path)
 
     def _safe_profile_path(self, bot_id: str, profile_path: str) -> Path:
-        safe_bot_id = validate_id(bot_id, "bot_id")
-        profile = Path(profile_path).resolve()
-        profiles_root = (Path(self.adapter.hermes_root) / "profiles").resolve()
-        try:
-            relative = profile.relative_to(profiles_root)
-        except ValueError as exc:
-            raise BotDeleteError("bot profile path is outside the Hermes profiles root") from exc
-        if len(relative.parts) != 1 or relative.parts[0] != safe_bot_id:
-            raise BotDeleteError("bot profile path does not match bot id")
-        return profile
+        return self._profile_manager.validate_profile_path(bot_id, profile_path)
 
     def _stage_profile_deletion(self, bot_id: str, profile_path: str) -> Path | None:
-        profile = self._safe_profile_path(bot_id, profile_path)
-        if not profile.exists():
+        deletion = self._profile_manager.stage_delete(bot_id, profile_path)
+        if deletion is None:
             return None
-        tombstone = profile.with_name(f".{profile.name}.deleting-{os.getpid()}-{time.time_ns()}")
-        try:
-            os.replace(profile, tombstone)
-        except OSError as exc:
-            raise BotDeleteError("could not stage the bot profile for deletion") from exc
-        return tombstone
+        return deletion.tombstone_path
 
     def _restore_tombstoned_profile(
         self,
@@ -3162,18 +2627,13 @@ class Supervisor:
         profile_path: str,
         tombstone: Path,
     ) -> None:
-        profile = self._safe_profile_path(bot_id, profile_path)
-        if profile.exists() or profile.is_symlink():
-            raise BotDeleteError(
-                "bot state deletion failed and the profile could not be restored because "
-                "its original path is occupied"
+        profile = self._profile_manager._pin_profile_path(bot_id, profile_path)
+        self._profile_manager.rollback_delete(
+            ProfileDeletion(
+                profile_path=profile,
+                tombstone_path=tombstone,
             )
-        try:
-            os.replace(tombstone, profile)
-        except OSError as exc:
-            raise BotDeleteError(
-                "bot state deletion failed and the profile could not be restored"
-            ) from exc
+        )
 
     def _restore_archived_profile(
         self,
@@ -3181,85 +2641,44 @@ class Supervisor:
         profile_path: str,
         archive_path: Path,
     ) -> None:
-        profile = self._safe_profile_path(bot_id, profile_path)
-        if profile.exists() or profile.is_symlink():
-            raise BotArchiveError(
-                "bot state deletion failed and the archived profile could not be restored "
-                "because its original path is occupied"
+        profile = self._profile_manager._pin_profile_path(bot_id, profile_path)
+        self._profile_manager.rollback_archive(
+            ProfileArchive(
+                profile_path=profile,
+                archive_path=archive_path,
             )
-        try:
-            shutil.move(str(archive_path), str(profile))
-        except OSError as exc:
-            raise BotArchiveError(
-                "bot state deletion failed and the archived profile could not be restored"
-            ) from exc
+        )
 
     def _readiness_probe_for_bot(
         self, bot_id: str, *, timeout_seconds: float | None = None
     ) -> ReadinessProbe | None:
-        _argv, env = self.adapter.command(bot_id, "gateway", "run")
-        return self._readiness_probe(env, timeout_seconds=timeout_seconds)
+        return self._runtime.readiness_probe_for_bot(
+            bot_id,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _readiness_probe_for_live_record(
         self, record: BotRecord
     ) -> tuple[ReadinessProbe | None, str | None]:
-        try:
-            payload = json.loads(
-                self.pid_marker_path(record.profile_path).read_text(encoding="utf-8")
-            )
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return None, "readiness provenance is unavailable from the PID marker"
-        if not isinstance(payload, dict):
-            return None, "readiness provenance in the PID marker is invalid"
-        if payload.get("schema") not in {2, 3} or "readiness_probe" not in payload:
-            # Markers written before readiness provenance was added remain supported.
-            return self._readiness_probe_for_bot(record.bot_id), None
-        try:
-            return _readiness_probe_from_marker(payload["readiness_probe"]), None
-        except ValueError as exc:
-            return None, f"readiness provenance in the PID marker is invalid: {exc}"
+        return self._runtime.readiness_probe_for_live_record(record)
 
     def _readiness_probe(
         self, env: dict[str, str], *, timeout_seconds: float | None = None
     ) -> ReadinessProbe | None:
-        resolved_timeout = (
-            self.readiness_timeout_seconds if timeout_seconds is None else timeout_seconds
-        )
-        if (
-            isinstance(resolved_timeout, bool)
-            or not isinstance(resolved_timeout, (int, float))
-            or not math.isfinite(float(resolved_timeout))
-            or not 0.1 <= float(resolved_timeout) <= 300
-        ):
-            raise TemplateError("readiness timeout must be a finite number between 0.1 and 300")
-        return readiness_probe_from_env(
-            env,
-            timeout_seconds=float(resolved_timeout),
-            interval_seconds=self.readiness_interval_seconds,
-        )
+        return self._runtime.readiness_probe(env, timeout_seconds=timeout_seconds)
 
-    def _wait_for_readiness(self, process: PopenLike, probe: ReadinessProbe) -> ReadinessResult:
-        deadline = time.monotonic() + probe.timeout_seconds
-        last = ReadinessResult(False, "not probed yet")
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                return ReadinessResult(False, "gateway process exited during readiness check")
-            last = probe_once(
-                probe.url,
-                timeout_seconds=min(5.0, max(0.2, probe.interval_seconds)),
-                expected_status=probe.expected_status,
-                expected_platform=probe.expected_platform,
-            )
-            if last.ready:
-                return last
-            time.sleep(probe.interval_seconds)
-        return ReadinessResult(False, f"readiness timeout: {last.message}", last.payload)
+    def _wait_for_readiness(
+        self,
+        process: PopenLike,
+        probe: ReadinessProbe,
+    ) -> ReadinessResult:
+        return self._runtime.wait_for_readiness(process, probe)
 
     def log_path(self, profile_path: str) -> Path:
-        return Path(profile_path) / "logs" / "zeus-gateway.log"
+        return self._runtime.log_path(profile_path)
 
     def pid_marker_path(self, profile_path: str) -> Path:
-        return Path(profile_path) / "logs" / "zeus-gateway.pid.json"
+        return self._runtime.pid_marker_path(profile_path)
 
     def _require_bot(self, bot_id: str) -> BotRecord:
         record = self.store.get_bot(bot_id)
@@ -3268,17 +2687,16 @@ class Supervisor:
         return record
 
     def _pid_state(self, pid: int) -> _PidState:
-        try:
-            if self.pid_alive_fn is not None:
-                return _PidState.alive if self.pid_alive_fn(pid) else _PidState.dead
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return _PidState.dead
-        except PermissionError:
-            return _PidState.unknown
-        except OSError as exc:
-            return _PidState.dead if exc.errno == errno.ESRCH else _PidState.unknown
-        return _PidState.alive
+        if "_runtime" in self.__dict__:
+            return self._runtime.pid_state(pid)
+        if self.pid_alive_fn is not None:
+            return _process_identity.pid_state(pid, pid_alive_fn=self.pid_alive_fn)
+
+        def probe_with_current_kill(probe_pid: int) -> bool:
+            os.kill(probe_pid, 0)
+            return True
+
+        return _process_identity.pid_state(pid, pid_alive_fn=probe_with_current_kill)
 
     def _unknown_pid_response(
         self,
@@ -3305,19 +2723,7 @@ class Supervisor:
         )
 
     def _send_signal(self, pid: int, sig: signal.Signals) -> _SignalResult:
-        try:
-            self.kill_fn(pid, sig)
-        except ProcessLookupError:
-            return _SignalResult.missing
-        except PermissionError:
-            return _SignalResult.denied
-        except OSError as exc:
-            if exc.errno == errno.ESRCH:
-                return _SignalResult.missing
-            if exc.errno == errno.EPERM:
-                return _SignalResult.denied
-            raise
-        return _SignalResult.sent
+        return self._runtime.send_signal(pid, sig)
 
     def _write_pid_marker(
         self,
@@ -3328,80 +2734,24 @@ class Supervisor:
         *,
         readiness_probe: ReadinessProbe | None | _ReadinessProbeUnset = _READINESS_PROBE_UNSET,
     ) -> None:
-        path = self.pid_marker_path(profile_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        resolved_hermes_bin = self._resolved_hermes_bin()
-        marker_argv = list(argv)
-        if resolved_hermes_bin:
-            marker_argv[0] = resolved_hermes_bin
-        fingerprint = self.proc_start_fingerprint_reader(pid)
-        payload = {
-            "schema": 2,
-            "pid": pid,
-            "bot_id": bot_id,
-            "component": "gateway",
-            "action": "run",
-            "argv": marker_argv,
-            "resolved_hermes_bin": resolved_hermes_bin,
-            "started_at": time.time(),
-        }
-        if not isinstance(readiness_probe, _ReadinessProbeUnset):
-            payload["readiness_probe"] = _readiness_probe_marker_payload(readiness_probe)
-        if fingerprint:
-            payload["proc_start_fingerprint"] = fingerprint
-        atomic_write_json(path, payload, mode=0o600)
+        include_readiness_probe = not isinstance(readiness_probe, _ReadinessProbeUnset)
+        runtime_probe = (
+            None if isinstance(readiness_probe, _ReadinessProbeUnset) else readiness_probe
+        )
+        self._runtime.write_pid_marker(
+            profile_path,
+            pid,
+            bot_id,
+            argv,
+            readiness_probe=runtime_probe,
+            include_readiness_probe=include_readiness_probe,
+        )
 
     def _remove_pid_marker(self, profile_path: str) -> None:
-        try:
-            self.pid_marker_path(profile_path).unlink()
-        except FileNotFoundError:
-            return
+        self._runtime.remove_pid_marker(profile_path)
 
     def _read_pid_marker(self, profile_path: str) -> dict[str, object]:
-        path = self.pid_marker_path(profile_path)
-        if not path.exists():
-            return {"exists": False}
-        marker_mode = _file_mode(path)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
-            return {"exists": True, "valid": False, "mode": marker_mode, "error": str(exc)}
-        if not isinstance(payload, dict):
-            return {
-                "exists": True,
-                "valid": False,
-                "mode": marker_mode,
-                "error": "pid marker must be a JSON object",
-            }
-        deprecated = payload.get("schema") is None
-        safe_payload: dict[str, object] = {
-            "exists": True,
-            "valid": True,
-            "mode": marker_mode,
-            "deprecated": deprecated,
-        }
-        for key in (
-            "schema",
-            "pid",
-            "bot_id",
-            "component",
-            "action",
-            "started_at",
-            "proc_start_fingerprint",
-        ):
-            if key in payload:
-                safe_payload[key] = payload[key]
-        if "readiness_probe" in payload:
-            try:
-                probe = _readiness_probe_from_marker(payload["readiness_probe"])
-            except ValueError:
-                safe_payload["readiness_probe"] = "invalid"
-            else:
-                safe_payload["readiness_probe"] = _readiness_probe_marker_payload(probe)
-        argv_value = payload.get("argv")
-        if isinstance(argv_value, list) and all(isinstance(part, str) for part in argv_value):
-            safe_payload["argv_shape"] = _safe_command_shape(argv_value)
-        return safe_payload
+        return self._runtime.read_pid_marker(profile_path)
 
     def _pid_owned(self, profile_path: str, pid: int, bot_id: str) -> bool:
         return self._verify_gateway_pid_ownership(profile_path, pid, bot_id).verified
@@ -3410,176 +2760,33 @@ class Supervisor:
         self, profile_path: str, pid: int, bot_id: str
     ) -> OwnershipCheck:
         record = self.store.get_bot(bot_id)
-        if record is not None and record.profile_path != profile_path:
-            return OwnershipCheck(False, "marker-mismatch")
-        observed = self._read_strict_runtime_marker(bot_id, profile_path)
-        if observed.kind == "missing":
-            return OwnershipCheck(False, "marker-missing")
-        if observed.kind != "present" or observed.payload is None:
-            return OwnershipCheck(False, "marker-mismatch")
-        payload = observed.payload
-        if payload.get("schema") == 3:
-            if record is None:
-                return OwnershipCheck(False, "marker-mismatch")
-            marker = self._classify_schema3_runtime_marker(
-                record,
-                payload,
-                expected_pid=pid,
-                require_live_command=True,
-            )
-            if marker.kind != "live":
-                return OwnershipCheck(False, marker.reason or "marker-mismatch")
-            live_argv = self.cmdline_reader(pid)
-            if not live_argv:
-                return OwnershipCheck(False, "live-cmdline-missing")
-            live_check = _verify_gateway_command(
-                live_argv,
-                bot_id,
-                self._trusted_hermes_bins(),
-                require_trusted_path=True,
-            )
-            return OwnershipCheck(
-                live_check.verified,
-                live_check.reason,
-                live_check.classification,
-            )
-        if payload.get("pid") != pid:
-            return OwnershipCheck(False, "marker-mismatch")
-        argv_value = payload.get("argv")
-        if not isinstance(argv_value, list) or not all(
-            isinstance(part, str) for part in argv_value
-        ):
-            return OwnershipCheck(False, "marker-mismatch")
-        trusted_hermes = self._resolved_hermes_bin()
-        if trusted_hermes is None:
-            return OwnershipCheck(False, "untrusted-executable")
-        marker_check = self._verify_marker_payload(payload, list(argv_value), bot_id)
-        if not marker_check.verified:
-            return OwnershipCheck(False, marker_check.reason, marker_check.classification)
-        live_argv = self.cmdline_reader(pid)
-        if not live_argv:
-            return OwnershipCheck(False, "live-cmdline-missing")
-        live_check = _verify_gateway_command(
-            live_argv, bot_id, self._trusted_hermes_bins(), require_trusted_path=True
+        ownership = self._runtime.verify_gateway_pid_ownership(
+            profile_path,
+            pid,
+            bot_id,
+            expected_record=record,
         )
-        if not live_check.verified:
-            return OwnershipCheck(False, live_check.reason, live_check.classification)
-        marker_schema = payload.get("schema")
-        fingerprint = payload.get("proc_start_fingerprint")
-        if marker_schema == 2:
-            live_fingerprint = self.proc_start_fingerprint_reader(pid)
-            if live_fingerprint and not (isinstance(fingerprint, str) and fingerprint):
-                return OwnershipCheck(
-                    False,
-                    "pid-start-time-missing",
-                    live_check.classification,
-                )
-            if isinstance(fingerprint, str) and fingerprint and live_fingerprint != fingerprint:
-                return OwnershipCheck(
-                    False,
-                    "pid-start-time-mismatch",
-                    live_check.classification,
-                )
-        elif isinstance(fingerprint, str) and fingerprint:
-            live_fingerprint = self.proc_start_fingerprint_reader(pid)
-            if live_fingerprint != fingerprint:
-                return OwnershipCheck(
-                    False,
-                    "pid-start-time-mismatch",
-                    live_check.classification,
-                )
-        classification = (
-            "legacy-marker-valid"
-            if marker_check.classification == "legacy-marker-valid"
-            else live_check.classification
-        )
-        if classification == "legacy-marker-valid":
+        if ownership.classification == "legacy-marker-valid":
             self.store.append_audit_event(
                 "bot.pid_marker_legacy_accepted",
                 bot_id=bot_id,
                 pid=pid,
             )
-        return OwnershipCheck(True, "ok", classification)
+        return ownership
 
     def _verify_marker_payload(
         self, payload: dict[str, object], argv: list[str], bot_id: str
     ) -> OwnershipCheck:
-        schema = payload.get("schema")
-        if schema == 3:
-            pid = payload.get("pid")
-            operation_id = payload.get("operation_id")
-            revision = payload.get("desired_revision")
-            fingerprint = payload.get("command_fingerprint")
-            if (
-                type(pid) is not int
-                or pid <= 0
-                or type(operation_id) is not str
-                or _REQUEST_ID_RE.fullmatch(operation_id) is None
-                or type(revision) is not int
-                or revision <= 0
-                or type(fingerprint) is not str
-            ):
-                return OwnershipCheck(False, "marker-mismatch")
-            if not _is_owned_runtime_marker(
-                payload,
-                bot_id=bot_id,
-                operation_id=operation_id,
-                desired_revision=revision,
-                pid=pid,
-                expected_fingerprint=fingerprint,
-            ):
-                return OwnershipCheck(False, "marker-mismatch")
-            resolved_hermes_bin = self._resolved_hermes_bin()
-            marker_hermes = payload.get("resolved_hermes_bin")
-            if (
-                resolved_hermes_bin is None
-                or type(marker_hermes) is not str
-                or _resolve_executable(marker_hermes) != resolved_hermes_bin
-            ):
-                return OwnershipCheck(False, "untrusted-executable")
-            marker_check = _verify_gateway_command(
-                argv,
-                bot_id,
-                resolved_hermes_bin,
-                require_trusted_path=True,
-            )
-            return OwnershipCheck(
-                marker_check.verified,
-                marker_check.reason,
-                marker_check.classification,
-            )
-        if schema == 2:
-            if payload.get("bot_id") != bot_id:
-                return OwnershipCheck(False, "wrong-bot-id")
-            if payload.get("component") != "gateway" or payload.get("action") != "run":
-                return OwnershipCheck(False, "wrong-command-intent")
-            resolved_hermes_bin = self._resolved_hermes_bin()
-            if not isinstance(payload.get("resolved_hermes_bin"), str):
-                return OwnershipCheck(False, "untrusted-executable")
-            marker_hermes = _resolve_executable(str(payload["resolved_hermes_bin"]))
-            if marker_hermes != resolved_hermes_bin:
-                return OwnershipCheck(False, "untrusted-executable")
-            marker_check = _verify_gateway_command(
-                argv, bot_id, resolved_hermes_bin, require_trusted_path=True
-            )
-            return OwnershipCheck(
-                marker_check.verified,
-                marker_check.reason,
-                marker_check.classification,
-            )
-        if schema is not None:
-            return OwnershipCheck(False, "marker-mismatch")
-        if not self.allow_legacy_pid_markers:
-            return OwnershipCheck(False, "legacy-marker-disabled")
-        marker_check = _verify_gateway_command(argv, bot_id, None, require_trusted_path=False)
-        if not marker_check.verified:
-            return OwnershipCheck(False, marker_check.reason, marker_check.classification)
-        return OwnershipCheck(True, "ok", "legacy-marker-valid")
+        return self._runtime.verify_marker_payload(payload, argv, bot_id)
 
     def _resolved_hermes_bin(self) -> str | None:
+        if "_runtime" in self.__dict__:
+            return self._runtime.resolved_hermes_bin()
         return _resolve_executable(self.adapter.hermes_bin)
 
     def _trusted_hermes_bins(self) -> set[str]:
+        if "_runtime" in self.__dict__:
+            return self._runtime.trusted_hermes_bins()
         return _trusted_hermes_paths(self.adapter.hermes_bin)
 
     def _cleanup_failed_start_registration(
@@ -3650,36 +2857,12 @@ class Supervisor:
         )
         return stopped
 
-    def _terminate_spawned_process(self, process: PopenLike, cleanup_errors: list[str]) -> bool:
-        if process.poll() is not None:
-            self._reap_spawned_process(process, cleanup_errors, timeout=0)
-            if self._spawned_tree_stopped(process, timeout=0):
-                return True
-        term_result = self._signal_spawned_process(process, signal.SIGTERM, cleanup_errors)
-        if term_result == _SignalResult.missing:
-            self._reap_spawned_process(process, cleanup_errors, timeout=0)
-            return self._spawned_tree_stopped(process, timeout=0)
-        if term_result == _SignalResult.denied:
-            return False
-        self._reap_spawned_process(
-            process,
-            cleanup_errors,
-            timeout=self.stop_grace_seconds,
-        )
-        if self._spawned_tree_stopped(process, timeout=0):
-            return True
-        kill_result = self._signal_spawned_process(process, signal.SIGKILL, cleanup_errors)
-        if kill_result == _SignalResult.missing:
-            self._reap_spawned_process(process, cleanup_errors, timeout=0)
-            return self._spawned_tree_stopped(process, timeout=0)
-        if kill_result == _SignalResult.denied:
-            return False
-        self._reap_spawned_process(
-            process,
-            cleanup_errors,
-            timeout=self.stop_grace_seconds,
-        )
-        return self._spawned_tree_stopped(process, timeout=self.stop_grace_seconds)
+    def _terminate_spawned_process(
+        self,
+        process: PopenLike,
+        cleanup_errors: list[str],
+    ) -> bool:
+        return self._runtime.terminate_spawned_process(process, cleanup_errors)
 
     def _signal_spawned_process(
         self,
@@ -3687,41 +2870,7 @@ class Supervisor:
         sig: signal.Signals,
         cleanup_errors: list[str],
     ) -> _SignalResult:
-        if self._cleanup_process_group:
-            try:
-                os.killpg(process.pid, sig)
-            except ProcessLookupError:
-                return _SignalResult.missing
-            except PermissionError as exc:
-                cleanup_errors.append(f"killpg: {type(exc).__name__}: {exc}")
-                return _SignalResult.denied
-            except OSError as exc:
-                if exc.errno == errno.ESRCH:
-                    return _SignalResult.missing
-                if exc.errno == errno.EPERM:
-                    cleanup_errors.append(f"killpg: {type(exc).__name__}: {exc}")
-                    return _SignalResult.denied
-                raise
-            return _SignalResult.sent
-        method_name = "terminate" if sig == signal.SIGTERM else "kill"
-        method = getattr(process, method_name, None)
-        if not callable(method):
-            return self._send_signal(process.pid, sig)
-        try:
-            method()
-        except ProcessLookupError:
-            return _SignalResult.missing
-        except PermissionError as exc:
-            cleanup_errors.append(f"{method_name}: {type(exc).__name__}: {exc}")
-            return _SignalResult.denied
-        except OSError as exc:
-            if exc.errno == errno.ESRCH:
-                return _SignalResult.missing
-            if exc.errno == errno.EPERM:
-                cleanup_errors.append(f"{method_name}: {type(exc).__name__}: {exc}")
-                return _SignalResult.denied
-            raise
-        return _SignalResult.sent
+        return self._runtime.signal_spawned_process(process, sig, cleanup_errors)
 
     def _reap_spawned_process(
         self,
@@ -3730,307 +2879,52 @@ class Supervisor:
         *,
         timeout: float,
     ) -> bool:
-        wait = getattr(process, "wait", None)
-        if callable(wait):
-            try:
-                wait(timeout=timeout)
-                return True
-            except subprocess.TimeoutExpired:
-                return False
-            except Exception as exc:
-                cleanup_errors.append(f"wait: {type(exc).__name__}: {exc}")
-        return process.poll() is not None or self._pid_state(process.pid) == _PidState.dead
+        return self._runtime.reap_spawned_process(
+            process,
+            cleanup_errors,
+            timeout=timeout,
+        )
 
     def _spawned_tree_stopped(self, process: PopenLike, *, timeout: float) -> bool:
-        if not self._cleanup_process_group:
-            return process.poll() is not None or self._pid_state(process.pid) == _PidState.dead
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                return True
-            except PermissionError:
-                return False
-            except OSError as exc:
-                return exc.errno == errno.ESRCH
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.05)
+        return self._runtime.spawned_tree_stopped(process, timeout=timeout)
 
     def _wait_for_exit(self, bot_id: str, pid: int) -> bool:
-        process = self._processes.get(bot_id)
-        if process is not None and hasattr(process, "wait"):
-            try:
-                process.wait(timeout=self.stop_grace_seconds)
-                return True
-            except subprocess.TimeoutExpired:
-                return False
-            except Exception:
-                return False
-
-        deadline = time.monotonic() + self.stop_grace_seconds
-        while self._pid_state(pid) != _PidState.dead and time.monotonic() < deadline:
-            time.sleep(0.1)
-        return self._pid_state(pid) == _PidState.dead
+        return self._runtime.wait_for_exit(bot_id, pid)
 
     def _poll_startup(self, process: PopenLike) -> int | None:
-        returncode = process.poll()
-        if returncode is not None or self.startup_grace_seconds <= 0:
-            return returncode
-
-        deadline = time.monotonic() + self.startup_grace_seconds
-        while time.monotonic() < deadline:
-            time.sleep(min(0.01, max(deadline - time.monotonic(), 0)))
-            returncode = process.poll()
-            if returncode is not None:
-                return returncode
-        return process.poll()
+        return self._runtime.poll_startup(process)
 
 
 def _read_process_cmdline(pid: int) -> list[str] | None:
-    system = platform.system()
-    if system == "Linux":
-        return _read_linux_cmdline(pid)
-    if system == "Darwin":
-        return _read_darwin_cmdline(pid)
-    return None
+    return _process_identity.read_process_cmdline(
+        pid,
+        system=platform.system(),
+        run_process=subprocess.run,
+    )
 
 
 def _readiness_probe_marker_payload(probe: ReadinessProbe | None) -> dict[str, object] | None:
-    if probe is None:
-        return None
-    return {
-        "url": probe.url,
-        "expected_status": probe.expected_status,
-        "expected_platform": probe.expected_platform,
-        "timeout_seconds": probe.timeout_seconds,
-        "interval_seconds": probe.interval_seconds,
-    }
+    return readiness_probe_to_payload(probe)
 
 
 def _readiness_probe_from_marker(value: object) -> ReadinessProbe | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("readiness_probe must be an object or null")
-    url = value.get("url")
-    expected_status = value.get("expected_status")
-    expected_platform = value.get("expected_platform")
-    timeout_seconds = value.get("timeout_seconds")
-    interval_seconds = value.get("interval_seconds")
-    if not isinstance(url, str):
-        raise ValueError("url must be a string")
-    parsed = urlparse(url)
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("url must be loopback HTTP without credentials or query data")
-    if not isinstance(expected_status, str) or not expected_status:
-        raise ValueError("expected_status must be a non-empty string")
-    if not isinstance(expected_platform, str) or not expected_platform:
-        raise ValueError("expected_platform must be a non-empty string")
-    if not _valid_probe_number(timeout_seconds) or not _valid_probe_number(interval_seconds):
-        raise ValueError("probe timing values must be finite positive numbers")
-    return ReadinessProbe(
-        url=url,
-        expected_status=expected_status,
-        expected_platform=expected_platform,
-        timeout_seconds=float(timeout_seconds),
-        interval_seconds=float(interval_seconds),
-    )
-
-
-def _valid_probe_number(value: object) -> TypeGuard[int | float]:
-    return (
-        isinstance(value, int | float)
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-        and 0 < float(value) <= 3600
-    )
-
-
-def _read_linux_cmdline(pid: int, proc_root: Path = Path("/proc")) -> list[str]:
-    try:
-        raw = (proc_root / str(pid) / "cmdline").read_bytes()
-    except FileNotFoundError:
-        return []
-    except OSError:
-        return []
-    return [part.decode("utf-8", errors="surrogateescape") for part in raw.split(b"\0") if part]
+    return readiness_probe_from_payload(value)
 
 
 def _read_darwin_cmdline(pid: int) -> list[str] | None:
-    try:
-        completed = subprocess.run(  # nosec B603
-            ["/bin/ps", "-p", str(pid), "-o", "command="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return []
-    command = completed.stdout.strip()
-    if not command:
-        return []
-    try:
-        return shlex.split(command)
-    except ValueError:
-        return None
+    return _process_identity.read_darwin_cmdline(pid, run_process=subprocess.run)
 
 
 def _read_process_start_fingerprint(pid: int) -> str | None:
-    system = platform.system()
-    if system == "Darwin":
-        return _read_darwin_process_start_fingerprint(pid)
-    if system != "Linux":
-        return None
-    return _read_linux_process_start_fingerprint(pid)
+    return _process_identity.read_process_start_fingerprint(
+        pid,
+        system=platform.system(),
+        run_process=subprocess.run,
+    )
 
 
 def _read_darwin_process_start_fingerprint(pid: int) -> str | None:
-    try:
-        completed = subprocess.run(  # nosec B603
-            ["/bin/ps", "-p", str(pid), "-o", "lstart="],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return None
-    started = " ".join(completed.stdout.split())
-    return f"darwin:ps-lstart:{started}" if started else None
-
-
-def _read_linux_process_start_fingerprint(pid: int, proc_root: Path = Path("/proc")) -> str | None:
-    try:
-        stat = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError, UnicodeDecodeError):
-        return None
-    try:
-        fields = stat.rsplit(") ", 1)[1].split()
-    except IndexError:
-        return None
-    if len(fields) < 20:
-        return None
-    return f"linux:/proc-starttime:{fields[19]}"
-
-
-def _verify_gateway_command(
-    argv: list[str],
-    bot_id: str,
-    trusted_hermes_bin: str | set[str] | None,
-    *,
-    require_trusted_path: bool,
-) -> _CommandCheck:
-    if not argv:
-        return _CommandCheck(False, "live-cmdline-missing")
-    classification = "direct-hermes"
-    hermes_command = argv[0]
-    args = argv[1:]
-    if len(argv) >= 2 and _looks_like_python_interpreter(argv[0]):
-        classification = "python-script-wrapper"
-        hermes_command = argv[1]
-        args = argv[2:]
-    if len(args) != 4 or args.count("-p") != 1 or args[0] != "-p":
-        return _CommandCheck(False, "wrong-command-intent", classification)
-    if args[1] != bot_id:
-        return _CommandCheck(False, "wrong-bot-id", classification)
-    if args[2:] != ["gateway", "run"]:
-        return _CommandCheck(False, "wrong-command-intent", classification)
-    if require_trusted_path:
-        resolved_command = _resolve_executable(hermes_command)
-        if isinstance(trusted_hermes_bin, str):
-            trusted_hermes_bins = {trusted_hermes_bin}
-        else:
-            trusted_hermes_bins = trusted_hermes_bin or set()
-        if not trusted_hermes_bins or resolved_command not in trusted_hermes_bins:
-            return _CommandCheck(False, "untrusted-executable", classification)
-    return _CommandCheck(True, "ok", classification)
-
-
-def _looks_like_python_interpreter(command: str) -> bool:
-    return bool(_PYTHON_INTERPRETER_RE.fullmatch(Path(command).name.lower()))
-
-
-def _resolve_executable(command: str, path: str | None = None) -> str | None:
-    if not command:
-        return None
-    candidate = command if "/" in command else shutil.which(command, path=path)
-    if candidate is None:
-        return None
-    try:
-        return str(Path(candidate).expanduser().resolve())
-    except (OSError, RuntimeError):
-        return str(Path(candidate).expanduser().absolute())
-
-
-def _trusted_hermes_paths(command: str) -> set[str]:
-    resolved = _resolve_executable(command)
-    if resolved is None:
-        return set()
-    paths = {resolved}
-    delegated = _resolve_launcher_exec_target(resolved)
-    if delegated is not None:
-        paths.add(delegated)
-    return paths
-
-
-def _resolve_launcher_exec_target(command: str) -> str | None:
-    path = Path(command)
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except (OSError, UnicodeDecodeError):
-        return None
-    if not text.startswith("#!"):
-        return None
-    for line in text.splitlines()[1:20]:
-        stripped = line.strip()
-        if not stripped.startswith("exec "):
-            continue
-        try:
-            parts = shlex.split(stripped)
-        except ValueError:
-            continue
-        if len(parts) < 2 or parts[0] != "exec":
-            continue
-        target = parts[1]
-        if "/" not in target:
-            continue
-        resolved = _resolve_executable(target)
-        if resolved and Path(resolved).name == "hermes":
-            return resolved
-    return None
-
-
-def _safe_command_shape(argv: list[str]) -> str:
-    if not argv:
-        return "empty"
-    classification = "direct-hermes"
-    args = argv[1:]
-    if len(argv) >= 2 and _looks_like_python_interpreter(argv[0]):
-        classification = "python-script-wrapper"
-        args = argv[2:]
-    if len(args) == 4 and args[0] == "-p" and args[2:] == ["gateway", "run"]:
-        return f"{classification} hermes -p <bot> gateway run"
-    return f"{classification} unrecognized"
-
-
-def _file_mode(path: Path) -> str | None:
-    try:
-        return f"{stat.S_IMODE(path.stat().st_mode):04o}"
-    except OSError:
-        return None
+    return _process_identity.read_darwin_process_start_fingerprint(
+        pid,
+        run_process=subprocess.run,
+    )

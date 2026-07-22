@@ -5,7 +5,6 @@ import contextlib
 import hmac
 import json
 import os
-import signal
 import sys
 import threading
 import time
@@ -14,33 +13,37 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
-from http.server import ThreadingHTTPServer as _ThreadingHTTPServer
-from pathlib import Path
 from typing import Any, NoReturn
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
+from zeus import api_request
+from zeus.api_errors import map_api_exception
 from zeus.api_logging import ApiLogWriter
-from zeus.config import Settings, validate_api_exposure
+from zeus.api_request import (
+    decode_json_object,
+    normalize_api_path,
+    parse_query,
+)
+from zeus.api_server import ThreadingHTTPServer
+from zeus.api_server import serve as _serve_server
+from zeus.config import Settings
 from zeus.doctor import run_doctor
-from zeus.errors import ZeusConflictError
 from zeus.idempotency import IdempotencyClaim, canonical_request_hash, hash_key
 from zeus.models import (
     BotCreateRequest,
     BotStatus,
     HermesTemplate,
     RestartPolicy,
-    TemplateError,
     validate_id,
 )
-from zeus.process_lock import BotProcessLock, LockTimeoutError
+from zeus.process_lock import LockTimeoutError
 from zeus.rate_limit import TokenBucket
 from zeus.reconciliation import (
     MAX_RECONCILE_TEXT_LENGTH,
-    ReconcileLockTimeoutError,
     ReconcileOutcome,
 )
 from zeus.request_context import RequestContext, new_request_id, route_template
-from zeus.state import MAX_IDEMPOTENCY_RESPONSE_BYTES, StateStore
+from zeus.state import MAX_IDEMPOTENCY_RESPONSE_BYTES, StateReadinessError, StateStore
 from zeus.supervisor import Supervisor
 from zeus.templates import TemplateStore
 
@@ -55,8 +58,8 @@ BOT_CREATE_FIELDS = frozenset(
         "restart_max_attempts",
     }
 )
-MAX_JSON_DEPTH = 64
-MAX_QUERY_FIELDS = 16
+MAX_JSON_DEPTH = api_request.MAX_JSON_DEPTH
+MAX_QUERY_FIELDS = api_request.MAX_QUERY_FIELDS
 MAX_IDEMPOTENCY_MESSAGE_JSON_BYTES = 4_096
 _IDEMPOTENCY_MESSAGE_REPLACEMENT = "response message omitted because it exceeded the replay budget"
 _IDEMPOTENCY_OWNER_LOCK = threading.Lock()
@@ -218,173 +221,16 @@ def _bound_idempotent_messages(value: object) -> tuple[object, bool]:
     return value, False
 
 
-def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON field: {key}")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> Any:
-    raise ValueError(f"invalid JSON constant: {value}")
-
-
-def _validate_json_depth(value: Any) -> None:
-    stack = [(value, 1)]
-    while stack:
-        current, depth = stack.pop()
-        if depth > MAX_JSON_DEPTH:
-            raise ValueError(f"request JSON nesting exceeds {MAX_JSON_DEPTH}")
-        if isinstance(current, dict):
-            stack.extend((child, depth + 1) for child in current.values())
-        elif isinstance(current, list):
-            stack.extend((child, depth + 1) for child in current)
-
-
-class ThreadingHTTPServer(_ThreadingHTTPServer):
-    daemon_threads = True
-
-    def __init__(
-        self,
-        server_address: Any,
-        RequestHandlerClass: type[BaseHTTPRequestHandler],
-        bind_and_activate: bool = True,
-    ) -> None:
-        self.api_max_concurrent_requests = int(
-            getattr(RequestHandlerClass, "api_max_concurrent_requests", 32)
-        )
-        self.api_request_timeout_seconds = float(
-            getattr(RequestHandlerClass, "api_request_timeout_seconds", 10.0)
-        )
-        self._request_slots = threading.BoundedSemaphore(self.api_max_concurrent_requests)
-        self._request_state = threading.Condition()
-        self._active_requests: set[int] = set()
-        self._draining = False
-        self._drain_started = threading.Event()
-        self._graceful_shutdown_requested = False
-        self._graceful_shutdown_timeout_seconds = 0.0
-        self._graceful_shutdown_thread: threading.Thread | None = None
-        self._graceful_shutdown_result: bool | None = None
-        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
-
-    def process_request(self, request: Any, client_address: Any) -> None:
-        with self._request_state:
-            if self._draining:
-                rejection = ("server_draining", "API server is draining")
-            elif not self._request_slots.acquire(blocking=False):
-                rejection = ("server_busy", "API request capacity is exhausted")
-            else:
-                self._active_requests.add(id(request))
-                rejection = None
-
-        if rejection is not None:
-            self._reject_unavailable_request(request, *rejection)
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except Exception:
-            self._finish_request(request)
-            raise
-
-    def process_request_thread(self, request: Any, client_address: Any) -> None:
-        try:
-            request.settimeout(self.api_request_timeout_seconds)
-            super().process_request_thread(request, client_address)
-        finally:
-            self._finish_request(request)
-
-    def begin_draining(self) -> None:
-        with self._request_state:
-            self._draining = True
-        self._drain_started.set()
-
-    def request_graceful_shutdown(self, timeout_seconds: float) -> None:
-        self._graceful_shutdown_timeout_seconds = timeout_seconds
-        self._graceful_shutdown_requested = True
-
-    def wait_until_draining(self, timeout_seconds: float) -> bool:
-        return self._drain_started.wait(timeout_seconds)
-
-    def service_actions(self) -> None:
-        super().service_actions()
-        if not self._graceful_shutdown_requested or self._graceful_shutdown_thread is not None:
-            return
-        self.begin_draining()
-        coordinator = threading.Thread(target=self._complete_graceful_shutdown, daemon=True)
-        coordinator.start()
-        self._graceful_shutdown_thread = coordinator
-
-    def finish_graceful_shutdown(self) -> bool | None:
-        coordinator = self._graceful_shutdown_thread
-        if coordinator is None:
-            return None
-        coordinator.join()
-        return self._graceful_shutdown_result
-
-    def wait_for_drain(self, timeout_seconds: float) -> bool:
-        deadline = time.monotonic() + timeout_seconds
-        with self._request_state:
-            while self._active_requests:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._request_state.wait(remaining)
-            return True
-
-    def _finish_request(self, request: Any) -> None:
-        with self._request_state:
-            request_id = id(request)
-            if request_id not in self._active_requests:
-                return
-            self._active_requests.remove(request_id)
-            self._request_slots.release()
-            if not self._active_requests:
-                self._request_state.notify_all()
-
-    def _complete_graceful_shutdown(self) -> None:
-        try:
-            self._graceful_shutdown_result = self.wait_for_drain(
-                self._graceful_shutdown_timeout_seconds
-            )
-        finally:
-            self.shutdown()
-
-    def _reject_unavailable_request(self, request: Any, code: str, message: str) -> None:
-        request_id = new_request_id()
-        body = json.dumps(
-            {
-                "error": {
-                    "code": code,
-                    "message": message,
-                    "status": HTTPStatus.SERVICE_UNAVAILABLE.value,
-                }
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-        response = (
-            b"HTTP/1.1 503 Service Unavailable\r\n"
-            b"connection: close\r\n"
-            b"content-type: application/json\r\n"
-            b"cache-control: no-store\r\n"
-            + f"x-request-id: {request_id}\r\n".encode("ascii")
-            + b"retry-after: 1\r\n"
-            + f"content-length: {len(body)}\r\n\r\n".encode("ascii")
-            + body
-        )
-        with contextlib.suppress(OSError):
-            request.sendall(response)
-
-
 def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
     settings.ensure_dirs()
     api_log_writer = ApiLogWriter(
         settings.state_dir / "logs" / "api.jsonl",
         enabled=settings.api_log_enabled,
     )
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        synchronous=settings.sqlite_synchronous,
+    )
     store.init()
     supervisor = Supervisor(
         store,
@@ -413,6 +259,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         _request_context: RequestContext
         _response_status: int
         _response_error_code: str | None
+        _validated_query_values: dict[str, list[str]]
 
         def send_error(
             self,
@@ -442,7 +289,21 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             else:
                 self._validate_query_parameters(set())
                 self._require_key(read=not self._get_requires_strict_auth(path))
-            if path == "/doctor":
+            if path == "/ready":
+                try:
+                    schema_version = store.check_readiness()
+                except StateReadinessError:
+                    self._json_error_response(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "not_ready",
+                        "state store is not ready",
+                    )
+                    return
+                self._json(
+                    HTTPStatus.OK,
+                    {"schema_version": schema_version, "status": "ready"},
+                )
+            elif path == "/doctor":
                 self._json(HTTPStatus.OK, run_doctor(settings).to_dict())
             elif path == "/templates":
                 self._json(HTTPStatus.OK, [template_to_dict(t) for t in TemplateStore().list()])
@@ -820,18 +681,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             if length > 1_000_000:
                 raise ValueError("request body too large")
             data = self.rfile.read(length) if length else b"{}"
-            try:
-                parsed = json.loads(
-                    data.decode("utf-8"),
-                    object_pairs_hook=_json_object_without_duplicates,
-                    parse_constant=_reject_json_constant,
-                )
-            except RecursionError as exc:
-                raise ValueError(f"request JSON nesting exceeds {MAX_JSON_DEPTH}") from exc
-            _validate_json_depth(parsed)
-            if not isinstance(parsed, dict):
-                raise ValueError("request body must be a JSON object")
-            return parsed
+            return decode_json_object(data)
 
         def _require_json_content_type(self) -> None:
             content_encoding = self.headers.get("content-encoding", "").strip().lower()
@@ -882,34 +732,13 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             return validate_id(parts[1], "bot_id")
 
         def _normalized_path(self) -> str:
-            parsed = urlparse(self.path)
-            if parsed.fragment:
-                raise ValueError("request target must not include a fragment")
-            path = parsed.path
-            if path == "/v1":
-                return "/"
-            if path.startswith("/v1/"):
-                return path[3:]
-            return path
+            return normalize_api_path(self.path)
 
         def _query_values(self) -> dict[str, list[str]]:
-            try:
-                return parse_qs(
-                    urlparse(self.path).query,
-                    keep_blank_values=True,
-                    max_num_fields=MAX_QUERY_FIELDS,
-                )
-            except ValueError as exc:
-                raise ValueError("too many query parameters") from exc
+            return self._validated_query_values
 
         def _validate_query_parameters(self, allowed: set[str]) -> None:
-            values = self._query_values()
-            unknown = sorted(set(values) - allowed)
-            if unknown:
-                raise ValueError(f"unknown query parameter: {unknown[0]}")
-            duplicates = sorted(name for name, entries in values.items() if len(entries) > 1)
-            if duplicates:
-                raise ValueError(f"query parameter {duplicates[0]} must be specified once")
+            self._validated_query_values = parse_query(self.path, frozenset(allowed))
 
         def _post_query_parameters(self, path: str) -> set[str] | None:
             if path == "/bots":
@@ -1057,39 +886,10 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         def _json_error(self, exc: Exception) -> None:
             if isinstance(exc, _ResponseSent):
                 return
-            if isinstance(exc, KeyError):
-                status, code, message = _key_error_response(exc)
-                self._json_error_response(status, code, message)
-            elif isinstance(exc, TemplateError):
-                code = (
-                    "invalid_bot_id"
-                    if str(exc).startswith("bot_id must match")
-                    else "invalid_request"
-                )
-                self._json_error_response(HTTPStatus.BAD_REQUEST, code, str(exc))
-            elif isinstance(exc, ReconcileLockTimeoutError):
-                self._json_error_response(
-                    HTTPStatus.CONFLICT,
-                    "reconcile_locked",
-                    "reconciliation is already in progress",
-                )
-            elif isinstance(exc, LockTimeoutError):
-                self._json_error_response(
-                    HTTPStatus.CONFLICT,
-                    "bot_locked",
-                    "bot lifecycle operation is already in progress",
-                )
-            elif isinstance(exc, ZeusConflictError):
-                self._json_error_response(HTTPStatus.CONFLICT, exc.code, str(exc))
-            elif isinstance(exc, ValueError):
-                self._json_error_response(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
-            else:
+            error = map_api_exception(exc)
+            if error.log_exception:
                 api_log_writer.error(self._request_context.request_id, exc)
-                self._json_error_response(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "internal server error",
-                )
+            self._json_error_response(error.status, error.code, error.message)
 
         def _handle_idempotency_outcome(self, claim: IdempotencyClaim) -> bool:
             if claim.kind == "claimed":
@@ -1150,41 +950,19 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             raise RuntimeError("invalid idempotency claim outcome")
 
         def _buffer_error(self, exc: Exception) -> BufferedJsonResponse:
-            if isinstance(exc, KeyError):
-                status, code, message = _key_error_response(exc)
-            elif isinstance(exc, TemplateError):
-                status = HTTPStatus.BAD_REQUEST
-                code = (
-                    "invalid_bot_id"
-                    if str(exc).startswith("bot_id must match")
-                    else "invalid_request"
-                )
-                message = str(exc)
-            elif isinstance(exc, ReconcileLockTimeoutError):
-                status = HTTPStatus.CONFLICT
-                code = "reconcile_locked"
-                message = "reconciliation is already in progress"
-            elif isinstance(exc, LockTimeoutError):
-                status = HTTPStatus.CONFLICT
-                code = "bot_locked"
-                message = "bot lifecycle operation is already in progress"
-            elif isinstance(exc, ZeusConflictError):
-                status = HTTPStatus.CONFLICT
-                code = exc.code
-                message = str(exc)
-            elif isinstance(exc, ValueError):
-                status = HTTPStatus.BAD_REQUEST
-                code = "invalid_request"
-                message = str(exc)
-            else:
-                status = HTTPStatus.INTERNAL_SERVER_ERROR
-                code = "internal_error"
-                message = "internal server error"
+            error = map_api_exception(exc)
+            if error.log_exception:
                 api_log_writer.error(self._request_context.request_id, exc)
-            self._response_error_code = code
+            self._response_error_code = error.code
             return BufferedJsonResponse(
-                status,
-                {"error": {"code": code, "message": message, "status": status.value}},
+                error.status,
+                {
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                        "status": error.status.value,
+                    }
+                },
             )
 
         def _buffer_internal_error(self, exc: Exception) -> BufferedJsonResponse:
@@ -1317,6 +1095,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             self._request_context.route = _safe_route_template(self.path)
             self._response_status = HTTPStatus.INTERNAL_SERVER_ERROR.value
             self._response_error_code = None
+            self._validated_query_values = {}
             try:
                 dispatch()
             except Exception as exc:
@@ -1353,16 +1132,6 @@ def _safe_route_template(target: str) -> str | None:
         return None
 
 
-def _key_error_response(exc: KeyError) -> tuple[HTTPStatus, str, str]:
-    detail = exc.args[0] if exc.args else "missing required field"
-    message = str(detail)
-    if message.startswith("unknown bot:"):
-        return HTTPStatus.NOT_FOUND, "unknown_bot", message
-    if message.startswith("unknown template:"):
-        return HTTPStatus.BAD_REQUEST, "unknown_template", message
-    return HTTPStatus.BAD_REQUEST, "invalid_request", f"missing required field: {message}"
-
-
 def template_to_dict(template: HermesTemplate) -> dict[str, Any]:
     return {
         "id": template.id,
@@ -1376,89 +1145,13 @@ def template_to_dict(template: HermesTemplate) -> dict[str, Any]:
 
 def serve(host: str, port: int, settings: Settings | None = None) -> None:
     base_settings = settings or Settings.from_env()
-    runtime_settings = replace(base_settings, host=host, port=port)
-    if not 0 <= port <= 65535:
-        raise ValueError("port must be between 0 and 65535")
-    validate_api_exposure(
-        runtime_settings.host,
-        runtime_settings.api_key,
-        runtime_settings.allow_unauth_reads,
+    _serve_server(
+        host,
+        port,
+        base_settings,
+        handler_factory=make_handler,
+        server_factory=ThreadingHTTPServer,
     )
-    runtime_settings.ensure_dirs()
-    pid = os.getpid()
-    pid_path = runtime_settings.state_dir / "zeus.pid"
-    api_lock = BotProcessLock(
-        runtime_settings.state_dir / "locks" / "api.lock",
-        timeout_seconds=min(runtime_settings.lock_timeout_seconds, 1.0),
-    )
-    with api_lock:
-        handler = make_handler(runtime_settings)
-        server = ThreadingHTTPServer((host, port), handler)
-        previous_signal_handlers: dict[signal.Signals, Any] = {}
-        try:
-            if threading.current_thread() is threading.main_thread():
-                for signum in (signal.SIGTERM, signal.SIGINT):
-                    previous_signal_handlers[signum] = signal.getsignal(signum)
-                    signal.signal(
-                        signum,
-                        lambda _signum, _frame: server.request_graceful_shutdown(
-                            runtime_settings.api_shutdown_drain_seconds
-                        ),
-                    )
-            with contextlib.suppress(KeyboardInterrupt):
-                _write_api_pid(pid_path, pid)
-                server.serve_forever()
-        finally:
-            for signum, previous_handler in previous_signal_handlers.items():
-                signal.signal(signum, previous_handler)
-            finish_graceful_shutdown = getattr(server, "finish_graceful_shutdown", None)
-            drain_result = (
-                finish_graceful_shutdown() if callable(finish_graceful_shutdown) else None
-            )
-            if drain_result is None:
-                begin_draining = getattr(server, "begin_draining", None)
-                if callable(begin_draining):
-                    begin_draining()
-                server.server_close()
-                wait_for_drain = getattr(server, "wait_for_drain", None)
-                drain_result = (
-                    wait_for_drain(runtime_settings.api_shutdown_drain_seconds)
-                    if callable(wait_for_drain)
-                    else True
-                )
-            else:
-                server.server_close()
-            if not drain_result:
-                print("warning: API shutdown drain deadline expired", file=sys.stderr)
-            _remove_api_pid_if_owned(pid_path, pid)
-
-
-def _write_api_pid(path: Path, pid: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(f".{path.name}.{pid}.{time.time_ns()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(f"{pid}\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-        with contextlib.suppress(OSError):
-            path.chmod(0o600)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-
-
-def _remove_api_pid_if_owned(path: Path, pid: int) -> None:
-    try:
-        recorded_pid = int(path.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, OSError, ValueError):
-        return
-    if recorded_pid != pid:
-        return
-    with contextlib.suppress(FileNotFoundError):
-        path.unlink()
 
 
 def main(argv: list[str] | None = None) -> int:

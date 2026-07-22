@@ -32,17 +32,50 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.models`: Template, bot, and status validation.
 - `zeus.templates`: Bundled plus local TOML template discovery with duplicate ID checks.
 - `zeus.renderer`: Hermes profile rendering.
-- `zeus.state`: SQLite bot projection and authoritative lifecycle ledger.
+- `zeus.sqlite_db`: Shared SQLite connection factory and per-connection durability policy.
+- `zeus.schema`: Schema-v6 initialization, compatibility guards, and forward migrations.
+- `zeus.idempotency_store`: Durable API mutation claims and replay responses.
+- `zeus.reconcile_store`: Persisted fleet reconciliation runs and ordered results.
+- `zeus.bot_lifecycle_store`: Bot projection, intent, lifecycle ledger, history, and audit mirror.
+- `zeus.state`: Compatibility facade composing the shared database and persistence stores.
 - `zeus.lifecycle`: Bounded lifecycle event types and recursively redacted details.
 - `zeus.request_context`: Locally generated request IDs and normalized route templates.
+- `zeus.api_errors`: Transport-neutral API exception classification.
+- `zeus.api_request`: Strict path, query, and JSON request parsing.
+- `zeus.api_server`: Bounded HTTP concurrency and graceful server lifecycle.
 - `zeus.api_logging`: Locked, fail-open, secret-safe API JSONL output.
 - `zeus.idempotency`: Key validation and canonical request hashing.
+- `zeus.process_identity`: Standard-library process observation and trusted-command checks.
+- `zeus.gateway_marker`: Effect-free schema-v3 marker parsing and exact-generation values.
 - `zeus.hermes_adapter`: Subprocess command construction for Hermes.
 - `zeus.gateway_launcher`: Descriptor-only marker-before-exec helper.
-- `zeus.supervisor`: Gateway lifecycle, PID ownership markers, logs, and status.
-- `zeus.api`: Local HTTP API.
+- `zeus.profile_manager`: Atomic profile installation, delete, archive, and rollback transactions.
+- `zeus.gateway_runtime`: Process, marker, readiness, signal, and cleanup effects.
+- `zeus.intent_recovery`: Store-free pending-intent recovery decisions through a structural host.
+- `zeus.supervisor`: Public lifecycle facade, locks, durable intent transitions, and audit ordering.
+- `zeus.api`: Local HTTP routes and compatibility facade.
 - `zeus.cli`: Operator CLI.
 - `zeus.doctor`: Readiness diagnostics.
+
+## SQLite Durability
+
+Zeus uses persistent SQLite WAL mode. `SQLiteDatabase` installs the selected
+`ZEUS_SQLITE_SYNCHRONOUS` policy on every returned operational connection after
+both newer-schema guards, foreign-key enforcement, and WAL setup. The raw
+read-only schema preflight and readiness probe cannot commit and are
+intentionally not configured with durability PRAGMAs.
+
+Committed transactions survive an application or Zeus process crash under both
+NORMAL and FULL. With NORMAL, SQLite omits a WAL sync on most commits, so a host
+OS crash, hard reset, or power loss can roll back recently reported commits
+after recovery while retaining WAL consistency. With FULL, SQLite syncs the WAL
+at each commit to provide durability across OS crash or power loss, at the cost
+of commit latency.
+
+The setting is per connection: every process that writes the same database must
+select the intended mode. It covers SQLite only. Rendered profile files, PID
+markers, locks, and the best-effort audit JSONL remain separate filesystem
+state, and neither mode replaces backup and restore procedures.
 
 ## Process Lifecycle
 
@@ -62,6 +95,20 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
    failure exits before Hermes and leaves recoverable durable state.
 7. Stop commits its stopped intent before verifying ownership and signaling;
    SIGTERM/SIGKILL authorization is rechecked against the exact process identity.
+
+`Supervisor` owns the per-bot locks, lifecycle correlation context, `StateStore`
+calls, and authoritative transition/audit ordering. `ProfileManager` changes only
+profile and archive paths. `GatewayRuntime` owns the mutable in-process gateway
+registry and host effects but never reads or writes SQLite. `PendingIntentRecovery`
+contains the pending start, stop, and restart decision flow and resolves facade
+methods dynamically through its structural host; it does not acquire locks, mint
+operation IDs, or import the concrete facade or persistence layer.
+
+Status never spawns or signals; it may adopt exact evidence and repair the durable
+projection. Reconcile may recover one effect per pass: a pending restart first
+stops or cleans its exact schema-v3 predecessor and persists that observation,
+then a later pass adopts or launches the replacement with the same pending
+operation ID.
 
 Hermes child processes receive a minimal host environment plus profile `.env`
 values. Operators can allow specific host variables with `ZEUS_ENV_PASSTHROUGH`.
@@ -130,7 +177,7 @@ The v2-to-v3 migration is also one transaction. It creates a
 the projection/event invariant, and advances the schema version only after all
 steps succeed. Additive v3-to-v4 and v4-to-v5 upgrades add durable idempotency
 and desired/pending intent in forward-only transactions. Databases newer than
-schema v5 are rejected rather than downgraded.
+schema v6 are rejected rather than downgraded.
 
 `$ZEUS_STATE_DIR/logs/audit.jsonl` remains a best-effort compatibility mirror.
 It is written only after the SQLite transaction commits and is not imported into

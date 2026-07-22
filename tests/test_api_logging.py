@@ -3,9 +3,7 @@ from __future__ import annotations
 import http.client
 import io
 import json
-import os
 import socket
-import stat
 import tempfile
 import threading
 import time
@@ -15,11 +13,12 @@ from contextlib import redirect_stderr
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 from zeus.api import make_handler
 from zeus.api_logging import ApiLogWriter
 from zeus.config import Settings
+from zeus.private_io import UnsafeFileError
 from zeus.request_context import (
     IDEMPOTENCY_OUTCOMES,
     RequestContext,
@@ -56,7 +55,7 @@ def raw_http_request(port: int, request: bytes) -> tuple[int, dict[str, str], di
 class ApiLoggingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name)
+        self.root = Path(self.temp_dir.name).resolve()
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -109,6 +108,8 @@ class ApiLoggingTests(unittest.TestCase):
     def test_route_templates_hide_bot_ids_and_normalize_v1(self) -> None:
         self.assertEqual("/bots/{bot_id}/start", route_template("/v1/bots/secret-bot/start"))
         self.assertEqual("/bots/{bot_id}/history", route_template("/v1/bots/secret-bot/history"))
+        self.assertEqual("/ready", route_template("/ready"))
+        self.assertEqual("/ready", route_template("/v1/ready"))
         self.assertIsNone(route_template("/not-a-route"))
 
     def test_api_log_writer_writes_parseable_redacted_lines(self) -> None:
@@ -250,6 +251,42 @@ class ApiLoggingTests(unittest.TestCase):
         ApiLogWriter(disabled_path, enabled=False).access({"status": 200})
         self.assertFalse(disabled_path.exists())
 
+    def test_api_log_writer_delegates_exact_canonical_utf8_line(self) -> None:
+        path = self.root / "api.jsonl"
+
+        with (
+            patch("zeus.api_logging.datetime") as clock,
+            patch("zeus.api_logging.append_private_bytes") as append,
+        ):
+            clock.now.return_value.isoformat.return_value = "2026-07-21T12:34:56+00:00"
+            ApiLogWriter(path, enabled=True).access({"status": 200})
+
+        append.assert_called_once_with(
+            path,
+            b'{"event":"api.access","level":"info","schema_version":1,'
+            b'"status":200,"ts":"2026-07-21T12:34:56+00:00"}\n',
+        )
+
+    def test_api_log_writer_keeps_private_io_failures_fail_open(self) -> None:
+        path = self.root / "api.jsonl"
+
+        with patch(
+            "zeus.api_logging.append_private_bytes",
+            side_effect=UnsafeFileError("unsafe path"),
+        ) as append:
+            ApiLogWriter(path, enabled=True).access({"status": 200})
+            ApiLogWriter(path, enabled=True).error("a" * 32, RuntimeError("safe"))
+
+        self.assertEqual(2, append.call_count)
+
+    def test_disabled_api_log_writer_does_not_delegate(self) -> None:
+        with patch("zeus.api_logging.append_private_bytes") as append:
+            writer = ApiLogWriter(self.root / "api.jsonl", enabled=False)
+            writer.access({"status": 200})
+            writer.error("a" * 32, RuntimeError("safe"))
+
+        append.assert_not_called()
+
     def test_api_access_payload_building_is_fail_open(self) -> None:
         class BrokenString:
             def __str__(self) -> str:
@@ -271,93 +308,6 @@ class ApiLoggingTests(unittest.TestCase):
         row = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual("Exception", row["error_type"])
         self.assertEqual("Unexpected API error", row["message"])
-
-    def test_api_log_writer_creates_private_directory_and_file(self) -> None:
-        path = self.root / "logs" / "api.jsonl"
-
-        ApiLogWriter(path, enabled=True).access({"status": 200})
-
-        self.assertEqual(0o700, stat.S_IMODE(path.parent.stat().st_mode))
-        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
-
-    def test_api_log_writer_tightens_existing_directory_and_file_modes(self) -> None:
-        directory = self.root / "logs"
-        directory.mkdir(mode=0o755)
-        path = directory / "api.jsonl"
-        path.write_text("", encoding="utf-8")
-        directory.chmod(0o755)
-        path.chmod(0o644)
-
-        ApiLogWriter(path, enabled=True).access({"status": 200})
-
-        self.assertEqual(0o700, stat.S_IMODE(directory.stat().st_mode))
-        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
-        self.assertEqual(200, json.loads(path.read_text(encoding="utf-8"))["status"])
-
-    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW unavailable")
-    def test_api_log_writer_does_not_follow_symlinked_log_directory(self) -> None:
-        outside = self.root / "outside"
-        outside.mkdir(mode=0o755)
-        outside.chmod(0o755)
-        outside_mode = stat.S_IMODE(outside.stat().st_mode)
-        logs = self.root / "state" / "logs"
-        logs.parent.mkdir()
-        logs.symlink_to(outside, target_is_directory=True)
-
-        ApiLogWriter(logs / "api.jsonl", enabled=True).access({"status": 200})
-
-        self.assertFalse((outside / "api.jsonl").exists())
-        self.assertEqual(outside_mode, stat.S_IMODE(outside.stat().st_mode))
-
-    def test_api_log_writer_closes_descriptor_when_fchmod_fails(self) -> None:
-        path = self.root / "api.jsonl"
-
-        with (
-            patch("zeus.api_logging.os.fchmod", side_effect=OSError("denied")),
-            patch("zeus.api_logging.os.close", wraps=os.close) as close,
-        ):
-            ApiLogWriter(path, enabled=True).access({"status": 200})
-
-        close.assert_called_once()
-        self.assertFalse(path.exists())
-
-    def test_api_log_writer_closes_both_descriptors_when_file_fchmod_fails(self) -> None:
-        path = self.root / "api.jsonl"
-
-        with (
-            patch("zeus.api_logging.os.fchmod", side_effect=[None, OSError("denied")]),
-            patch("zeus.api_logging.os.close", wraps=os.close) as close,
-        ):
-            ApiLogWriter(path, enabled=True).access({"status": 200})
-
-        self.assertEqual(2, close.call_count)
-        self.assertEqual("", path.read_text(encoding="utf-8"))
-
-    def test_api_log_writer_attempts_directory_close_when_file_close_fails(self) -> None:
-        path = self.root / "api.jsonl"
-
-        with (
-            patch("zeus.api_logging.os.open", side_effect=[101, 202]),
-            patch("zeus.api_logging.os.fchmod", side_effect=[None, OSError("denied")]),
-            patch(
-                "zeus.api_logging.os.close",
-                side_effect=[OSError("file close failed"), None],
-            ) as close,
-        ):
-            ApiLogWriter(path, enabled=True).access({"status": 200})
-
-        self.assertEqual([call(202), call(101)], close.call_args_list)
-
-    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW unavailable")
-    def test_api_log_writer_does_not_follow_symlinks(self) -> None:
-        target = self.root / "target.jsonl"
-        target.write_text("original\n", encoding="utf-8")
-        path = self.root / "api.jsonl"
-        path.symlink_to(target)
-
-        ApiLogWriter(path, enabled=True).access({"status": 200})
-
-        self.assertEqual("original\n", target.read_text(encoding="utf-8"))
 
     def test_api_error_omits_exception_messages_and_tracebacks(self) -> None:
         path = self.root / "api.jsonl"

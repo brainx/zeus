@@ -6,14 +6,36 @@ set -eu
 bot_id="${ZEUS_VERIFY_BOT_ID:-real-hermes-check}"
 template_id="${ZEUS_VERIFY_TEMPLATE:-coding-bot}"
 state_dir="${ZEUS_VERIFY_STATE_DIR:-.zeus-real-hermes-check}"
+evidence_dir="${ZEUS_VERIFY_EVIDENCE_DIR:-.tmp/real-hermes-evidence}"
+expected_hermes_version="${ZEUS_VERIFY_EXPECTED_HERMES_VERSION:-}"
 api_server_host="${ZEUS_VERIFY_API_SERVER_HOST:-127.0.0.1}"
 api_server_port="${ZEUS_VERIFY_API_SERVER_PORT:-4312}"
 health_timeout_seconds="${ZEUS_VERIFY_HEALTH_TIMEOUT_SECONDS:-30}"
 health_interval_seconds="${ZEUS_VERIFY_HEALTH_INTERVAL_SECONDS:-0.5}"
 
 case "$state_dir" in
-  "" | "/" | "." | ".." | /* | ../* | */../*)
+  "" | "/" | "." | ".." | /* | ../* | */.. | */../*)
     echo "unsafe ZEUS_VERIFY_STATE_DIR: use a workspace-relative scratch directory" >&2
+    exit 2
+    ;;
+esac
+
+case "$evidence_dir" in
+  "" | "/" | "." | ".." | /* | ../* | */.. | */../*)
+    echo "unsafe ZEUS_VERIFY_EVIDENCE_DIR: use a workspace-relative scratch directory" >&2
+    exit 2
+    ;;
+esac
+
+case "$state_dir/" in
+  "$evidence_dir/"*)
+    echo "unsafe verification directories: state and evidence paths must not overlap" >&2
+    exit 2
+    ;;
+esac
+case "$evidence_dir/" in
+  "$state_dir/"*)
+    echo "unsafe verification directories: state and evidence paths must not overlap" >&2
     exit 2
     ;;
 esac
@@ -43,21 +65,55 @@ if ! command -v hermes >/dev/null 2>&1; then
   exit 2
 fi
 
+failure_stage="environment"
 cleanup() {
+  status=$?
+  trap - EXIT INT TERM
   if [ -d "$state_dir" ]; then
     ZEUS_STATE_DIR="$state_dir" \
       ZEUS_HERMES_BIN="$(command -v hermes 2>/dev/null || printf '%s' hermes)" \
       python3 -B -m zeus.cli bot stop "$bot_id" >/dev/null 2>&1 || true
   fi
+  rm -rf -- "$state_dir"
+  if [ "$status" -eq 0 ]; then
+    rm -rf -- "$evidence_dir"
+  else
+    rm -rf -- "$evidence_dir"
+    mkdir -p "$evidence_dir"
+    chmod 0700 "$evidence_dir"
+    (
+      umask 077
+      printf 'result=failed\nfailure_stage=%s\n' "$failure_stage" \
+        >"$evidence_dir/summary.txt"
+    )
+  fi
+  exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-rm -rf -- "$state_dir"
+rm -rf -- "$state_dir" "$evidence_dir"
 
+failure_stage="hermes_version"
+if [ -n "$expected_hermes_version" ]; then
+  actual_hermes_version="$(
+    python3 -c 'from importlib.metadata import version; print(version("hermes-agent"))'
+  )"
+  if [ "$actual_hermes_version" != "$expected_hermes_version" ]; then
+    echo "Hermes version mismatch: expected $expected_hermes_version, got $actual_hermes_version" >&2
+    exit 1
+  fi
+fi
+
+failure_stage="zeus_doctor"
 ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" ZEUS_API_KEY="${ZEUS_VERIFY_API_KEY:-real-hermes-local-check}" python3 -B -m zeus.cli doctor --strict --json
+failure_stage="profile_create"
 ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" python3 -B -m zeus.cli bot create "$bot_id" --template "$template_id"
+failure_stage="bot_doctor"
 ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" python3 -B -m zeus.cli bot doctor "$bot_id"
 
+failure_stage="rendered_profile"
 config_path="$state_dir/hermes/profiles/$bot_id/config.yaml"
 test -f "$config_path"
 grep -q "max_async_children" "$config_path"
@@ -72,6 +128,7 @@ if [ "${ZEUS_VERIFY_START_GATEWAY:-0}" = "1" ]; then
     api_server_passthrough="$ZEUS_ENV_PASSTHROUGH,$api_server_passthrough"
   fi
 
+  failure_stage="gateway_start"
   API_SERVER_ENABLED=1 \
     API_SERVER_HOST="$api_server_host" \
     API_SERVER_PORT="$api_server_port" \
@@ -79,11 +136,12 @@ if [ "${ZEUS_VERIFY_START_GATEWAY:-0}" = "1" ]; then
     ZEUS_ENV_PASSTHROUGH="$api_server_passthrough" \
     ZEUS_STATE_DIR="$state_dir" \
     ZEUS_HERMES_BIN="$(command -v hermes)" \
-    python3 -B -m zeus.cli bot start "$bot_id"
-  sleep "${ZEUS_VERIFY_GATEWAY_SECONDS:-3}"
+    python3 -B -m zeus.cli bot start "$bot_id" --wait --timeout "$health_timeout_seconds"
+  failure_stage="gateway_status"
   ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
     python3 -B -m zeus.cli bot status "$bot_id" \
     | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "running"'
+  failure_stage="process_ownership"
   ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
     python3 -B -m zeus.cli bot inspect "$bot_id" --json \
     | python3 -c '
@@ -100,6 +158,7 @@ assert ownership["classification"] in {
     "legacy-marker-valid",
 }, ownership
 '
+  failure_stage="loopback_health"
   python3 - "$api_server_host" "$api_server_port" "$health_timeout_seconds" "$health_interval_seconds" <<'PY'
 import json
 import sys
@@ -136,9 +195,11 @@ while True:
         )
     time.sleep(interval_seconds)
 PY
+  failure_stage="gateway_stop"
   ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
     python3 -B -m zeus.cli bot stop "$bot_id" \
     | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "stopped"'
+  failure_stage="stopped_status"
   ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
     python3 -B -m zeus.cli bot status "$bot_id" \
     | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "stopped"'
@@ -146,4 +207,5 @@ else
   echo "Skipping gateway start. Set ZEUS_VERIFY_START_GATEWAY=1 to exercise hermes gateway run."
 fi
 
+failure_stage="complete"
 echo "Real Hermes verification completed for $bot_id using $state_dir"

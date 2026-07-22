@@ -6,12 +6,15 @@ import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from zeus.bot_lifecycle_store import BotLifecycleStore
 from zeus.lifecycle import LifecycleEvent, LifecycleEventInput, serialize_lifecycle_details
-from zeus.models import BotRecord, BotStatus
+from zeus.models import BotRecord, BotStatus, DesiredState
+from zeus.reconciliation import BotReconcileResult, ReconcileOutcome, ReconcileRunStart
+from zeus.sanitization import sanitize_details, sanitize_text
 from zeus.state import StateStore
 
 
@@ -321,6 +324,73 @@ class LifecycleLedgerTests(unittest.TestCase):
                         before=invalid_before,  # type: ignore[arg-type]
                     )
 
+    def test_pending_intent_projection_and_event_are_committed_as_one_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(self._record(root))
+
+            pending = store.begin_lifecycle_intent(
+                "coder",
+                action="start",
+                operation_id="a" * 32,
+                source="api",
+                request_id="b" * 32,
+                reason="gateway start requested",
+            )
+
+            history = store.list_lifecycle_events("coder", limit=10, before=None)
+            self.assertEqual(1, len(history))
+            intent = history[0]
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                last_event_id = conn.execute(
+                    "SELECT last_event_id FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()[0]
+            self.assertEqual(intent.event_id, last_event_id)
+            self.assertEqual(DesiredState.running, pending.desired_state)
+            self.assertEqual(1, pending.desired_revision)
+            self.assertEqual("a" * 32, pending.pending_operation_id)
+            self.assertEqual("start", pending.pending_action)
+            self.assertEqual(
+                {
+                    "bot_id": "coder",
+                    "operation_id": "a" * 32,
+                    "request_id": "b" * 32,
+                    "source": "api",
+                    "action": "bot.start.intent",
+                    "outcome": "pending",
+                    "status_before": "stopped",
+                    "status_after": "stopped",
+                    "pid_before": None,
+                    "pid_after": None,
+                    "reason": "gateway start requested",
+                    "error_code": None,
+                    "error_message": None,
+                    "details": {
+                        "action": "start",
+                        "desired_revision": 1,
+                        "desired_state": "running",
+                    },
+                },
+                {
+                    "bot_id": intent.bot_id,
+                    "operation_id": intent.operation_id,
+                    "request_id": intent.request_id,
+                    "source": intent.source,
+                    "action": intent.action,
+                    "outcome": intent.outcome,
+                    "status_before": intent.status_before,
+                    "status_after": intent.status_after,
+                    "pid_before": intent.pid_before,
+                    "pid_after": intent.pid_after,
+                    "reason": intent.reason,
+                    "error_code": intent.error_code,
+                    "error_message": intent.error_message,
+                    "details": dict(intent.details),
+                },
+            )
+
     def test_event_input_is_frozen_and_recursively_redacts_bounded_details(self) -> None:
         nested_items = [{"visible": "value"}]
         nested: dict[str, object] = {
@@ -432,6 +502,331 @@ class LifecycleLedgerTests(unittest.TestCase):
         )
         json.dumps(stored.to_dict(), sort_keys=True)
 
+    def test_sanitizer_bounds_cycles_nonfinite_numbers_and_free_text_secrets(self) -> None:
+        secret = "lifecycle-sentinel-9a21"
+        cycle: list[object] = []
+        cycle.append(cycle)
+        deep: object = "leaf"
+        for _ in range(12):
+            deep = {"next": deep}
+
+        sanitized = sanitize_details(
+            {
+                "api_key": secret,
+                "messages": [
+                    f"API_KEY={secret}",
+                    f"authorization=Bearer {secret}",
+                    f"request failed with Bearer {secret}",
+                ],
+                "cycle": cycle,
+                "deep": deep,
+                "nan": float("nan"),
+                "positive_infinity": float("inf"),
+                "negative_infinity": float("-inf"),
+            }
+        )
+        encoded = json.dumps(
+            sanitized,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+        self.assertFalse(secret.encode("utf-8") in encoded)
+        self.assertLessEqual(len(encoded), 8192)
+        self.assertIsNone(sanitized["nan"])  # type: ignore[index]
+        self.assertIsNone(sanitized["positive_infinity"])  # type: ignore[index]
+        self.assertIsNone(sanitized["negative_infinity"])  # type: ignore[index]
+        self.assertIn(b"[cycle]", encoded)
+        self.assertIn(b"[truncated]", encoded)
+
+        oversized = json.dumps(
+            sanitize_details({"message": "Δ" * 20_000}),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertLessEqual(len(oversized), 8192)
+
+        bounded_collection = sanitize_details({"items": list(range(1_000))})
+        self.assertLessEqual(len(bounded_collection["items"]), 64)  # type: ignore[index]
+
+    def test_sanitizer_redacts_values_for_oversized_sensitive_keys(self) -> None:
+        secret = "long-key-sentinel-cb30"
+        sanitized = sanitize_details({f"{'x' * 256}_api_key": secret})
+        encoded = json.dumps(sanitized, allow_nan=False).encode("utf-8")
+
+        self.assertFalse(secret.encode("utf-8") in encoded)
+
+    def test_sanitizer_never_invokes_hostile_string_or_repr_methods(self) -> None:
+        class Hostile:
+            def __str__(self) -> str:
+                raise AssertionError("string conversion invoked")
+
+            def __repr__(self) -> str:
+                raise AssertionError("representation invoked")
+
+        class HostileString(str):
+            def __str__(self) -> str:
+                raise AssertionError("string conversion invoked")
+
+            def __repr__(self) -> str:
+                raise AssertionError("representation invoked")
+
+        hostile_key = Hostile()
+        hostile_value = Hostile()
+
+        sanitized = sanitize_details(
+            {
+                "value": hostile_value,
+                "text": HostileString("TOKEN=hostile-string-sentinel"),
+                hostile_key: "untrusted key value",
+            }
+        )
+
+        self.assertEqual("[unsupported]", sanitized["value"])  # type: ignore[index]
+        self.assertEqual("[unsupported]", sanitized["text"])  # type: ignore[index]
+        json.dumps(sanitized, allow_nan=False)
+
+    def test_lifecycle_text_fields_are_redacted_before_sqlite_persistence(self) -> None:
+        secret = "event-sentinel-84c2"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            event = LifecycleEventInput(
+                bot_id="coder",
+                operation_id="a" * 32,
+                source="cli",
+                action="bot.start",
+                outcome="failure",
+                reason=f"readiness failed with Bearer {secret}",
+                error_code="readiness_failed",
+                error_message=f"cleanup failed: API_KEY={secret}",
+            )
+
+            store.upsert_bot_with_event(self._record(root), event=event)
+
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                row = conn.execute(
+                    "SELECT reason, error_message, details_json FROM lifecycle_events"
+                ).fetchone()
+            assert row is not None
+            persisted = "\n".join(str(value) for value in row if value is not None)
+            self.assertFalse(secret in persisted)
+
+    def test_authorization_credentials_are_redacted_from_all_persistence_sinks(self) -> None:
+        credentials = (
+            "basic-credential-sentinel-47d1",
+            "digest-credential-sentinel-8a20",
+            "custom-credential-sentinel-53fe",
+        )
+        messages = (
+            f"Authorization: Basic {credentials[0]}",
+            f'authorization=Digest username="operator", response="{credentials[1]}"',
+            f"Authorization: CustomScheme {credentials[2]}",
+        )
+        started_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            event = LifecycleEventInput(
+                bot_id="coder",
+                operation_id="a" * 32,
+                source="cli",
+                action="bot.start",
+                outcome="failure",
+                reason=messages[0],
+                error_code="authorization_failed",
+                error_message=messages[1],
+                details={"message": messages[2]},
+            )
+            store.upsert_bot_with_event(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / "profiles" / "coder"),
+                    last_error=messages[0],
+                    last_transition_reason=messages[1],
+                ),
+                event=event,
+            )
+            store.append_audit_event(
+                "bot.authorization_failed",
+                cleanup_errors=list(messages),
+            )
+            run = ReconcileRunStart(
+                run_id="authorization-sanitization",
+                scope="fleet",
+                requested_bot_id=None,
+                source="cli",
+                force=False,
+                reset_restart=False,
+                started_at=started_at,
+            )
+            result = BotReconcileResult(
+                bot_id="coder",
+                outcome=ReconcileOutcome.error,
+                desired_state="running",
+                observed_status="failed",
+                pid=None,
+                action="inspect",
+                message="; ".join(messages),
+                error_code="authorization_failed",
+                event_id=None,
+                started_at=started_at,
+                finished_at=started_at + timedelta(seconds=1),
+            )
+            store.begin_reconcile_run(run)
+            store.append_reconcile_result(run.run_id, result)
+
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                lifecycle_row = conn.execute(
+                    "SELECT reason, error_message, details_json FROM lifecycle_events"
+                ).fetchone()
+                bot_row = conn.execute(
+                    "SELECT last_error, last_transition_reason FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()
+                reconcile_row = conn.execute(
+                    "SELECT message FROM reconcile_results WHERE run_id = ?",
+                    (run.run_id,),
+                ).fetchone()
+            assert lifecycle_row is not None
+            assert bot_row is not None
+            assert reconcile_row is not None
+            observed = (
+                *(sanitize_text(message) for message in messages),
+                *lifecycle_row,
+                *bot_row,
+                *reconcile_row,
+                result.message,
+                store.audit_log_path().read_text(encoding="utf-8"),
+            )
+            for credential in credentials:
+                self.assertFalse(
+                    any(credential in value for value in observed if isinstance(value, str))
+                )
+
+    def test_authorization_label_variants_and_folded_credentials_are_redacted(self) -> None:
+        credentials = tuple(f"authorization-variant-sentinel-{index:02d}" for index in range(16))
+        messages = (
+            f"Authorization Header: Basic {credentials[0]}",
+            f'authorization_header=Digest response="{credentials[1]}"',
+            f"Authorization Headers: CustomScheme {credentials[2]}",
+            f"authorizationHeaders=Bearer {credentials[3]}",
+            f"authorization-header: Basic {credentials[4]}",
+            f'authorization.headers=Digest response="{credentials[5]}"',
+            f"authorizationHeader=CustomScheme {credentials[6]}",
+            f"authorization/header: Basic {credentials[7]}",
+            f"Authorization: Basic\r\n  {credentials[8]}",
+            f'Authorization Header: Digest\n\tresponse="{credentials[9]}"',
+            f"authorization_headers=CustomScheme\r\n  {credentials[10]}",
+            f"authorizationHeaders: Bearer\n\t{credentials[11]}",
+            f"Authorization:\r\n  Basic {credentials[12]}",
+            f'Authorization Header:\n\tDigest response="{credentials[13]}"',
+            f"authorization_headers=\r\n  CustomScheme {credentials[14]}",
+            f'"Authorization":\n  "Basic {credentials[15]}"',
+        )
+        combined = "\nnext authorization case\n".join(messages)
+        started_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root / "zeus.db")
+            store.init()
+            event = LifecycleEventInput(
+                bot_id="coder",
+                operation_id="b" * 32,
+                source="cli",
+                action="bot.start",
+                outcome="failure",
+                reason=combined,
+                error_code="authorization_failed",
+                error_message=combined,
+                details={"message": combined},
+            )
+            store.upsert_bot_with_event(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(root / "profiles" / "coder"),
+                    last_error=combined,
+                    last_transition_reason=combined,
+                ),
+                event=event,
+            )
+            store.append_audit_event(
+                "bot.authorization_failed",
+                cleanup_errors=list(messages),
+            )
+            run = ReconcileRunStart(
+                run_id="authorization-variant-sanitization",
+                scope="fleet",
+                requested_bot_id=None,
+                source="cli",
+                force=False,
+                reset_restart=False,
+                started_at=started_at,
+            )
+            result = BotReconcileResult(
+                bot_id="coder",
+                outcome=ReconcileOutcome.error,
+                desired_state="running",
+                observed_status="failed",
+                pid=None,
+                action="inspect",
+                message=combined,
+                error_code="authorization_failed",
+                event_id=None,
+                started_at=started_at,
+                finished_at=started_at + timedelta(seconds=1),
+            )
+            store.begin_reconcile_run(run)
+            store.append_reconcile_result(run.run_id, result)
+
+            with closing(sqlite3.connect(store.database_path)) as conn:
+                lifecycle_row = conn.execute(
+                    "SELECT reason, error_message, details_json FROM lifecycle_events"
+                ).fetchone()
+                bot_row = conn.execute(
+                    "SELECT last_error, last_transition_reason FROM bots WHERE bot_id = 'coder'"
+                ).fetchone()
+                reconcile_row = conn.execute(
+                    "SELECT message FROM reconcile_results WHERE run_id = ?",
+                    (run.run_id,),
+                ).fetchone()
+            assert lifecycle_row is not None
+            assert bot_row is not None
+            assert reconcile_row is not None
+            observed_by_sink = {
+                "direct": tuple(sanitize_text(message) for message in messages),
+                "lifecycle": lifecycle_row,
+                "bot_projection": bot_row,
+                "reconciliation": (*reconcile_row, result.message),
+                "audit": (store.audit_log_path().read_text(encoding="utf-8"),),
+            }
+            for case_index, credential in enumerate(credentials):
+                for sink_name, observed in observed_by_sink.items():
+                    with self.subTest(case=case_index, sink=sink_name):
+                        self.assertFalse(
+                            any(credential in value for value in observed if isinstance(value, str))
+                        )
+
+    def test_audit_non_bmp_event_fallback_is_strictly_byte_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp) / "zeus.db")
+
+            store.append_audit_event(chr(0x1F512) * 2_048, message="ordinary")
+
+            line = store.audit_log_path().read_bytes()
+            self.assertLessEqual(len(line), 8192)
+            self.assertEqual(1, len(line.splitlines()))
+            self.assertTrue(json.loads(line)["truncated"])
+
     def test_upsert_bot_with_event_rolls_back_projection_when_event_insert_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -440,7 +835,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -460,7 +855,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -488,7 +883,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -519,7 +914,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_insert_lifecycle_event",
                     side_effect=sqlite3.Error("boom"),
                 ),
@@ -541,7 +936,7 @@ class LifecycleLedgerTests(unittest.TestCase):
 
                 with (
                     patch.object(
-                        store,
+                        BotLifecycleStore,
                         "_row_to_lifecycle_event",
                         side_effect=sqlite3.Error("materialization failed"),
                     ),
@@ -576,7 +971,7 @@ class LifecycleLedgerTests(unittest.TestCase):
                     store.upsert_bot(self._record(root))
 
                 with patch.object(
-                    store,
+                    BotLifecycleStore,
                     "_append_lifecycle_audit",
                     side_effect=RuntimeError("audit failed"),
                 ):

@@ -887,13 +887,13 @@ class LifecycleRegressionTests(unittest.TestCase):
                 patch.dict(os.environ, {"ZEUS_ENV_PASSTHROUGH": ""}, clear=False),
                 patch(
                     "zeus.supervisor.probe_once",
-                    return_value=ReadinessResult(False, "connection refused"),
+                    return_value=ReadinessResult(False, "readiness probe failed"),
                 ) as probe_once,
             ):
                 status = status_supervisor.status("coder")
 
             self.assertEqual(BotStatus.starting, status.status)
-            self.assertEqual("connection refused", status.message)
+            self.assertEqual("readiness probe failed", status.message)
             probe_once.assert_called_once_with(
                 "http://127.0.0.1:4312/health",
                 timeout_seconds=0.5,

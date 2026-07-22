@@ -38,7 +38,7 @@ Known error codes are `invalid_request`, `invalid_bot_id`, `unknown_bot`,
 `idempotency_key_conflict`, `idempotency_in_progress`,
 `idempotency_indeterminate`, `idempotency_response_too_large`,
 `idempotency_store_unavailable`,
-`server_busy`, `server_draining`, and `internal_error`.
+`server_busy`, `server_draining`, `not_ready`, and `internal_error`.
 
 JSON responses include `cache-control: no-store`. Mutating endpoints that accept
 request bodies require an `application/json` content type and reject missing or invalid media
@@ -159,11 +159,36 @@ permission, or serialization failures never change the HTTP response. Setting
 
 ### `GET /health`
 
+Public process-liveness check. It does not access SQLite or authenticate the
+caller, so a successful response does not mean the state store is ready.
+
 Returns:
 
 ```json
 {"status":"ok"}
 ```
+
+### `GET /ready`
+
+Authenticated state-store readiness check, also available as `GET /v1/ready`.
+It opens the existing SQLite database in read-only mode, requires schema version
+6, and executes `SELECT 1`; it does not inspect or start bots. A stopped bot does
+not make Zeus unready.
+
+The route uses the normal read-endpoint authentication policy. It requires
+`x-zeus-api-key` unless loopback-only development explicitly enables
+`ZEUS_ALLOW_UNAUTH_READS=1`. Query parameters are rejected before the database
+probe.
+
+Success returns:
+
+```json
+{"schema_version":6,"status":"ready"}
+```
+
+An unavailable, missing, malformed, older, or newer state database returns
+`503` with `error.code=not_ready`. Failure to initialize the state store before
+the API binds remains a startup failure rather than an HTTP readiness response.
 
 ### `GET /doctor`
 

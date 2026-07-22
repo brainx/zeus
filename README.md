@@ -48,17 +48,58 @@ run summaries at that boundary.
 
 ## Quick Start
 
+### 1. Credential-free offline demo
+
+The fastest first success needs neither Hermes nor provider credentials. From a
+checkout:
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e .
-cp .env.example .env
+python -m pip install -e .
 
+zeus demo up
+zeus demo status
+zeus demo down
+```
+
+The demo uses Zeus' packaged fake-Hermes executable and stores its disposable
+runtime under `ZEUS_STATE_DIR` (the workspace-local `.zeus/` directory by
+default). It exercises real profile rendering and process lifecycle behavior
+without contacting a provider.
+
+### 2. Real Hermes setup
+
+Check the installed Hermes version, then prepare a private workspace secret
+file:
+
+```bash
+hermes version
+cp .env.example .env
+chmod 0600 .env
+```
+
+`.env.example` contains empty placeholders and is not ready to import. Stop here
+until `.env` contains a real, non-empty provider key required by the selected
+template, such as `OPENROUTER_API_KEY` for `coding-bot`. As an alternative,
+provide the same named secret through a secure process-environment mechanism.
+
+Then validate Zeus and render the real Hermes profile:
+
+```bash
 zeus doctor
 zeus template list
-zeus bot create coder --template coding-bot
+zeus bot create coder --template coding-bot --env-from OPENROUTER_API_KEY
 zeus bot doctor coder
 ```
+
+`--env-from NAME` imports a named value from the process environment first and
+then the trusted workspace `./.env`; the value never enters the Zeus argument
+list or command output. A present but empty process value is an error and does
+not fall back to `.env`. Keep the workspace `.env` private with `chmod 0600 .env`.
+The legacy `--env NAME=VALUE` form remains available
+for non-secret compatibility values, but is unsafe for secrets because command
+arguments can be retained in shell history and exposed in process listings.
 
 Safety model: Zeus is a local process orchestrator, not a sandbox. Use Docker or
 another Hermes terminal backend for untrusted tasks. Do not expose the API
@@ -74,8 +115,10 @@ ZEUS_API_KEY=change-me sh scripts/start.sh
 
 ## 60-Second Demo
 
-The asciinema recording in [docs/assets/demo.cast](docs/assets/demo.cast) mirrors the local
-operator flow:
+The pre-recorded asciinema cast in [docs/assets/demo.cast](docs/assets/demo.cast)
+illustrates the local operator flow. It is not evidence that the current Zeus
+checkout is compatible with whichever Hermes version is installed today; use
+the live verification steps below for that evidence.
 
 ```bash
 zeus doctor
@@ -98,6 +141,7 @@ zeus bot stop coder
 - [Operations](docs/OPERATIONS.md)
 - [Reconcile scheduling](docs/RECONCILE.md)
 - [Release process](docs/RELEASE.md)
+- [Compatibility policy](docs/COMPATIBILITY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)
@@ -112,16 +156,10 @@ Zeus is maintained by [BrainX](https://github.com/brainx). See [Credits](CREDITS
 - Hermes Agent installed as `hermes` for real bot startup
 - Optional Docker or another Hermes terminal backend for stronger execution isolation
 
-No Python package dependencies are required for the current MVP.
-
-## Setup
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-cp .env.example .env
-```
+Zeus has no required third-party Python runtime dependencies. Development and
+build tools are available separately through the optional `dev` dependency
+group; see [Contributing](CONTRIBUTING.md). The exact automated platform and
+Python matrix is recorded in the [compatibility policy](docs/COMPATIBILITY.md).
 
 ## Install Modes
 
@@ -197,12 +235,17 @@ ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
 ```
 
 The gateway check enables Hermes' local `api_server` platform on loopback,
-passes a random per-run API key, probes `/health`, and then stops the bot.
+passes an isolated local API key, starts with readiness waiting, verifies process
+ownership, probes `/health`, and then stops the bot. Committed CI runs this flow
+without provider credentials against the fully hash-locked Hermes Agent 0.19.0
+environment documented in the compatibility policy.
 
 For a clean Debian/Ubuntu host, use the fresh VPS harness:
 
 ```bash
-ZEUS_VPS_INSTALL_PACKAGES=1 ZEUS_VPS_INSTALL_HERMES=1 bash scripts/fresh_vps_verify.sh
+ZEUS_VPS_HERMES_INSTALLER_SHA256='<64-hex SHA-256 of the reviewed installer>' \
+ZEUS_VPS_INSTALL_PACKAGES=1 ZEUS_VPS_INSTALL_HERMES=1 \
+bash scripts/fresh_vps_verify.sh
 ```
 
 See [Fresh VPS test](docs/FRESH_VPS_TEST.md) for gateway and async-delegation probes.
@@ -285,6 +328,20 @@ rejected unless the file is an exact mirror copy of a bundled template in the
 source tree.
 Rendered `.env` values are serialized with quoting when needed so whitespace, `#`,
 quotes, and backslashes cannot create extra assignments.
+
+Import template secrets by name instead of placing their values in argv:
+
+```bash
+zeus bot create coder \
+  --template coding-bot \
+  --env-from OPENROUTER_API_KEY
+```
+
+Zeus looks for each imported name in the process environment and then the
+trusted workspace `./.env`. Process values take precedence. Missing and empty
+values fail bot creation without printing the value. Keep `./.env` mode `0600`;
+Zeus also writes the imported values only to the selected profile's mode-`0600`
+`.env` file.
 
 Built-in templates include OpenRouter-backed bots and `deepseek-coding-bot`, which uses Hermes' native DeepSeek provider with `DEEPSEEK_API_KEY`. Example templates also cover gateway operations, log triage, and documentation writing.
 

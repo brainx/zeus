@@ -1,12 +1,141 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
+from zeus.state import SCHEMA_VERSION
+
+
+def _workflow_job_bodies(workflow: str) -> dict[str, str]:
+    jobs_header = re.search(r"(?m)^jobs:\s*$", workflow)
+    if jobs_header is None:
+        raise ValueError("workflow has no jobs mapping")
+
+    jobs_text = workflow[jobs_header.end() :]
+    next_top_level = re.search(r"(?m)^[A-Za-z_][A-Za-z0-9_-]*:\s*", jobs_text)
+    if next_top_level is not None:
+        jobs_text = jobs_text[: next_top_level.start()]
+
+    headers = list(re.finditer(r"(?m)^  (?P<name>[A-Za-z0-9_-]+):\s*$", jobs_text))
+    if not headers:
+        raise ValueError("workflow jobs mapping is empty")
+
+    jobs: dict[str, str] = {}
+    for index, header in enumerate(headers):
+        name = header.group("name")
+        if name in jobs:
+            raise ValueError(f"duplicate workflow job: {name}")
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(jobs_text)
+        jobs[name] = jobs_text[header.end() : end]
+    return jobs
+
+
+def _job_level_scalar(job_body: str, key: str) -> str:
+    values = re.findall(
+        rf"(?m)^    {re.escape(key)}:\s*(?P<value>[^\s#][^\n#]*?)\s*(?:#.*)?$",
+        job_body,
+    )
+    if len(values) != 1:
+        raise ValueError(f"expected one job-level {key}, found {len(values)}")
+    return values[0]
+
+
+def _job_python_versions(job_body: str) -> tuple[str, ...]:
+    matrix = re.search(r"(?m)^        python-version:\s*(?P<versions>\[[^\n]+\])\s*$", job_body)
+    if matrix is not None:
+        versions = json.loads(matrix.group("versions"))
+        if not isinstance(versions, list) or not all(isinstance(item, str) for item in versions):
+            raise ValueError("python-version matrix must be a list of strings")
+        return tuple(versions)
+
+    setup_versions = re.findall(
+        r'(?m)^          python-version:\s*"(?P<version>3\.\d+)"\s*$', job_body
+    )
+    if len(setup_versions) != 1:
+        raise ValueError(f"expected one setup-python version, found {len(setup_versions)}")
+    return tuple(setup_versions)
+
+
+def _job_run_commands(job_body: str) -> tuple[str, ...]:
+    lines = job_body.splitlines()
+    commands: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^        run:\s*(?P<value>.*)$", lines[index])
+        if match is None:
+            index += 1
+            continue
+
+        value = match.group("value").strip()
+        if value not in {"|", "|-"}:
+            commands.append(value)
+            index += 1
+            continue
+
+        index += 1
+        block: list[str] = []
+        while index < len(lines):
+            line = lines[index]
+            if line.strip() and len(line) - len(line.lstrip(" ")) <= 8:
+                break
+            block.append(line)
+            index += 1
+        commands.append(textwrap.dedent("\n".join(block)).strip())
+    return tuple(commands)
+
+
+def _markdown_table_rows(markdown: str) -> dict[str, tuple[str, ...]]:
+    rows: dict[str, tuple[str, ...]] = {}
+    for line in markdown.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+        if not cells or cells[0] == "Gate" or set(cells[0]) <= {"-", ":"}:
+            continue
+        if cells[0] in rows:
+            raise ValueError(f"duplicate Markdown table row: {cells[0]}")
+        rows[cells[0]] = cells[1:]
+    return rows
+
 
 class RepoContractTests(unittest.TestCase):
+    def test_builtin_template_copies_are_identical_and_images_are_digest_pinned(
+        self,
+    ) -> None:
+        source_root = Path("templates")
+        bundled_root = Path("zeus/bundled_templates")
+        expected_image = (
+            "nikolaik/python-nodejs:python3.11-nodejs20@sha256:"
+            "8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
+        )
+        source_names = sorted(path.name for path in source_root.glob("*.toml"))
+        bundled_names = sorted(path.name for path in bundled_root.glob("*.toml"))
+
+        self.assertEqual(source_names, bundled_names)
+        self.assertGreaterEqual(len(source_names), 7)
+        for name in source_names:
+            with self.subTest(template=name):
+                source_text = (source_root / name).read_text(encoding="utf-8")
+                bundled_text = (bundled_root / name).read_text(encoding="utf-8")
+                self.assertEqual(source_text, bundled_text)
+
+                data = tomllib.loads(source_text)
+                docker_image = data["hermes"]["terminal"]["docker_image"]
+                self.assertIsInstance(docker_image, str)
+                self.assertEqual(expected_image, docker_image)
+                self.assertRegex(
+                    docker_image,
+                    r"\A[a-z0-9./_-]+:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}\Z",
+                )
+
     def test_publishable_repository_files_exist(self) -> None:
         required = [
             "README.md",
@@ -25,11 +154,13 @@ class RepoContractTests(unittest.TestCase):
             "docs/OPERATIONS.md",
             "docs/RECONCILE.md",
             "docs/RELEASE.md",
+            "docs/COMPATIBILITY.md",
             "docs/openapi.json",
             "docs/ROADMAP.md",
             "docs/assets/demo.cast",
             "docs/assets/zeus-hero.png",
             ".coveragerc",
+            "requirements-hermes-ci.txt",
             ".github/workflows/release.yml",
             ".github/ISSUE_TEMPLATE/bug_report.yml",
             ".github/ISSUE_TEMPLATE/feature_request.yml",
@@ -39,6 +170,7 @@ class RepoContractTests(unittest.TestCase):
             "systemd/zeus-reconcile.service",
             "systemd/zeus-reconcile.timer",
             "scripts/repo_check.sh",
+            "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
             "zeus/bundled_templates/__init__.py",
@@ -64,41 +196,313 @@ class RepoContractTests(unittest.TestCase):
 
     def test_ci_runs_project_test_script_on_supported_python_versions(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        jobs = _workflow_job_bodies(workflow)
 
+        expected_runners = {
+            "test": "ubuntu-24.04",
+            "python-3-14": "ubuntu-24.04",
+            "lifecycle-subprocess": "ubuntu-24.04",
+            "macos-process-lifecycle": "macos-26",
+            "real-hermes": "ubuntu-24.04",
+            "package": "ubuntu-24.04",
+        }
+        expected_python_versions = {
+            "test": ("3.11", "3.12", "3.13"),
+            "python-3-14": ("3.14",),
+            "lifecycle-subprocess": ("3.11",),
+            "macos-process-lifecycle": ("3.13",),
+            "real-hermes": ("3.11",),
+            "package": ("3.11",),
+        }
+        expected_setup_python = {
+            "test": "${{ matrix.python-version }}",
+            "python-3-14": '"3.14"',
+            "lifecycle-subprocess": '"3.11"',
+            "macos-process-lifecycle": '"3.13"',
+            "real-hermes": '"3.11"',
+            "package": '"3.11"',
+        }
+        expected_commands = {
+            "test": (
+                "sudo apt-get update\nsudo apt-get install -y shellcheck",
+                'python -m pip install -e ".[dev]"',
+                "ruff format --check .",
+                "ruff check .",
+                "mypy zeus",
+                "bandit -r zeus",
+                "shellcheck scripts/*.sh",
+                "sh scripts/test.sh",
+                "sh scripts/repo_check.sh",
+                "coverage erase\ncoverage run -m unittest discover -s tests\ncoverage report",
+            ),
+            "python-3-14": (
+                'python -m pip install -e ".[dev]"',
+                "sh scripts/test.sh",
+            ),
+            "lifecycle-subprocess": (
+                'python -m pip install -e ".[dev]"',
+                "python -m unittest tests.test_subprocess_lifecycle",
+            ),
+            "macos-process-lifecycle": (
+                'python -m pip install -e ".[dev]"',
+                "python -m unittest -v \\\n"
+                "  tests.test_subprocess_lifecycle \\\n"
+                "  tests.test_fake_hermes_integration \\\n"
+                "  tests.test_crash_recovery.GatewayLauncherTests",
+            ),
+            "real-hermes": (
+                "mkdir -p .tmp/real-hermes-evidence\n"
+                "printf '%s\\n' 'result=failed' 'failure_stage=ci_setup' > "
+                ".tmp/real-hermes-evidence/summary.txt",
+                "python -m pip install --require-hashes --only-binary=:all: "
+                "-r requirements-hermes-ci.txt",
+                "python -m pip install -e .",
+                "python -m pip check",
+                "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
+                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \\\n"
+                "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
+                "sh scripts/verify_real_hermes.sh",
+            ),
+            "package": (
+                'python -m pip install -e ".[dev]"',
+                "python -m pip check",
+                "rm -rf dist\npython -m build",
+                "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
+                "twine check dist/*",
+            ),
+        }
+
+        self.assertEqual(set(expected_runners), set(jobs))
         self.assertIn("workflow_dispatch:", workflow)
-        self.assertIn("3.11", workflow)
-        self.assertIn("3.12", workflow)
-        self.assertIn("3.13", workflow)
-        self.assertIn('pip install -e ".[dev]"', workflow)
-        self.assertIn("ruff format --check .", workflow)
-        self.assertIn("ruff check .", workflow)
-        self.assertIn("mypy zeus", workflow)
-        self.assertIn("bandit -r zeus", workflow)
-        self.assertIn("shellcheck scripts/*.sh", workflow)
-        self.assertIn("sh scripts/test.sh", workflow)
-        self.assertIn("coverage erase", workflow)
-        self.assertIn("coverage run -m unittest discover -s tests", workflow)
-        self.assertIn("coverage report", workflow)
-        self.assertNotIn("coverage report --fail-under", workflow)
-        self.assertIn("python -m build", workflow)
-        self.assertIn("twine check dist/*", workflow)
-        self.assertIn("sh scripts/wheel_smoke.sh", workflow)
+        for job_name, job_body in jobs.items():
+            with self.subTest(job=job_name):
+                self.assertEqual(expected_runners[job_name], _job_level_scalar(job_body, "runs-on"))
+                self.assertEqual(expected_python_versions[job_name], _job_python_versions(job_body))
+                self.assertEqual(
+                    [expected_setup_python[job_name]],
+                    re.findall(r"(?m)^          python-version:\s*(.+?)\s*$", job_body),
+                )
+                self.assertEqual(expected_commands[job_name], _job_run_commands(job_body))
 
-    def test_test_script_runs_compile_unittest_and_doctor(self) -> None:
-        script = Path("scripts/test.sh").read_text(encoding="utf-8")
+        job_level_continue_on_error: dict[str, str] = {}
+        for job_name, job_body in jobs.items():
+            values = re.findall(r"(?m)^    continue-on-error:\s*([^\s#]+)\s*$", job_body)
+            self.assertLessEqual(len(values), 1, msg=f"duplicate setting in {job_name}")
+            if values:
+                job_level_continue_on_error[job_name] = values[0]
+        self.assertEqual({"python-3-14": "true"}, job_level_continue_on_error)
 
-        self.assertIn("compileall zeus tests", script)
-        self.assertIn("unittest discover -s tests -v", script)
-        self.assertIn("trap cleanup EXIT INT TERM", script)
-        self.assertIn('mkdir -p "$tmp_dir"', script)
-        self.assertIn("zeus.cli doctor --json", script)
+        real_hermes = jobs["real-hermes"]
+        self.assertEqual("15", _job_level_scalar(real_hermes, "timeout-minutes"))
+        self.assertNotIn("secrets.", real_hermes)
+        self.assertNotRegex(real_hermes, r"(?i)(openai|anthropic|openrouter).*api[_-]?key")
+        self.assertRegex(real_hermes, r"(?m)^        if: failure\(\)\s*$")
+        self.assertIn(".tmp/real-hermes-evidence/summary.txt", real_hermes)
+        self.assertIn("if-no-files-found: error", real_hermes)
+
+        python_314 = jobs["python-3-14"].lower()
+        self.assertNotIn("hermes", python_314)
+        self.assertNotIn("verify_real_hermes", python_314)
+
+        macos_selectors = re.findall(
+            r"(?<![\w.])(tests(?:\.[A-Za-z_][A-Za-z0-9_]*)+)",
+            jobs["macos-process-lifecycle"],
+        )
+        self.assertEqual(
+            [
+                "tests.test_subprocess_lifecycle",
+                "tests.test_fake_hermes_integration",
+                "tests.test_crash_recovery.GatewayLauncherTests",
+            ],
+            macos_selectors,
+        )
+
+        package_commands = _job_run_commands(jobs["package"])
+        pip_check_index = package_commands.index("python -m pip check")
+        for later_command in (
+            "rm -rf dist\npython -m build",
+            "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
+            "twine check dist/*",
+        ):
+            self.assertLess(pip_check_index, package_commands.index(later_command))
+
+    def test_test_script_preserves_failures_and_gates_resource_warnings(self) -> None:
+        script_source = Path("scripts/test.sh").read_text(encoding="utf-8")
+        fake_python_source = textwrap.dedent(
+            """\
+            #!/bin/sh
+            set -eu
+            : "${FAKE_PYTHON_LOG:?}"
+            : "${FAKE_UNITTEST_MODE:?}"
+            printf '%s\\n' "$*" >> "$FAKE_PYTHON_LOG"
+            case "$*" in
+              *"-m compileall zeus tests")
+                exit 0
+                ;;
+              *"-m unittest discover -s tests -v")
+                case "$FAKE_UNITTEST_MODE" in
+                  warning)
+                    printf '%s\\n' "Exception ignored in: <_io.FileIO name='fixture'>" >&2
+                    printf '%s\\n' "ResourceWarning: unclosed file <fixture>" >&2
+                    exit 0
+                    ;;
+                  exit7)
+                    printf '%s\\n' "synthetic unittest failure" >&2
+                    exit 7
+                    ;;
+                  clean)
+                    exit 0
+                    ;;
+                  *)
+                    exit 98
+                    ;;
+                esac
+                ;;
+              *"-m zeus.cli doctor --json")
+                printf '%s\\n' '{"ok": true}'
+                ;;
+              *"-m zeus.cli template list")
+                printf '%s\\n' 'coding-bot'
+                ;;
+              *)
+                printf '%s\\n' "unexpected python invocation: $*" >&2
+                exit 97
+                ;;
+            esac
+            """
+        )
+
+        def run_case(
+            root: Path, mode: str
+        ) -> tuple[subprocess.CompletedProcess[str], tuple[str, ...]]:
+            case_root = root / mode
+            scripts_dir = case_root / "scripts"
+            bin_dir = case_root / "bin"
+            scripts_dir.mkdir(parents=True)
+            bin_dir.mkdir()
+            script = scripts_dir / "test.sh"
+            fake_python = bin_dir / "python3"
+            log = case_root / "python-calls.log"
+            script.write_text(script_source, encoding="utf-8")
+            fake_python.write_text(fake_python_source, encoding="utf-8")
+            fake_python.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "FAKE_PYTHON_LOG": str(log),
+                    "FAKE_UNITTEST_MODE": mode,
+                    "PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
+                }
+            )
+            shell = shutil.which("sh", path=environment["PATH"])
+            if shell is None:
+                self.fail("POSIX sh is required for the shell contract")
+            result = subprocess.run(
+                [shell, str(script)],
+                cwd=case_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            calls = tuple(log.read_text(encoding="utf-8").splitlines())
+            return result, calls
+
+        pre_gate_calls = (
+            "-B -m compileall zeus tests",
+            "-B -W error::ResourceWarning -m unittest discover -s tests -v",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            warning_result, warning_calls = run_case(root, "warning")
+            self.assertNotEqual(0, warning_result.returncode)
+            self.assertIn("Exception ignored in:", warning_result.stderr)
+            self.assertIn("ResourceWarning", warning_result.stderr)
+            self.assertEqual(pre_gate_calls, warning_calls)
+
+            failed_result, failed_calls = run_case(root, "exit7")
+            self.assertEqual(7, failed_result.returncode)
+            self.assertNotIn("ResourceWarning", failed_result.stderr)
+            self.assertEqual(pre_gate_calls, failed_calls)
+
+            clean_result, clean_calls = run_case(root, "clean")
+            self.assertEqual(0, clean_result.returncode)
+            self.assertEqual(
+                (
+                    *pre_gate_calls,
+                    "-B -m zeus.cli doctor --json",
+                    "-B -m zeus.cli template list",
+                ),
+                clean_calls,
+            )
 
     def test_wheel_smoke_exercises_installed_demo_entrypoint(self) -> None:
         script = Path("scripts/wheel_smoke.sh").read_text(encoding="utf-8")
 
-        self.assertIn('"$venv_zeus" demo up --json', script)
-        self.assertIn('"$venv_zeus" demo status --json', script)
-        self.assertIn('"$venv_zeus" demo down --json', script)
+        canonical_root = 'repo_root="$(pwd -P)"'
+        tmp_dir = 'tmp_dir="$repo_root/.tmp/wheel-smoke"'
+        self.assertIn(canonical_root, script)
+        self.assertIn(tmp_dir, script)
+        self.assertLess(script.index(canonical_root), script.index(tmp_dir))
+        self.assertNotIn('repo_root="$(pwd)"', script)
+
+        trap_index = script.index("trap cleanup EXIT INT TERM")
+        for initialization in ('venv_zeus=""', 'state_dir="$tmp_dir/state"', "demo_started=0"):
+            self.assertIn(initialization, script)
+            self.assertLess(script.index(initialization), trap_index)
+
+        cleanup = script[script.index("cleanup() {") : trap_index]
+        self.assertIn('[ "$demo_started" = "1" ]', cleanup)
+        self.assertIn('ZEUS_STATE_DIR="$state_dir" "$venv_zeus" demo down --json', cleanup)
+        self.assertLess(cleanup.index("demo down --json"), cleanup.index('rm -rf "$tmp_dir"'))
+
+        help_command = '"$venv_zeus" --help'
+        pip_check_command = '"$venv_python" -m pip check'
+        self.assertIn(help_command, script)
+        self.assertIn(pip_check_command, script)
+        cd_index = script.index('cd "$tmp_dir"')
+        help_index = script.index(help_command)
+        pip_check_index = script.index(pip_check_command)
+        self.assertLess(cd_index, help_index)
+        self.assertLess(cd_index, pip_check_index)
+        self.assertIn("unset PYTHONPATH PYTHONHOME", script)
+        self.assertIn("export PYTHONNOUSERSITE=1", script)
+        self.assertIn('export PATH="$tmp_dir/venv/bin:$PATH"', script)
+        self.assertIn("command -v zeus-fake-hermes", script)
+        self.assertIn('"$venv_zeus" --help >zeus-help.txt', script)
+        self.assertIn('grep -F "usage: zeus" zeus-help.txt', script)
+
+        self.assertIn('version("zeus-hermes-orchestrator")', script)
+        self.assertIn("import zeus; print(zeus.__version__)", script)
+        self.assertIn('cli_version=$("$venv_zeus" --version)', script)
+        self.assertIn('[ "$metadata_version" = "$module_version" ]', script)
+        self.assertIn('[ "$cli_version" = "zeus $metadata_version" ]', script)
+        self.assertIn("zeus.__file__", script)
+        self.assertGreaterEqual(script.count('[ ! -e "$state_dir" ]'), 2)
+
+        for template_id in (
+            "coding-bot",
+            "deepseek-coding-bot",
+            "docs-writer-bot",
+            "gateway-operator",
+            "log-triage-bot",
+            "research-bot",
+            "support-gateway",
+        ):
+            self.assertIn(template_id, script)
+
+        self.assertIn('export ZEUS_STATE_DIR="$state_dir"', script)
+        self.assertIn('"$venv_zeus" doctor --json', script)
+        up_index = script.index('"$venv_zeus" demo up --json')
+        status_index = script.index('"$venv_zeus" demo status --json')
+        down_index = script.index('"$venv_zeus" demo down --json', up_index)
+        self.assertLess(up_index, status_index)
+        self.assertLess(status_index, down_index)
+        self.assertNotEqual(-1, script.rfind("demo_started=1", 0, up_index))
+        self.assertNotEqual(-1, script.find("demo_started=0", down_index))
         self.assertIn('"fake_hermes_bin"', script)
         self.assertIn('"status": "running"', script)
         self.assertIn('"status": "stopped"', script)
@@ -115,7 +519,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("branch = True", config)
         self.assertRegex(config, r"(?m)^source =\s*$")
         self.assertRegex(config, r"(?m)^[ \t]+zeus[ \t]*$")
-        self.assertIn("fail_under = 70", config)
+        self.assertIn("fail_under = 79", config)
+        self.assertNotIn("fail_under = 70", config)
         self.assertIn("precision = 2", config)
 
     def test_workflow_actions_are_pinned_to_immutable_commits(self) -> None:
@@ -186,6 +591,187 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("Do not expose the API", readme)
         self.assertIn("## Known Limitations", readme)
 
+    def test_onboarding_compatibility_and_roadmap_match_current_evidence(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        contributing = Path("CONTRIBUTING.md").read_text(encoding="utf-8")
+        roadmap = Path("docs/ROADMAP.md").read_text(encoding="utf-8")
+        roadmap_text = " ".join(roadmap.split())
+        ci_workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        release_workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+        pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+        compatibility_path = Path("docs/COMPATIBILITY.md")
+
+        self.assertTrue(compatibility_path.is_file())
+        compatibility = compatibility_path.read_text(encoding="utf-8")
+        compatibility_text = " ".join(compatibility.split())
+
+        offline_heading = "### 1. Credential-free offline demo"
+        hermes_heading = "### 2. Real Hermes setup"
+        self.assertLess(readme.index(offline_heading), readme.index(hermes_heading))
+        offline_path = readme.split(offline_heading, 1)[1].split(hermes_heading, 1)[0]
+        hermes_path = readme.split(hermes_heading, 1)[1].split("\n## ", 1)[0]
+        for command in (
+            "python3 -m venv .venv",
+            "python -m pip install -e .",
+            "zeus demo up",
+            "zeus demo status",
+            "zeus demo down",
+        ):
+            self.assertIn(command, offline_path)
+        for command in (
+            "hermes version",
+            "cp .env.example .env",
+            "chmod 0600 .env",
+            "zeus doctor",
+            "--env-from OPENROUTER_API_KEY",
+            "zeus bot doctor coder",
+        ):
+            self.assertIn(command, hermes_path)
+        self.assertIn("real, non-empty provider key", hermes_path)
+        self.assertIn("docs/COMPATIBILITY.md", readme)
+        self.assertIn("no required third-party Python runtime dependencies", readme)
+
+        self.assertIn('python -m pip install -e ".[dev]"', contributing)
+        self.assertIn("make check", contributing)
+        self.assertIn("docs/COMPATIBILITY.md", contributing)
+        self.assertIn("sh scripts/verify_real_hermes.sh", contributing)
+
+        for heading in (
+            "## Current status",
+            "## Shipped",
+            "## Near term",
+            "## Under evaluation",
+            "## Out of scope",
+        ):
+            self.assertIn(heading, roadmap)
+        for statement in (
+            "v0.3.0",
+            "alpha",
+            "host-local",
+            "cross-host placement",
+            "distributed approvals",
+            "fleet rollout policy",
+            "control-plane ownership",
+            "Olymp",
+        ):
+            self.assertIn(statement, roadmap_text)
+
+        ci_jobs = _workflow_job_bodies(ci_workflow)
+        release_jobs = _workflow_job_bodies(release_workflow)
+        automated_matrix = compatibility.split("## Automated matrix", 1)[1].split("\n## ", 1)[0]
+        compatibility_rows = _markdown_table_rows(automated_matrix)
+        compatibility_contracts = {
+            "test": (
+                ci_jobs["test"],
+                "Main CI matrix",
+                "ubuntu-24.04",
+                ("3.11", "3.12", "3.13"),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11, 3.12, and 3.13",
+                    "Unit and integration tests, repository contracts, source-and-branch "
+                    "coverage, formatting, lint, typing, Bandit, and ShellCheck",
+                ),
+            ),
+            "python-3-14": (
+                ci_jobs["python-3-14"],
+                "Provisional Python compatibility",
+                "ubuntu-24.04",
+                ("3.14",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.14",
+                    "Full Zeus test suite; non-required and Zeus-only because the pinned "
+                    "Hermes baseline requires Python below 3.14",
+                ),
+            ),
+            "lifecycle-subprocess": (
+                ci_jobs["lifecycle-subprocess"],
+                "Subprocess lifecycle",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Focused multi-process lifecycle and locking behavior",
+                ),
+            ),
+            "macos-process-lifecycle": (
+                ci_jobs["macos-process-lifecycle"],
+                "macOS process lifecycle",
+                "macos-26",
+                ("3.13",),
+                (
+                    "macOS `macos-26`",
+                    "Python 3.13",
+                    "Focused process, fake-Hermes integration, and gateway-launcher recovery tests",
+                ),
+            ),
+            "real-hermes": (
+                ci_jobs["real-hermes"],
+                "Real Hermes compatibility",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Hash-locked Hermes Agent 0.19.0 profile rendering, strict diagnostics, "
+                    "loopback gateway readiness, process ownership, and clean shutdown "
+                    "without a model-provider credential",
+                ),
+            ),
+            "package": (
+                ci_jobs["package"],
+                "Package build",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Wheel and source build, installed-wheel smoke test, dependency "
+                    "consistency, and metadata checks",
+                ),
+            ),
+            "release:build": (
+                release_jobs["build"],
+                "Tagged release build",
+                "ubuntu-latest",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-latest`",
+                    "Python 3.11",
+                    "Full release gate, artifact checksums, and GitHub release artifacts",
+                ),
+            ),
+        }
+        requires_python = re.search(r'(?m)^requires-python = "([^"]+)"$', pyproject)
+
+        self.assertIsNotNone(requires_python)
+        self.assertEqual(
+            {contract[1] for contract in compatibility_contracts.values()},
+            set(compatibility_rows),
+        )
+        for job_name, contract in compatibility_contracts.items():
+            job_body, row_name, runner, python_versions, expected_row = contract
+            with self.subTest(compatibility_job=job_name):
+                self.assertEqual(runner, _job_level_scalar(job_body, "runs-on"))
+                self.assertEqual(python_versions, _job_python_versions(job_body))
+                self.assertEqual(expected_row, compatibility_rows[row_name])
+        self.assertIn(
+            f'`requires-python = "{requires_python.group(1)}"`',
+            compatibility_text,
+        )
+        self.assertIn("lifecycle and package jobs use Python 3.11", compatibility_text)
+        self.assertIn("Debian and Ubuntu", compatibility_text)
+        self.assertIn("Hermes Agent 0.19.0", compatibility_text)
+        self.assertIn("complete 60-package wheel closure", compatibility_text)
+        self.assertIn("no model-provider credential", compatibility_text)
+        self.assertIn("whichever `hermes` executable is installed", compatibility_text)
+        self.assertIn("Python 3.14", compatibility_text)
+        self.assertIn("provisional Zeus-only", compatibility_text)
+        self.assertIn("focused process", compatibility_text.lower())
+        self.assertIn("Windows is not currently automated", compatibility_text)
+
     def test_env_example_lists_deepseek_and_api_auth(self) -> None:
         env = Path(".env.example").read_text(encoding="utf-8")
         api_docs = Path("docs/API.md").read_text(encoding="utf-8")
@@ -238,6 +824,17 @@ class RepoContractTests(unittest.TestCase):
         for field in access_fields:
             self.assertIn(f"`{field}`", api_docs)
 
+    def test_architecture_terminal_schema_compatibility_matches_runtime(self) -> None:
+        architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+        compatibility_statements = re.findall(
+            r"Databases newer than\s+schema v(?P<version>\d+) "
+            r"are rejected rather than downgraded\.",
+            architecture,
+        )
+
+        self.assertEqual(1, len(compatibility_statements))
+        self.assertEqual(str(SCHEMA_VERSION), compatibility_statements[0])
+
     def test_every_openapi_response_documents_request_id_header(self) -> None:
         document = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
         request_id_header = document["components"]["headers"]["XRequestID"]
@@ -282,6 +879,30 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("/health", script)
         self.assertIn("time.monotonic", script)
         self.assertIn("Hermes /health did not become ready", script)
+        self.assertIn("ZEUS_VERIFY_EXPECTED_HERMES_VERSION", script)
+        self.assertIn('bot start "$bot_id" --wait', script)
+        self.assertIn("ZEUS_VERIFY_EVIDENCE_DIR", script)
+        self.assertIn("failure_stage=%s", script)
+        self.assertIn('rm -rf -- "$state_dir"', script)
+
+    def test_real_hermes_ci_lock_is_complete_and_hash_pinned(self) -> None:
+        requirements = Path("requirements-hermes-ci.txt").read_text(encoding="utf-8")
+        entries = re.findall(
+            r"(?m)^([a-z0-9][a-z0-9._-]*)==([^\\\s]+) \\$",
+            requirements,
+        )
+        hashes = re.findall(r"(?m)^    --hash=sha256:([0-9a-f]{64})(?: \\)?$", requirements)
+
+        self.assertEqual(60, len(entries))
+        self.assertEqual(60, len({name for name, _version in entries}))
+        self.assertEqual(74, len(hashes))
+        self.assertIn(("hermes-agent", "0.19.0"), entries)
+        self.assertIn(
+            "bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f",
+            hashes,
+        )
+        self.assertNotIn("--index-url", requirements)
+        self.assertNotIn("git+", requirements)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")
@@ -308,6 +929,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("mypy>=1.11.0", pyproject)
         self.assertIn("bandit>=1.7.9", pyproject)
         self.assertIn("coverage>=7.0.0", pyproject)
+        self.assertNotIn('"pytest', pyproject)
         self.assertIn('dynamic = ["version"]', pyproject)
         self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
         self.assertIn('Repository = "https://github.com/brainx/zeus"', pyproject)
@@ -446,6 +1068,9 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("attestations: write", workflow)
         self.assertIn("git cat-file -t", workflow)
         self.assertIn("Release tags must be annotated tags.", workflow)
+        self.assertIn("Require GitHub-verified release ref", workflow)
+        self.assertIn("python scripts/check_verified_release_ref.py", workflow)
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", workflow)
         self.assertIn("actions/attest-build-provenance@", workflow)
         self.assertIn("dist/*.tar.gz", workflow)
         self.assertIn("dist/*.whl", workflow)
@@ -454,7 +1079,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("actions/download-artifact@", workflow)
         self.assertIn("cd dist && sha256sum -c SHA256SUMS.txt", workflow)
         self.assertIn("annotated version tags", release_docs)
-        self.assertIn("does not cryptographically verify signer identity", release_docs)
+        self.assertIn("GitHub-verified annotated tag", release_docs)
+        self.assertIn("v0.3.0 release predates", release_docs)
         self.assertIn("gh attestation verify", release_docs)
         self.assertIn('build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"', wheel_smoke)
         self.assertIn('fail "ZEUS_WHEEL_SMOKE_BUILD must be 0 or 1"', wheel_smoke)
@@ -462,6 +1088,9 @@ class RepoContractTests(unittest.TestCase):
 
     def test_makefile_has_release_check_target(self) -> None:
         makefile = Path("Makefile").read_text(encoding="utf-8")
+        check_recipe = re.search(r"(?m)^check:\n(?P<body>(?:\t[^\n]*\n)+)", makefile)
+        build_recipe = re.search(r"(?m)^build:\n(?P<body>(?:\t[^\n]*\n)+)", makefile)
+        release_recipe = re.search(r"(?m)^release-check:\n(?P<body>(?:\t[^\n]*\n)+)", makefile)
 
         self.assertIn("release-check:", makefile)
         self.assertIn("coverage:", makefile)
@@ -471,6 +1100,12 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("coverage report", makefile)
         self.assertNotIn("coverage report --fail-under", makefile)
         self.assertIn("shellcheck scripts/*.sh", makefile)
+        self.assertIsNotNone(check_recipe)
+        self.assertIsNotNone(build_recipe)
+        self.assertIsNotNone(release_recipe)
+        self.assertIn("shellcheck scripts/*.sh", check_recipe.group("body"))
+        self.assertIn("python -m pip check", build_recipe.group("body"))
+        self.assertIn("python -m pip check", release_recipe.group("body"))
         self.assertIn("rm -rf dist", makefile)
         self.assertIn("python -m build", makefile)
         self.assertIn("ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh", makefile)
@@ -521,6 +1156,43 @@ class RepoContractTests(unittest.TestCase):
             "#/components/schemas/LifecycleHistory",
             history["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
         )
+
+    def test_readiness_openapi_and_operator_documentation_contract(self) -> None:
+        spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
+        api_docs = Path("docs/API.md").read_text(encoding="utf-8")
+        operations = Path("docs/OPERATIONS.md").read_text(encoding="utf-8")
+
+        self.assertIn("/ready", spec["paths"])
+        self.assertNotIn("/v1/ready", spec["paths"])
+        self.assertEqual([], spec["paths"]["/health"]["get"]["security"])
+        readiness = spec["paths"]["/ready"]["get"]
+        self.assertEqual([{"ZeusApiKey": []}], readiness["security"])
+        self.assertEqual({"200", "400", "401", "429", "503"}, set(readiness["responses"]))
+        self.assertEqual(
+            "#/components/schemas/ReadinessResponse",
+            readiness["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        )
+        retry_after = readiness["responses"]["429"]["headers"]["Retry-After"]
+        self.assertNotIn("$ref", retry_after)
+        self.assertEqual({"type": "integer", "minimum": 1}, retry_after["schema"])
+        for response in readiness["responses"].values():
+            self.assertEqual(
+                {"$ref": "#/components/headers/XRequestID"},
+                response["headers"]["X-Request-ID"],
+            )
+
+        schema = spec["components"]["schemas"]["ReadinessResponse"]
+        self.assertEqual(["schema_version", "status"], schema["required"])
+        self.assertEqual(SCHEMA_VERSION, schema["properties"]["schema_version"]["const"])
+        self.assertEqual("ready", schema["properties"]["status"]["const"])
+        error_codes = spec["components"]["schemas"]["Error"]["properties"]["error"]["properties"][
+            "code"
+        ]["enum"]
+        self.assertIn("not_ready", error_codes)
+        for text in (api_docs, operations):
+            self.assertIn("/ready", text)
+            self.assertIn("/health", text)
+            self.assertIn("ZEUS_ALLOW_UNAUTH_READS", text)
 
     def test_wave_two_replay_and_recovery_contracts_are_documented(self) -> None:
         spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
@@ -704,6 +1376,40 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("https://github.com/brainx", credits)
         self.assertIn("https://github.com/brainx", architecture)
         self.assertIn('Maintainer = "https://github.com/brainx"', pyproject)
+
+    def test_sqlite_durability_policy_is_consistent_across_runtime_and_docs(self) -> None:
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+        api_service = Path("systemd/zeus-api.service").read_text(encoding="utf-8")
+        reconcile_service = Path("systemd/zeus-reconcile.service").read_text(encoding="utf-8")
+        timer = Path("systemd/zeus-reconcile.timer").read_text(encoding="utf-8")
+        systemd_docs = Path("docs/SYSTEMD.md").read_text(encoding="utf-8")
+        compatibility = Path("docs/COMPATIBILITY.md").read_text(encoding="utf-8").lower()
+        architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8").lower()
+        operations = Path("docs/OPERATIONS.md").read_text(encoding="utf-8").lower()
+
+        self.assertEqual(1, env_example.count("ZEUS_SQLITE_SYNCHRONOUS=NORMAL"))
+        self.assertNotIn("ZEUS_SQLITE_SYNCHRONOUS=FULL", env_example)
+        for service in (api_service, reconcile_service):
+            with self.subTest(service=service[:32]):
+                self.assertEqual(
+                    1,
+                    service.count("Environment=ZEUS_SQLITE_SYNCHRONOUS=FULL"),
+                )
+                self.assertIn("EnvironmentFile=/etc/zeus/zeus.env", service)
+        self.assertNotIn("ZEUS_SQLITE_SYNCHRONOUS", timer)
+        self.assertIn("ZEUS_SQLITE_SYNCHRONOUS=FULL", systemd_docs)
+        self.assertIn("normal", compatibility)
+        self.assertIn("unset", compatibility)
+        self.assertIn("empty", compatibility)
+        self.assertIn("schema v6", compatibility)
+        for text in (architecture, operations):
+            self.assertIn("process crash", text)
+            self.assertIn("power loss", text)
+        self.assertIn("every process that writes the same database", operations)
+        self.assertIn("sqlite only", operations)
+        self.assertIn("rendered profile files", operations)
+        self.assertIn("audit jsonl", operations)
+        self.assertIn("backup", operations)
 
     def test_root_scripts_credit_repo_maintainers(self) -> None:
         script_paths = [Path("Makefile"), *sorted(Path("scripts").glob("*.sh"))]

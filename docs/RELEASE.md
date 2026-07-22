@@ -2,8 +2,9 @@
 
 Zeus releases are built from annotated version tags. Keep releases small, verify
 the repository locally first, and publish GitHub artifacts before considering
-package-index distribution. Maintainers are encouraged to sign tags, but the
-workflow does not cryptographically verify signer identity.
+package-index distribution. Future releases require both the annotated tag and
+its referenced commit to carry signatures that GitHub marks verified. The
+historical v0.3.0 release predates this policy and remains unchanged.
 
 1. Ensure CI is green on the commit to release.
 2. Run the full local release gate:
@@ -45,16 +46,18 @@ workflow does not cryptographically verify signer identity.
    python scripts/check_version_tag.py vX.Y.Z --require-changelog
    ```
 
-6. Create and push an annotated tag:
+6. Confirm the release commit is signed and GitHub-verified, then create and push
+   a signed annotated tag:
 
    ```bash
-   git tag -a vX.Y.Z -m "Zeus vX.Y.Z"
+   git log --show-signature -1
+   git tag -s vX.Y.Z -m "Zeus vX.Y.Z"
    git push origin vX.Y.Z
    ```
 
-   If the maintainer has a configured signing identity, `git tag -s` may be
-   used instead. The release gate enforces an annotated tag but does not verify
-   the signature or signer identity.
+   A merely annotated or locally valid signature is insufficient: GitHub must
+   report both the tag and commit verification objects as `verified` with reason
+   `valid`. Configure the signing identity with GitHub before pushing the tag.
 
 7. Confirm the GitHub release workflow completed and attached the generated
    `dist/*` artifacts plus `dist/SHA256SUMS.txt` to the GitHub Release.
@@ -63,13 +66,17 @@ workflow does not cryptographically verify signer identity.
 
 `.github/workflows/release.yml` builds and checks distribution artifacts for
 `v*.*.*` tags, rejects lightweight tags and tags that do not match
-`zeus.__version__`, and requires a matching changelog section. Its read-only
-build job runs `make release-check`, including tests, source-and-branch coverage,
-repository contracts, formatting, lint, type checks, Bandit, ShellCheck, package
-build, wheel smoke verification, metadata checks, and checksum generation. Only
-after that job succeeds does a separate privileged job download the checked
-artifacts, verify their checksums, create GitHub artifact attestations, and attach
-the assets to the GitHub Release. It intentionally does not publish to PyPI.
+`zeus.__version__`, requires a matching changelog section, and calls GitHub's API
+to require a GitHub-verified annotated tag and referenced commit. The checker
+binds the tag target to the workflow's `GITHUB_SHA`, reads `GITHUB_TOKEN` only
+from the environment, rejects redirects and malformed responses, and never logs
+the token or raw response bodies. Its read-only build job runs
+`make release-check`, including tests, source-and-branch coverage, repository
+contracts, formatting, lint, type checks, Bandit, ShellCheck, package build,
+wheel smoke verification, metadata checks, and checksum generation. Only after
+that job succeeds does a separate privileged job download the checked artifacts,
+verify their checksums, create GitHub artifact attestations, and attach the assets
+to the GitHub Release. It intentionally does not publish to PyPI.
 
 Coverage configuration lives in `.coveragerc`, measures only the `zeus` package,
 and includes branch coverage. The threshold records the honest current baseline;

@@ -83,6 +83,7 @@
                   "idempotency_response_too_large",
                   "server_busy",
                   "server_draining",
+                  "not_ready",
                   "internal_error"
                 ]
               },
@@ -93,6 +94,20 @@
                 "type": "integer"
               }
             }
+          }
+        }
+      },
+      "ReadinessResponse": {
+        "type": "object",
+        "required": ["schema_version", "status"],
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "const": 6
+          },
+          "status": {
+            "type": "string",
+            "const": "ready"
           }
         }
       },
@@ -644,6 +659,83 @@
                     }
                   }
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Check API state-store readiness",
+        "description": "Authenticates the request, then opens the Zeus database read-only, requires the current schema version, and executes SELECT 1. The /v1/ready alias is provided by the versioned server URL.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The state store is readable at the current schema version",
+            "headers": {
+              "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "headers": {
+              "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
+          "401": {
+            "description": "Missing API key, invalid API key, or API key not configured",
+            "headers": {
+              "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded",
+            "headers": {
+              "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
+              "Retry-After": {
+                "description": "Seconds to wait before retrying authentication.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
+          "503": {
+            "description": "The API key is unconfigured or the state store is not ready",
+            "headers": {
+              "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
+            },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
           }

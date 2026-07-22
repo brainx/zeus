@@ -15,6 +15,7 @@ EnvironmentFile=/etc/zeus/zeus.env
 Environment=ZEUS_HOST=127.0.0.1
 Environment=ZEUS_PORT=4311
 Environment=ZEUS_STATE_DIR=/var/lib/zeus
+Environment=ZEUS_SQLITE_SYNCHRONOUS=FULL
 ExecStart=/opt/zeus/.venv/bin/python -m zeus.api
 Restart=on-failure
 RestartSec=5s

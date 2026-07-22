@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 import socket
@@ -12,17 +13,18 @@ import threading
 import time
 import unittest
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, redirect_stderr
 from datetime import UTC, datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from zeus import api as api_module
 from zeus.api import make_handler, serve
-from zeus.config import Settings
-from zeus.models import BotRecord, BotStatus, BotStatusResponse
+from zeus.config import Settings, SQLiteSynchronous
+from zeus.errors import ZeusConflictError
+from zeus.models import BotRecord, BotStatus, BotStatusResponse, TemplateError
 from zeus.process_lock import LockTimeoutError
 from zeus.rate_limit import TokenBucket
 from zeus.reconciliation import (
@@ -31,7 +33,7 @@ from zeus.reconciliation import (
     ReconcileOutcome,
     ReconcileRunSummary,
 )
-from zeus.state import StateStore
+from zeus.state import SCHEMA_VERSION, StateReadinessError, StateStore
 
 JsonPayload = dict[str, Any] | list[Any]
 
@@ -152,6 +154,28 @@ def raw_http_response(
         conn.close()
 
 
+def raw_http_exchange(
+    port: int,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        response = conn.getresponse()
+        response_body = response.read()
+        return (
+            response.status,
+            {name.lower(): value for name, value in response.getheaders()},
+            response_body,
+        )
+    finally:
+        conn.close()
+
+
 def json_request_body(payload: JsonPayload) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
@@ -235,6 +259,287 @@ def raw_post_without_content_length(port: int, body: bytes) -> tuple[int, dict[s
 
 
 class ApiBehaviorTests(unittest.TestCase):
+    def test_health_exact_bytes_are_public_and_never_probe_readiness(self) -> None:
+        with (
+            patch.object(
+                StateStore,
+                "check_readiness",
+                side_effect=AssertionError("health must not probe state"),
+            ) as readiness,
+            api_server_with_state() as (port, state_dir),
+        ):
+            exchanges = [raw_http_exchange(port, "GET", path) for path in ("/health", "/v1/health")]
+            rows = wait_for_access_rows(state_dir, 2)
+
+        for status, headers, body in exchanges:
+            self.assertEqual(200, status)
+            self.assertEqual(b'{"status": "ok"}', body)
+            self.assertEqual("application/json", headers["content-type"])
+            self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+        readiness.assert_not_called()
+        self.assertEqual(["/health", "/health"], [row["route"] for row in rows])
+        self.assertEqual(["not_required", "not_required"], [row["auth_outcome"] for row in rows])
+
+    def test_readiness_auth_query_alias_and_override_contract(self) -> None:
+        with patch.object(StateStore, "check_readiness", return_value=SCHEMA_VERSION) as readiness:
+            with api_server() as port:
+                missing_config_status, _ = request_json(port, "GET", "/ready")
+            self.assertEqual(503, missing_config_status)
+            readiness.assert_not_called()
+
+            configured = {
+                "ZEUS_API_KEY": "secret",
+                "ZEUS_API_AUTH_FAILURE_RATE_PER_MINUTE": "1",
+                "ZEUS_API_AUTH_FAILURE_BURST": "2",
+            }
+            with api_server(configured) as port:
+                missing_status, _ = request_json(port, "GET", "/ready")
+                wrong_status, _ = request_json(
+                    port,
+                    "GET",
+                    "/ready",
+                    headers={"x-zeus-api-key": "wrong"},
+                )
+                limited_status, limited_headers, limited_body = request_json_with_headers(
+                    port,
+                    "GET",
+                    "/ready",
+                    headers={"x-zeus-api-key": "wrong"},
+                )
+                query_status, query_body = request_json(
+                    port,
+                    "GET",
+                    "/ready?debug=1",
+                    headers={"x-zeus-api-key": "secret"},
+                )
+                ready_status, ready_headers, ready_body = raw_http_exchange(
+                    port,
+                    "GET",
+                    "/ready",
+                    headers={"x-zeus-api-key": "secret"},
+                )
+                alias_status, _alias_headers, alias_body = raw_http_exchange(
+                    port,
+                    "GET",
+                    "/v1/ready",
+                    headers={"x-zeus-api-key": "secret"},
+                )
+
+            self.assertEqual((401, 401, 429), (missing_status, wrong_status, limited_status))
+            self.assertEqual("auth_rate_limited", limited_body["error"]["code"])
+            self.assertGreaterEqual(int(limited_headers["retry-after"]), 1)
+            self.assertEqual(400, query_status)
+            self.assertEqual("invalid_request", query_body["error"]["code"])
+            expected = b'{"schema_version": 6, "status": "ready"}'
+            self.assertEqual((200, expected), (ready_status, ready_body))
+            self.assertEqual((200, expected), (alias_status, alias_body))
+            self.assertRegex(ready_headers["x-request-id"], r"^[0-9a-f]{32}$")
+            self.assertEqual(2, readiness.call_count)
+
+            with api_server({"ZEUS_ALLOW_UNAUTH_READS": "1"}) as port:
+                override_status, override_body = request_json(port, "GET", "/ready")
+            self.assertEqual(200, override_status)
+            self.assertEqual({"schema_version": SCHEMA_VERSION, "status": "ready"}, override_body)
+            self.assertEqual(3, readiness.call_count)
+
+    def test_readiness_expected_failure_is_sanitized_and_not_logged_as_exception(self) -> None:
+        with (
+            patch.object(
+                StateStore,
+                "check_readiness",
+                side_effect=StateReadinessError("private sqlite detail"),
+            ),
+            api_server_with_state({"ZEUS_API_KEY": "secret"}) as (port, state_dir),
+        ):
+            status, headers, body = raw_http_exchange(
+                port,
+                "GET",
+                "/ready",
+                headers={"x-zeus-api-key": "secret"},
+            )
+            rows = wait_for_access_rows(state_dir, 1)
+
+        self.assertEqual(503, status)
+        self.assertEqual(
+            b'{"error": {"code": "not_ready", '
+            b'"message": "state store is not ready", "status": 503}}',
+            body,
+        )
+        self.assertNotIn("retry-after", headers)
+        self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(["api.access"], [row["event"] for row in rows])
+        self.assertEqual("/ready", rows[0]["route"])
+        self.assertEqual("not_ready", rows[0]["error_code"])
+        self.assertNotIn("private sqlite detail", json.dumps(rows))
+
+    def test_readiness_aliases_probe_the_real_current_store(self) -> None:
+        with api_server({"ZEUS_API_KEY": "secret"}) as port:
+            responses = [
+                raw_http_exchange(
+                    port,
+                    "GET",
+                    path,
+                    headers={"x-zeus-api-key": "secret"},
+                )
+                for path in ("/ready", "/v1/ready")
+            ]
+
+        for status, headers, body in responses:
+            self.assertEqual(200, status)
+            self.assertEqual(b'{"schema_version": 6, "status": "ready"}', body)
+            self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+
+    def test_exception_status_payload_and_header_contracts(self) -> None:
+        cases = (
+            (
+                "unknown_bot",
+                lambda: KeyError("unknown bot: coder"),
+                404,
+                "unknown_bot",
+                "unknown bot: coder",
+            ),
+            (
+                "unknown_template",
+                lambda: KeyError("unknown template: missing"),
+                400,
+                "unknown_template",
+                "unknown template: missing",
+            ),
+            (
+                "missing_field",
+                lambda: KeyError("bot_id"),
+                400,
+                "invalid_request",
+                "missing required field: bot_id",
+            ),
+            (
+                "invalid_bot_id",
+                lambda: TemplateError("bot_id must match ^[a-z][a-z0-9-]{1,62}$"),
+                400,
+                "invalid_bot_id",
+                "bot_id must match ^[a-z][a-z0-9-]{1,62}$",
+            ),
+            (
+                "template_error",
+                lambda: TemplateError("template contract failed"),
+                400,
+                "invalid_request",
+                "template contract failed",
+            ),
+            (
+                "reconcile_lock",
+                lambda: ReconcileLockTimeoutError(Path("/tmp/reconcile.lock"), 0.1),
+                409,
+                "reconcile_locked",
+                "reconciliation is already in progress",
+            ),
+            (
+                "bot_lock",
+                lambda: LockTimeoutError(Path("/tmp/coder.lock"), 0.1),
+                409,
+                "bot_locked",
+                "bot lifecycle operation is already in progress",
+            ),
+            (
+                "conflict",
+                lambda: ZeusConflictError("conflicting lifecycle state"),
+                409,
+                "conflict",
+                "conflicting lifecycle state",
+            ),
+            (
+                "value_error",
+                lambda: ValueError("invalid lifecycle request"),
+                400,
+                "invalid_request",
+                "invalid lifecycle request",
+            ),
+            (
+                "internal_error",
+                lambda: RuntimeError("private failure detail"),
+                500,
+                "internal_error",
+                "internal server error",
+            ),
+        )
+
+        class RaisingSupervisor:
+            failure: Exception
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return
+
+            def status(self, *args: object, **kwargs: object) -> BotStatusResponse:
+                raise self.failure
+
+            def start(self, *args: object, **kwargs: object) -> BotStatusResponse:
+                raise self.failure
+
+        with (
+            patch("zeus.api.Supervisor", RaisingSupervisor),
+            api_server({"ZEUS_API_KEY": "secret"}) as port,
+        ):
+            for name, make_error, expected_status, code, message in cases:
+                expected = {
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "status": expected_status,
+                    }
+                }
+                expected_body = json.dumps(expected, sort_keys=True).encode("utf-8")
+                requests = (
+                    ("GET", "/bots/coder/status", {}),
+                    (
+                        "POST",
+                        "/bots/coder/start",
+                        {"idempotency-key": f"characterization-{name}"},
+                    ),
+                )
+                for method, path, extra_headers in requests:
+                    with self.subTest(name=name, method=method):
+                        RaisingSupervisor.failure = make_error()
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                        try:
+                            conn.request(
+                                method,
+                                path,
+                                headers={
+                                    "x-zeus-api-key": "secret",
+                                    **extra_headers,
+                                },
+                            )
+                            response = conn.getresponse()
+                            body = response.read()
+                            headers = {key.lower(): value for key, value in response.getheaders()}
+                        finally:
+                            conn.close()
+
+                        self.assertEqual(expected_status, response.status)
+                        self.assertEqual(expected_body, body)
+                        self.assertEqual(
+                            {
+                                "cache-control": "no-store",
+                                "content-length": str(len(expected_body)),
+                                "content-type": "application/json",
+                                "cross-origin-resource-policy": "same-origin",
+                                "referrer-policy": "no-referrer",
+                                "x-content-type-options": "nosniff",
+                            },
+                            {
+                                key: headers[key]
+                                for key in (
+                                    "cache-control",
+                                    "content-length",
+                                    "content-type",
+                                    "cross-origin-resource-policy",
+                                    "referrer-policy",
+                                    "x-content-type-options",
+                                )
+                            },
+                        )
+                        self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
+
     def test_all_json_responses_include_generated_request_id(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
             for method, path in (("GET", "/health"), ("GET", "/bots"), ("PUT", "/bots")):
@@ -286,190 +591,6 @@ class ApiBehaviorTests(unittest.TestCase):
         for env, message in invalid_values:
             with self.subTest(env=env), self.assertRaisesRegex(ValueError, message):
                 Settings.from_env(env)
-
-    def test_http_server_rejects_requests_above_concurrency_limit(self) -> None:
-        first_entered = threading.Event()
-        release_first = threading.Event()
-        call_lock = threading.Lock()
-        call_count = 0
-
-        class LimitedHandler(BaseHTTPRequestHandler):
-            api_max_concurrent_requests = 1
-            api_request_timeout_seconds = 2.0
-
-            def do_GET(self) -> None:
-                nonlocal call_count
-                with call_lock:
-                    call_count += 1
-                    current_call = call_count
-                if current_call == 1:
-                    first_entered.set()
-                    release_first.wait(timeout=3)
-                data = b'{"status":"ok"}'
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def log_message(self, format: str, *args: Any) -> None:
-                return
-
-        server = api_module.ThreadingHTTPServer(("127.0.0.1", 0), LimitedHandler)
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        first_result: list[tuple[int, dict[str, Any]]] = []
-        first_thread = threading.Thread(
-            target=lambda: first_result.append(request_json(server.server_port, "GET", "/health"))
-        )
-        server_thread.start()
-        first_thread.start()
-        try:
-            self.assertTrue(first_entered.wait(timeout=2))
-            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-            try:
-                conn.request("GET", "/health")
-                response = conn.getresponse()
-                raw_body = response.read()
-            finally:
-                conn.close()
-
-            self.assertEqual(503, response.status)
-            self.assertEqual("1", response.getheader("retry-after"))
-            self.assertRegex(
-                response.getheader("x-request-id") or "",
-                r"^[0-9a-f]{32}$",
-            )
-            body = json.loads(raw_body.decode("utf-8"))
-            self.assertEqual("server_busy", body["error"]["code"])
-        finally:
-            release_first.set()
-            first_thread.join(timeout=3)
-            server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=3)
-
-        self.assertFalse(first_thread.is_alive())
-        self.assertEqual(200, first_result[0][0])
-
-    def test_http_server_drains_active_requests_and_rejects_new_work(self) -> None:
-        first_entered = threading.Event()
-        release_first = threading.Event()
-
-        class DrainHandler(BaseHTTPRequestHandler):
-            api_max_concurrent_requests = 2
-            api_request_timeout_seconds = 2.0
-
-            def do_GET(self) -> None:
-                first_entered.set()
-                release_first.wait(timeout=3)
-                data = b'{"status":"ok"}'
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def log_message(self, format: str, *args: Any) -> None:
-                return
-
-        server = api_module.ThreadingHTTPServer(("127.0.0.1", 0), DrainHandler)
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        first_result: list[tuple[int, dict[str, Any]]] = []
-        first_thread = threading.Thread(
-            target=lambda: first_result.append(request_json(server.server_port, "GET", "/health"))
-        )
-        server_thread.start()
-        first_thread.start()
-        try:
-            self.assertTrue(first_entered.wait(timeout=2))
-            request_graceful_shutdown = getattr(server, "request_graceful_shutdown", None)
-            wait_until_draining = getattr(server, "wait_until_draining", None)
-            wait_for_drain = getattr(server, "wait_for_drain", None)
-            self.assertTrue(callable(request_graceful_shutdown))
-            self.assertTrue(callable(wait_until_draining))
-            self.assertTrue(callable(wait_for_drain))
-            request_graceful_shutdown(1.0)
-            self.assertTrue(wait_until_draining(1.0))
-
-            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-            try:
-                conn.request("GET", "/health")
-                response = conn.getresponse()
-                raw_body = response.read()
-            finally:
-                conn.close()
-
-            self.assertEqual(503, response.status)
-            self.assertEqual("1", response.getheader("retry-after"))
-            self.assertRegex(
-                response.getheader("x-request-id") or "",
-                r"^[0-9a-f]{32}$",
-            )
-            body = json.loads(raw_body.decode("utf-8"))
-            self.assertEqual("server_draining", body["error"]["code"])
-            self.assertFalse(wait_for_drain(0.05))
-
-            release_first.set()
-            first_thread.join(timeout=3)
-            self.assertTrue(wait_for_drain(1.0))
-            server_thread.join(timeout=3)
-        finally:
-            release_first.set()
-            first_thread.join(timeout=3)
-            if server_thread.is_alive():
-                server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=3)
-
-        self.assertFalse(first_thread.is_alive())
-        self.assertFalse(server_thread.is_alive())
-        self.assertEqual(200, first_result[0][0])
-
-    def test_http_server_times_out_incomplete_requests_and_releases_capacity(self) -> None:
-        accepted = threading.Event()
-
-        class TimeoutHandler(BaseHTTPRequestHandler):
-            api_max_concurrent_requests = 1
-            api_request_timeout_seconds = 0.1
-
-            def do_GET(self) -> None:
-                data = b'{"status":"ok"}'
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def log_message(self, format: str, *args: Any) -> None:
-                return
-
-        class TrackingServer(api_module.ThreadingHTTPServer):
-            def process_request(self, request: Any, client_address: Any) -> None:
-                accepted.set()
-                super().process_request(request, client_address)
-
-        server = TrackingServer(("127.0.0.1", 0), TimeoutHandler)
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        server_thread.start()
-        slow_client = socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
-        try:
-            slow_client.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n")
-            self.assertTrue(accepted.wait(timeout=2))
-            slow_client.settimeout(1)
-            try:
-                closed_data = slow_client.recv(1)
-            except TimeoutError:
-                self.fail("incomplete API request was not closed after the configured timeout")
-            self.assertEqual(b"", closed_data)
-
-            status, body = request_json(server.server_port, "GET", "/health")
-            self.assertEqual(200, status)
-            self.assertEqual({"status": "ok"}, body)
-        finally:
-            slow_client.close()
-            server.shutdown()
-            server.server_close()
-            server_thread.join(timeout=3)
 
     def test_health_is_public_but_missing_api_key_rejects_bots_list(self) -> None:
         with api_server() as port:
@@ -614,6 +735,135 @@ class ApiBehaviorTests(unittest.TestCase):
             status, body = request_json(port, "GET", "/v1/bots")
             self.assertEqual(200, status)
             self.assertEqual("coder", body[0]["bot_id"])
+
+    def test_v1_alias_normalizes_roots_and_forwards_lifecycle_queries(self) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        class CapturingSupervisor:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                return
+
+            def start(
+                self,
+                bot_id: str,
+                *,
+                wait: bool = False,
+                timeout_seconds: float | None = None,
+                source: str = "cli",
+                request_id: str | None = None,
+            ) -> BotStatusResponse:
+                calls.append(("start", bot_id, wait, timeout_seconds, source, request_id))
+                return BotStatusResponse(bot_id, BotStatus.starting, 123, "/profiles/coder")
+
+            def stop(
+                self,
+                bot_id: str,
+                *,
+                kill_after_timeout: bool | None = None,
+                source: str = "cli",
+                request_id: str | None = None,
+            ) -> BotStatusResponse:
+                calls.append(("stop", bot_id, kill_after_timeout, source, request_id))
+                return BotStatusResponse(bot_id, BotStatus.stopped, None, "/profiles/coder")
+
+            def restart(
+                self,
+                bot_id: str,
+                *,
+                wait: bool = False,
+                timeout_seconds: float | None = None,
+                source: str = "cli",
+                request_id: str | None = None,
+            ) -> BotStatusResponse:
+                calls.append(("restart", bot_id, wait, timeout_seconds, source, request_id))
+                return BotStatusResponse(bot_id, BotStatus.running, 456, "/profiles/coder")
+
+            def reconcile_summary(
+                self,
+                bot_id: str | None = None,
+                *,
+                source: str = "cli",
+                request_id: str | None = None,
+                **kwargs: object,
+            ) -> object:
+                calls.append(("reconcile_summary", bot_id, source, request_id))
+
+                class Summary:
+                    def to_dict(self) -> dict[str, object]:
+                        return {"ok": True, "scope": "bot"}
+
+                return Summary()
+
+        headers = {"x-zeus-api-key": "secret"}
+        with (
+            patch("zeus.api.Supervisor", CapturingSupervisor),
+            api_server({"ZEUS_API_KEY": "secret"}) as port,
+        ):
+            for root in ("/v1", "/v1/"):
+                with self.subTest(root=root):
+                    status, body = request_json(port, "GET", root, headers=headers)
+                    self.assertEqual(404, status)
+                    self.assertEqual(
+                        {
+                            "error": {
+                                "code": "invalid_request",
+                                "message": "not found",
+                                "status": 404,
+                            }
+                        },
+                        body,
+                    )
+
+            requests = (
+                (
+                    "/v1/bots/coder/start?wait=1&timeout=2.5",
+                    {
+                        "bot_id": "coder",
+                        "message": "",
+                        "pid": 123,
+                        "profile_path": "/profiles/coder",
+                        "status": "starting",
+                    },
+                    ("start", "coder", True, 2.5, "api"),
+                ),
+                (
+                    "/v1/bots/coder/stop?kill_after_timeout=1",
+                    {
+                        "bot_id": "coder",
+                        "message": "",
+                        "pid": None,
+                        "profile_path": "/profiles/coder",
+                        "status": "stopped",
+                    },
+                    ("stop", "coder", True, "api"),
+                ),
+                (
+                    "/v1/bots/coder/restart?wait=0&timeout=3.5",
+                    {
+                        "bot_id": "coder",
+                        "message": "",
+                        "pid": 456,
+                        "profile_path": "/profiles/coder",
+                        "status": "running",
+                    },
+                    ("restart", "coder", False, 3.5, "api"),
+                ),
+                (
+                    "/v1/bots/coder/reconcile?summary=1",
+                    {"ok": True, "scope": "bot"},
+                    ("reconcile_summary", "coder", "api"),
+                ),
+            )
+            for path, expected_body, expected_call in requests:
+                with self.subTest(path=path):
+                    status, body = request_json(port, "POST", path, headers=headers)
+                    self.assertEqual(200, status)
+                    self.assertEqual(expected_body, body)
+                    call = calls.pop(0)
+                    self.assertEqual(expected_call, call[:-1])
+                    self.assertRegex(str(call[-1]), r"^[0-9a-f]{32}$")
+
+        self.assertEqual([], calls)
 
     def test_bot_create_and_list_expose_desired_state_and_convergence(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
@@ -771,7 +1021,7 @@ class ApiBehaviorTests(unittest.TestCase):
                     },
                     set(payload["results"][0]),
                 )
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     2,
                     conn.execute("SELECT COUNT(*) FROM reconcile_runs").fetchone()[0],
@@ -833,7 +1083,7 @@ class ApiBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(404, status)
             self.assertEqual("unknown_bot", body["error"]["code"])
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     0,
                     conn.execute("SELECT COUNT(*) FROM reconcile_runs").fetchone()[0],
@@ -1010,7 +1260,7 @@ class ApiBehaviorTests(unittest.TestCase):
             self.assertEqual(["coder"], [item["bot_id"] for item in first["results"]])
             self.assertNotIn("idempotency-replayed", first_headers)
             self.assertEqual("true", replay_headers["idempotency-replayed"])
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     1,
                     conn.execute("SELECT COUNT(*) FROM reconcile_runs").fetchone()[0],
@@ -1136,7 +1386,7 @@ class ApiBehaviorTests(unittest.TestCase):
                     )
 
             self.assertEqual(1, effects)
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     (0, 1),
                     (
@@ -1168,7 +1418,7 @@ class ApiBehaviorTests(unittest.TestCase):
 
             self.assertEqual(422, status)
             self.assertEqual("idempotency_response_too_large", body["error"]["code"])
-            with sqlite3.connect(state_dir / "zeus.db") as conn:
+            with closing(sqlite3.connect(state_dir / "zeus.db")) as conn:
                 self.assertEqual(
                     (0, 0),
                     (
@@ -1485,6 +1735,44 @@ class ApiBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(404, status)
             self.assertEqual("unknown_bot", body["error"]["code"])
+
+    def test_bot_logs_and_inspect_hide_unsafe_gateway_log_path(self) -> None:
+        with api_server({"ZEUS_API_KEY": "secret"}) as port:
+            status, created = request_json(
+                port,
+                "POST",
+                "/bots",
+                body=json_request_body({"bot_id": "coder", "template_id": "coding-bot"}),
+                headers=auth_json_headers(),
+            )
+            self.assertEqual(200, status)
+            profile_path = Path(created["profile_path"])
+            logs_path = profile_path / "logs"
+            logs_path.rmdir()
+            external_logs = profile_path.parent / "external-api-logs"
+            external_logs.mkdir(mode=0o755)
+            target_log = external_logs / "zeus-gateway.log"
+            target_log.write_text("API-TARGET-SENTINEL\n", encoding="utf-8")
+            target_mode = target_log.stat().st_mode & 0o777
+            logs_path.symlink_to(external_logs, target_is_directory=True)
+
+            for endpoint in ("logs", "inspect"):
+                with self.subTest(endpoint=endpoint):
+                    status, body = request_json(
+                        port,
+                        "GET",
+                        f"/bots/coder/{endpoint}",
+                        headers={"x-zeus-api-key": "secret"},
+                    )
+                    self.assertEqual(500, status)
+                    self.assertEqual("internal_error", body["error"]["code"])
+                    self.assertEqual("internal server error", body["error"]["message"])
+                    serialized = json.dumps(body)
+                    self.assertNotIn("API-TARGET-SENTINEL", serialized)
+                    self.assertNotIn(str(external_logs), serialized)
+
+            self.assertEqual("API-TARGET-SENTINEL\n", target_log.read_text(encoding="utf-8"))
+            self.assertEqual(target_mode, target_log.stat().st_mode & 0o777)
 
     def test_rejects_malformed_json(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
@@ -2063,6 +2351,7 @@ class ApiBehaviorTests(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         first.kill()
                         first.wait(timeout=5)
+                first.communicate()
 
 
 class ApiRateLimitTests(unittest.TestCase):
@@ -2384,6 +2673,63 @@ class ApiRateLimitTests(unittest.TestCase):
         self.assertEqual(404, first_status)
         self.assertEqual(429, limited_status)
         self.assertEqual(404, refilled_status)
+
+
+class ApiSQLiteDurabilityTests(unittest.TestCase):
+    def test_make_handler_forwards_full_to_state_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings.from_env(
+                {
+                    "ZEUS_STATE_DIR": str(Path(tmp) / "state"),
+                    "ZEUS_SQLITE_SYNCHRONOUS": "FULL",
+                }
+            )
+            with (
+                patch.object(Settings, "ensure_dirs"),
+                patch("zeus.api.StateStore") as store_type,
+                patch("zeus.api.ApiLogWriter"),
+            ):
+                make_handler(settings)
+
+        store_type.assert_called_once_with(
+            settings.database_path,
+            synchronous=SQLiteSynchronous.FULL,
+        )
+
+    def test_api_main_rejects_invalid_mode_before_runtime_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "missing-state"
+            stderr = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ZEUS_STATE_DIR": str(state_dir),
+                        "ZEUS_SQLITE_SYNCHRONOUS": "FULL; VACUUM",
+                    },
+                    clear=True,
+                ),
+                patch("zeus.config.load_dotenv", return_value={}),
+                patch("zeus.api.serve") as serve_entrypoint,
+                patch("zeus.api.StateStore") as store_type,
+                patch("zeus.api.make_handler") as handler_factory,
+                patch("zeus.api.ThreadingHTTPServer") as server_type,
+                patch.object(Settings, "ensure_dirs") as ensure_dirs,
+                redirect_stderr(stderr),
+            ):
+                result = api_module.main([])
+
+            self.assertEqual(1, result)
+            self.assertEqual(
+                "Invalid Zeus configuration: ZEUS_SQLITE_SYNCHRONOUS must be NORMAL or FULL\n",
+                stderr.getvalue(),
+            )
+            serve_entrypoint.assert_not_called()
+            store_type.assert_not_called()
+            handler_factory.assert_not_called()
+            server_type.assert_not_called()
+            ensure_dirs.assert_not_called()
+            self.assertFalse(state_dir.exists())
 
 
 if __name__ == "__main__":

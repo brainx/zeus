@@ -9,6 +9,7 @@ User=zeus
 Group=zeus
 WorkingDirectory=/opt/zeus
 EnvironmentFile=/etc/zeus/zeus.env
+Environment=ZEUS_SQLITE_SYNCHRONOUS=FULL
 ExecStart=/opt/zeus/.venv/bin/zeus bot reconcile
 NoNewPrivileges=true
 PrivateTmp=true

@@ -7,7 +7,7 @@ body:
     id: zeus-version
     attributes:
       label: Zeus version
-      description: Output from `zeus --version` or the installed package version.
+      description: Run `zeus --version` and paste the complete output.
     validations:
       required: true
   - type: input

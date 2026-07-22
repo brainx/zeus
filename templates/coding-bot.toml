@@ -18,7 +18,7 @@ backend = "docker"
 cwd = "."
 home_mode = "profile"
 timeout = 300
-docker_image = "nikolaik/python-nodejs:python3.11-nodejs20"
+docker_image = "nikolaik/python-nodejs:python3.11-nodejs20@sha256:8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
 docker_mount_cwd_to_workspace = false
 
 [hermes.gateway]

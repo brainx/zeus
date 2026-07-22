@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from zeus import models
+from zeus.bot_lifecycle_store import BotLifecycleStore
 from zeus.models import BotRecord, BotStatus, DesiredState, RestartPolicy
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
@@ -699,6 +701,173 @@ class GatewayLauncherTests(unittest.TestCase):
 
             self.assertTrue(swapped)
 
+    def test_profile_chain_rejects_final_symlink_appearing_during_missing_lookup(self) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_profile_chain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            profile = root / "hermes" / "profiles" / "coder"
+            profile.parent.mkdir(parents=True)
+            external = root / "external-profile"
+            external.mkdir()
+            real_stat = os.stat
+            appeared = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal appeared
+                if path == profile.name and dir_fd is not None and not appeared:
+                    try:
+                        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                    except FileNotFoundError:
+                        profile.symlink_to(external, target_is_directory=True)
+                        appeared = True
+                        raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with (
+                patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat),
+                self.assertRaisesRegex(LaunchPayloadError, "appeared"),
+            ):
+                _open_profile_chain(profile)
+
+            self.assertTrue(appeared)
+            self.assertTrue(profile.is_symlink())
+
+    def test_profile_chain_rejects_intermediate_symlink_appearing_during_missing_lookup(
+        self,
+    ) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_profile_chain
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            hermes = root / "hermes"
+            hermes.mkdir()
+            profiles = hermes / "profiles"
+            profile = profiles / "coder"
+            external = root / "external-profiles"
+            (external / "coder").mkdir(parents=True)
+            real_stat = os.stat
+            appeared = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal appeared
+                if path == profiles.name and dir_fd is not None and not appeared:
+                    try:
+                        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+                    except FileNotFoundError:
+                        profiles.symlink_to(external, target_is_directory=True)
+                        appeared = True
+                        raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with (
+                patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat),
+                self.assertRaisesRegex(LaunchPayloadError, "appeared"),
+            ):
+                _open_profile_chain(profile)
+
+            self.assertTrue(appeared)
+            self.assertTrue(profiles.is_symlink())
+
+    def test_directory_open_closes_new_descriptor_when_post_open_fstat_fails(self) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_directory_at
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = root / "child"
+            child.mkdir()
+            parent_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            real_open = os.open
+            real_fstat = os.fstat
+            opened_fd: int | None = None
+
+            def tracking_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal opened_fd
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if path == child.name and dir_fd == parent_fd:
+                    opened_fd = descriptor
+                return descriptor
+
+            def failing_fstat(fd: int) -> os.stat_result:
+                if fd == opened_fd:
+                    raise OSError(errno.EIO, "injected directory fstat failure")
+                return real_fstat(fd)
+
+            try:
+                with (
+                    patch("zeus.gateway_launcher.os.open", side_effect=tracking_open),
+                    patch("zeus.gateway_launcher.os.fstat", side_effect=failing_fstat),
+                    self.assertRaises(LaunchPayloadError),
+                ):
+                    _open_directory_at(parent_fd, child.name)
+            finally:
+                os.close(parent_fd)
+
+            self.assertIsNotNone(opened_fd)
+            with self.assertRaises(OSError):
+                os.fstat(opened_fd)  # type: ignore[arg-type]
+
+    def test_marker_open_closes_new_descriptor_when_post_open_fstat_fails(self) -> None:
+        from zeus.gateway_launcher import LaunchPayloadError, _open_regular_marker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / "logs"
+            logs.mkdir()
+            marker = logs / "zeus-gateway.pid.json"
+            marker.write_text("{}", encoding="utf-8")
+            logs_fd = os.open(logs, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            real_open = os.open
+            real_fstat = os.fstat
+            opened_fd: int | None = None
+
+            def tracking_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal opened_fd
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if path == marker.name and dir_fd == logs_fd:
+                    opened_fd = descriptor
+                return descriptor
+
+            def failing_fstat(fd: int) -> os.stat_result:
+                if fd == opened_fd:
+                    raise OSError(errno.EIO, "injected marker fstat failure")
+                return real_fstat(fd)
+
+            try:
+                with (
+                    patch("zeus.gateway_launcher.os.open", side_effect=tracking_open),
+                    patch("zeus.gateway_launcher.os.fstat", side_effect=failing_fstat),
+                    self.assertRaises(LaunchPayloadError),
+                ):
+                    _open_regular_marker(logs_fd)
+            finally:
+                os.close(logs_fd)
+
+            self.assertIsNotNone(opened_fd)
+            with self.assertRaises(OSError):
+                os.fstat(opened_fd)  # type: ignore[arg-type]
+
     def test_ack_failure_removes_only_the_owned_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1308,7 +1477,9 @@ class CrashRecoveryStateTests(unittest.TestCase):
 
             with (
                 patch.object(
-                    store, "_insert_lifecycle_event", side_effect=sqlite3.DatabaseError("boom")
+                    BotLifecycleStore,
+                    "_insert_lifecycle_event",
+                    side_effect=sqlite3.DatabaseError("boom"),
                 ),
                 self.assertRaisesRegex(sqlite3.DatabaseError, "boom"),
             ):
@@ -1336,7 +1507,9 @@ class CrashRecoveryStateTests(unittest.TestCase):
 
                 with (
                     patch.object(
-                        store, "_insert_lifecycle_event", side_effect=sqlite3.DatabaseError("boom")
+                        BotLifecycleStore,
+                        "_insert_lifecycle_event",
+                        side_effect=sqlite3.DatabaseError("boom"),
                     ),
                     self.assertRaisesRegex(sqlite3.DatabaseError, "boom"),
                 ):
@@ -1475,6 +1648,120 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
         marker_path.write_text(json.dumps(marker), encoding="utf-8")
         return marker_path
 
+    def test_strict_marker_final_profile_validation_enoent_is_untrusted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            _store, supervisor = self._fixture(root)
+            record = _store.get_bot("coder")
+            assert record is not None
+            profile = Path(record.profile_path)
+            marker_path = self._write_runtime_marker(
+                supervisor,
+                record.profile_path,
+                self._runtime_marker(supervisor),
+            )
+            displaced = root / "profile-displaced-during-validation"
+            profiles_stat = profile.parent.stat()
+            real_stat = os.stat
+            profile_observations = 0
+            restored = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal profile_observations, restored
+                if path == profile.name and dir_fd is not None:
+                    parent = os.fstat(dir_fd)
+                    if (
+                        parent.st_dev == profiles_stat.st_dev
+                        and parent.st_ino == profiles_stat.st_ino
+                    ):
+                        profile_observations += 1
+                        if profile_observations == 2:
+                            profile.rename(displaced)
+                            try:
+                                return real_stat(
+                                    path,
+                                    dir_fd=dir_fd,
+                                    follow_symlinks=follow_symlinks,
+                                )
+                            except FileNotFoundError:
+                                displaced.rename(profile)
+                                restored = True
+                                raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat):
+                observation = supervisor._read_strict_runtime_marker("coder", record.profile_path)
+
+            self.assertEqual(2, profile_observations)
+            self.assertTrue(restored)
+            self.assertEqual("untrusted", observation.kind)
+            self.assertTrue(profile.is_dir())
+            self.assertTrue(marker_path.is_file())
+
+    def test_inspect_marker_final_profile_validation_enoent_is_unsafe(self) -> None:
+        from zeus.private_io import UnsafeFileError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            _store, supervisor = self._fixture(root)
+            record = _store.get_bot("coder")
+            assert record is not None
+            profile = Path(record.profile_path)
+            marker_path = self._write_runtime_marker(
+                supervisor,
+                record.profile_path,
+                self._runtime_marker(supervisor),
+            )
+            displaced = root / "profile-displaced-during-inspect"
+            profiles_stat = profile.parent.stat()
+            real_stat = os.stat
+            profile_observations = 0
+            restored = False
+
+            def racing_stat(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                nonlocal profile_observations, restored
+                if path == profile.name and dir_fd is not None:
+                    parent = os.fstat(dir_fd)
+                    if (
+                        parent.st_dev == profiles_stat.st_dev
+                        and parent.st_ino == profiles_stat.st_ino
+                    ):
+                        profile_observations += 1
+                        if profile_observations == 2:
+                            profile.rename(displaced)
+                            try:
+                                return real_stat(
+                                    path,
+                                    dir_fd=dir_fd,
+                                    follow_symlinks=follow_symlinks,
+                                )
+                            except FileNotFoundError:
+                                displaced.rename(profile)
+                                restored = True
+                                raise
+                return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+            with (
+                patch("zeus.gateway_launcher.os.stat", side_effect=racing_stat),
+                self.assertRaises(UnsafeFileError),
+            ):
+                supervisor._read_pid_marker(record.profile_path)
+
+            self.assertEqual(2, profile_observations)
+            self.assertTrue(restored)
+            self.assertTrue(profile.is_dir())
+            self.assertTrue(marker_path.is_file())
+
     def _compat_marker(
         self,
         supervisor: Supervisor,
@@ -1565,6 +1852,65 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
             source="cli",
         )
         return pending, marker_path
+
+    def test_start_and_stop_effects_observe_committed_lifecycle_intents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, supervisor = self._fixture(Path(tmp))
+            observed: list[tuple[str | None, int, str]] = []
+
+            def spawn_after_intent(*args: object, **kwargs: object) -> _RecoveryPopen:
+                pending = store.get_bot("coder")
+                assert pending is not None
+                event = store.list_lifecycle_events("coder", limit=1, before=None)[0]
+                observed.append((pending.pending_action, pending.desired_revision, event.action))
+                return _RecoveryPopen(*args, **kwargs)
+
+            supervisor.popen_factory = spawn_after_intent
+            _RecoveryPopen.launches.clear()
+
+            started = supervisor.start("coder")
+
+            self.assertEqual(BotStatus.running, started.status)
+            self.assertEqual([("start", 1, "bot.start.intent")], observed)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            alive = True
+            store, supervisor = self._fixture(
+                Path(tmp),
+                desired=DesiredState.running,
+                pid_alive_fn=lambda pid: alive,
+            )
+            record = store.get_bot("coder")
+            assert record is not None
+            running = replace(
+                record,
+                status=BotStatus.running,
+                pid=4321,
+                desired_revision=1,
+            )
+            store.upsert_bot(running)
+            self._write_runtime_marker(
+                supervisor,
+                running.profile_path,
+                self._runtime_marker(supervisor, desired_revision=1),
+            )
+            observed = []
+
+            def signal_after_intent(pid: int, sent_signal: object) -> None:
+                nonlocal alive
+                pending = store.get_bot("coder")
+                assert pending is not None
+                event = store.list_lifecycle_events("coder", limit=1, before=None)[0]
+                observed.append((pending.pending_action, pending.desired_revision, event.action))
+                alive = False
+
+            supervisor.kill_fn = signal_after_intent
+            supervisor.stop_grace_seconds = 0
+
+            stopped = supervisor.stop("coder")
+
+            self.assertEqual(BotStatus.stopped, stopped.status)
+            self.assertEqual([("stop", 2, "bot.stop.intent")], observed)
 
     def test_pending_compat_restart_fails_closed_without_side_effects(self) -> None:
         for schema in (2, None):
@@ -1752,13 +2098,35 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
 
     def test_reconcile_crash_before_spawn_reuses_pending_correlation_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store, supervisor = self._fixture(Path(tmp))
+            root = Path(tmp)
+            store, _interrupted_supervisor = self._fixture(root)
             _RecoveryPopen.launches.clear()
             pending = store.begin_lifecycle_intent(
                 "coder",
                 action="start",
                 operation_id="a" * 32,
                 source="cli",
+            )
+
+            hermes = root / "bin" / "hermes"
+            hermes_root = root / "hermes"
+            recovered_store = StateStore(root / "zeus.db")
+            recovered_store.init()
+            supervisor = Supervisor(
+                recovered_store,
+                str(hermes),
+                hermes_root,
+                popen_factory=_RecoveryPopen,
+                pid_alive_fn=lambda pid: True,
+                cmdline_reader=lambda pid: [
+                    str(hermes.resolve()),
+                    "-p",
+                    "coder",
+                    "gateway",
+                    "run",
+                ],
+                proc_start_fingerprint_reader=lambda pid: "test-start:4321",
+                startup_grace_seconds=0,
             )
 
             result = supervisor.reconcile("coder")[0]
@@ -1768,7 +2136,7 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
             marker = _RecoveryPopen.launches[0]["marker"]
             self.assertEqual("a" * 32, marker["operation_id"])
             self.assertEqual(pending.desired_revision, marker["desired_revision"])
-            loaded = store.get_bot("coder")
+            loaded = recovered_store.get_bot("coder")
             assert loaded is not None
             self.assertIsNone(loaded.pending_operation_id)
 
@@ -3065,7 +3433,14 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired("hermes", timeout)
 
         with tempfile.TemporaryDirectory() as tmp:
-            fingerprints = iter(["test-start:4321", "test-start:4321", "test-start:reused"])
+            fingerprints = iter(
+                [
+                    "test-start:4321",
+                    "test-start:4321",
+                    "test-start:4321",
+                    "test-start:reused",
+                ]
+            )
             store, supervisor = self._fixture(
                 Path(tmp),
                 desired=DesiredState.running,

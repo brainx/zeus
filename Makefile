@@ -25,8 +25,10 @@ check:
 	ruff check .
 	mypy zeus
 	bandit -r zeus
+	shellcheck scripts/*.sh
 
 build:
+	python -m pip check
 	python -m build
 	twine check dist/*
 
@@ -44,6 +46,7 @@ release-check:
 	mypy zeus
 	bandit -r zeus
 	shellcheck scripts/*.sh
+	python -m pip check
 	rm -rf dist
 	python -m build
 	ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh

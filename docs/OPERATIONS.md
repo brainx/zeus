@@ -1,5 +1,55 @@
 # Operations
 
+## SQLite Durability
+
+Zeus uses SQLite WAL mode and applies `ZEUS_SQLITE_SYNCHRONOUS` to every
+operational connection. Unset or empty configuration defaults to NORMAL for
+upgrade compatibility. The bundled API and reconcile services select FULL.
+
+Committed transactions survive an application or Zeus process crash under both
+NORMAL and FULL. With NORMAL, SQLite omits a WAL sync on most commits; a host OS
+crash, hard reset, or power loss can roll back recently reported commits after
+recovery while WAL consistency is retained. With FULL, SQLite syncs the WAL at
+each commit to provide durability across OS crash or power loss, at the cost of
+commit latency.
+
+The policy is per connection. Every process that writes the same database,
+including manual CLI and doctor commands capable of migration, must select the
+intended mode. A NORMAL writer does not change an existing FULL connection, but
+its own commits retain NORMAL power-loss semantics. For hosted manual work where
+FULL durability is expected, carry the setting explicitly:
+
+```bash
+sudo -u zeus env \
+  ZEUS_STATE_DIR=/var/lib/zeus \
+  ZEUS_SQLITE_SYNCHRONOUS=FULL \
+  /opt/zeus/.venv/bin/zeus bot reconcile
+sudo -u zeus env \
+  ZEUS_STATE_DIR=/var/lib/zeus \
+  ZEUS_SQLITE_SYNCHRONOUS=FULL \
+  /opt/zeus/.venv/bin/zeus doctor --strict
+```
+
+The setting covers SQLite only. It does not make rendered profile files, PID
+markers, locks, or the best-effort audit JSONL atomic with the database, replace
+backups, or overcome storage that lies about flushes. Continue the backup and
+restore procedures below under either mode.
+
+## API Liveness and Readiness
+
+Use `GET /health` for public process liveness. It does not authenticate or touch
+SQLite, so it can remain healthy while persistent state is unavailable.
+
+Use `GET /ready` (or `GET /v1/ready`) for load-balancer and service readiness.
+This ordinary read endpoint requires `x-zeus-api-key`, except on a loopback bind
+when `ZEUS_ALLOW_UNAUTH_READS=1` is explicitly enabled. It opens the existing
+database read-only, requires the current schema version, and runs `SELECT 1`.
+It never creates or migrates a database and does not require bots to be running.
+
+A ready service returns `{"schema_version":6,"status":"ready"}`. State-store
+failures return `503` with `error.code=not_ready`. If state initialization fails
+before the API binds, the process exits instead of serving `/ready`.
+
 ## Backup
 
 Back up `ZEUS_STATE_DIR` regularly. For the sample systemd deployment, that is
@@ -59,7 +109,7 @@ Start services and verify the restored host:
 ```bash
 sudo systemctl start zeus-api
 sudo systemctl start zeus-reconcile.timer
-sudo -u zeus env ZEUS_STATE_DIR=/var/lib/zeus \
+sudo -u zeus env ZEUS_STATE_DIR=/var/lib/zeus ZEUS_SQLITE_SYNCHRONOUS=FULL \
   /opt/zeus/.venv/bin/zeus doctor --strict
 ```
 
@@ -353,6 +403,23 @@ where Hermes is expected to be installed and usable.
 Hermes child processes receive a minimal environment by default plus variables
 rendered into the bot profile `.env`. Zeus does not pass the full API service or
 operator shell environment to child processes.
+
+Import bot secrets without putting their values in command arguments:
+
+```bash
+zeus bot create coder \
+  --template coding-bot \
+  --env-from OPENROUTER_API_KEY
+```
+
+For every `--env-from NAME`, Zeus reads the process environment first and then
+the trusted workspace `./.env`. A present but empty process value fails closed;
+it does not fall back to `.env`. Missing and empty errors identify only the
+variable name, and imported values are not printed. Keep the trusted source
+private with `chmod 0600 .env`. Zeus persists imported values only in the
+selected bot profile's `.env`, which Zeus writes with mode `0600`. The legacy
+`--env NAME=VALUE` form remains compatible for non-secret values but is unsafe
+for secrets because argv can be visible in shell history and process listings.
 
 To pass selected host variables, set an explicit allowlist:
 
