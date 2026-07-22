@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -106,6 +107,35 @@ def _markdown_table_rows(markdown: str) -> dict[str, tuple[str, ...]]:
 
 
 class RepoContractTests(unittest.TestCase):
+    def test_builtin_template_copies_are_identical_and_images_are_digest_pinned(
+        self,
+    ) -> None:
+        source_root = Path("templates")
+        bundled_root = Path("zeus/bundled_templates")
+        expected_image = (
+            "nikolaik/python-nodejs:python3.11-nodejs20@sha256:"
+            "8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
+        )
+        source_names = sorted(path.name for path in source_root.glob("*.toml"))
+        bundled_names = sorted(path.name for path in bundled_root.glob("*.toml"))
+
+        self.assertEqual(source_names, bundled_names)
+        self.assertGreaterEqual(len(source_names), 7)
+        for name in source_names:
+            with self.subTest(template=name):
+                source_text = (source_root / name).read_text(encoding="utf-8")
+                bundled_text = (bundled_root / name).read_text(encoding="utf-8")
+                self.assertEqual(source_text, bundled_text)
+
+                data = tomllib.loads(source_text)
+                docker_image = data["hermes"]["terminal"]["docker_image"]
+                self.assertIsInstance(docker_image, str)
+                self.assertEqual(expected_image, docker_image)
+                self.assertRegex(
+                    docker_image,
+                    r"\A[a-z0-9./_-]+:[a-zA-Z0-9._-]+@sha256:[0-9a-f]{64}\Z",
+                )
+
     def test_publishable_repository_files_exist(self) -> None:
         required = [
             "README.md",
