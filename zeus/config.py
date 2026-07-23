@@ -50,8 +50,13 @@ class Settings:
     sqlite_synchronous: SQLiteSynchronous = SQLiteSynchronous.NORMAL
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
-        merged: dict[str, str] = load_dotenv()
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        include_dotenv: bool = True,
+    ) -> Settings:
+        merged: dict[str, str] = load_dotenv() if include_dotenv else {}
         merged.update(dict(os.environ if env is None else env))
         sqlite_synchronous = _sqlite_synchronous_env(merged)
         state_dir = nofollow_absolute_path(Path(merged.get("ZEUS_STATE_DIR") or ".zeus"))

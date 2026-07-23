@@ -4402,6 +4402,71 @@ raise SystemExit(0)
 
         self.assertEqual((Path.cwd() / ".zeus").resolve(), settings.state_dir)
 
+    def test_settings_dotenv_free_mode_never_calls_dotenv_loader(self) -> None:
+        with patch("zeus.config.load_dotenv") as load_dotenv:
+            Settings.from_env({}, include_dotenv=False)
+
+        load_dotenv.assert_not_called()
+
+    def test_settings_dotenv_free_mode_ignores_repository_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dotenv_state_dir = root / "dotenv-state"
+            explicit_state_dir = root / "explicit-state"
+            (root / ".env").write_text(
+                "\n".join(
+                    (
+                        f"ZEUS_STATE_DIR={dotenv_state_dir}",
+                        "ZEUS_HERMES_BIN=dotenv-hermes",
+                        "ZEUS_HOST=0.0.0.0",
+                        "ZEUS_PORT=9999",
+                        "ZEUS_API_KEY=dotenv-api-key",
+                        "OPENROUTER_API_KEY=dotenv-provider-key",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                settings = Settings.from_env(
+                    {
+                        "ZEUS_STATE_DIR": str(explicit_state_dir),
+                        "ZEUS_HERMES_BIN": "explicit-hermes",
+                        "ZEUS_HOST": "127.0.0.1",
+                        "ZEUS_PORT": "4312",
+                        "ZEUS_API_KEY": "explicit-api-key",
+                    },
+                    include_dotenv=False,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(explicit_state_dir.resolve(), settings.state_dir)
+        self.assertEqual("explicit-hermes", settings.hermes_bin)
+        self.assertEqual("127.0.0.1", settings.host)
+        self.assertEqual(4312, settings.port)
+        self.assertEqual("explicit-api-key", settings.api_key)
+
+    def test_settings_from_env_loads_dotenv_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dotenv_state_dir = root / "dotenv-state"
+            (root / ".env").write_text(
+                f"ZEUS_STATE_DIR={dotenv_state_dir}\nZEUS_PORT=4312\n",
+                encoding="utf-8",
+            )
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                settings = Settings.from_env({})
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(dotenv_state_dir.resolve(), settings.state_dir)
+        self.assertEqual(4312, settings.port)
+
     def test_cli_serve_forwards_explicit_ephemeral_port(self) -> None:
         settings = Settings.from_env({})
         with (
