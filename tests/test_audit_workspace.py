@@ -8,6 +8,8 @@ import tempfile
 import time
 import unittest
 import zlib
+from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from unittest.mock import patch
@@ -520,6 +522,109 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
 
         self.assertEqual(b"preserve", marker.read_bytes())
 
+    def test_materialization_does_not_require_path_chmod(self) -> None:
+        inspection = self.inspect()
+
+        with patch(
+            "zeus.audit_workspace.os.chmod",
+            side_effect=NotImplementedError("follow_symlinks unavailable"),
+        ):
+            snapshot = self.materialize("descriptor-modes", inspection=inspection)
+
+        self.assertEqual(b"committed\n", (snapshot.root / "README.md").read_bytes())
+        self.workspace.validate_snapshot(snapshot)
+
+    def test_rejects_destination_parent_swap_and_cleans_bound_leaf(self) -> None:
+        output_parent = self.temp_root / "output"
+        moved_parent = self.temp_root / "output-original"
+        attacker = self.temp_root / "attacker"
+        output_parent.mkdir(mode=0o700)
+        attacker.mkdir(mode=0o700)
+        destination = output_parent / "snapshot"
+        inspection = self.inspect()
+        original_mkdir = os.mkdir
+        swapped = False
+
+        def swapping_mkdir(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal swapped
+            path_text = os.fsdecode(path)
+            destination_call = (dir_fd is None and Path(path_text) == destination) or (
+                dir_fd is not None and path_text == destination.name
+            )
+            if destination_call and not swapped:
+                output_parent.rename(moved_parent)
+                output_parent.symlink_to(attacker, target_is_directory=True)
+                swapped = True
+            if dir_fd is None:
+                original_mkdir(path, mode)
+            else:
+                original_mkdir(path, mode, dir_fd=dir_fd)
+
+        try:
+            with (
+                patch(
+                    "zeus.audit_workspace.os.mkdir",
+                    side_effect=swapping_mkdir,
+                ),
+                self.assertRaisesRegex(AuditWorkspaceError, "parent binding changed"),
+            ):
+                self.workspace.materialize(
+                    inspection,
+                    destination,
+                    exclude_paths=(),
+                    limits=HARD_LIMITS,
+                    deadline=_deadline(),
+                )
+
+            self.assertTrue(swapped)
+            self.assertFalse((attacker / destination.name).exists())
+            self.assertFalse((moved_parent / destination.name).exists())
+        finally:
+            if output_parent.is_symlink():
+                output_parent.unlink()
+            if moved_parent.exists():
+                moved_parent.rename(output_parent)
+
+    def test_cleanup_preserves_a_replacement_snapshot_leaf(self) -> None:
+        inspection = self.inspect()
+        destination = self.temp_root / "cleanup-race"
+        orphan = self.temp_root / "cleanup-race-original"
+        opened = self.workspace._prepare_destination(
+            inspection.location,
+            destination,
+        )
+        original_scandir = os.scandir
+        swapped = False
+
+        def swapping_scandir(path: int) -> Iterator[os.DirEntry[str]]:
+            nonlocal swapped
+            if isinstance(path, int) and not swapped:
+                destination.rename(orphan)
+                destination.mkdir(mode=0o700)
+                swapped = True
+            return original_scandir(path)
+
+        try:
+            with patch(
+                "zeus.audit_workspace.os.scandir",
+                side_effect=swapping_scandir,
+            ):
+                self.workspace._cleanup_opened_snapshot(opened)
+
+            self.assertTrue(swapped)
+            self.assertTrue(destination.is_dir())
+            self.assertTrue(orphan.is_dir())
+        finally:
+            with suppress(OSError):
+                os.close(opened.root_descriptor)
+            with suppress(OSError):
+                os.close(opened.parent_descriptor)
+
     def test_rejects_destinations_inside_repository_boundaries(self) -> None:
         inspection = self.inspect()
         destinations = [
@@ -561,6 +666,51 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
             )
         self.assertFalse((self.temp_root / "metadata-limited").exists())
         self.assertFalse((self.temp_root / "deadline-expired").exists())
+
+    def test_final_snapshot_validation_honors_materialization_deadline(self) -> None:
+        inspection = self.inspect()
+        destination = self.temp_root / "validation-deadline"
+        caller_deadline = time.monotonic() + 0.7
+        original_hash = self.workspace._hash_regular_file_at
+        observed_deadlines: list[float | None] = []
+
+        def expire_during_hash(
+            parent_descriptor: int,
+            name: str,
+            expected: os.stat_result,
+            *,
+            deadline: float | None = None,
+        ) -> str:
+            observed_deadlines.append(deadline)
+            time.sleep(max(0.0, caller_deadline - time.monotonic() + 0.02))
+            if deadline is None:
+                return original_hash(parent_descriptor, name, expected)
+            return original_hash(
+                parent_descriptor,
+                name,
+                expected,
+                deadline=deadline,
+            )
+
+        with (
+            patch.object(
+                self.workspace,
+                "_hash_regular_file_at",
+                side_effect=expire_during_hash,
+            ) as hash_file,
+            self.assertRaisesRegex(AuditWorkspaceError, "deadline"),
+        ):
+            self.workspace.materialize(
+                inspection,
+                destination,
+                exclude_paths=(),
+                limits=HARD_LIMITS,
+                deadline=caller_deadline,
+            )
+
+        self.assertEqual(1, hash_file.call_count)
+        self.assertEqual([caller_deadline], observed_deadlines)
+        self.assertFalse(destination.exists())
 
     def test_validate_snapshot_rejects_content_mode_and_extra_entry_changes(self) -> None:
         snapshot = self.materialize()
