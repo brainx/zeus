@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, cast, overload
 
 _DIRECTORY_MODE = 0o700
 _FILE_MODE = 0o600
@@ -555,6 +555,7 @@ def _open_private_file_at(
     *,
     append: bool,
     create: bool,
+    tighten: bool = True,
     platform: _Platform,
 ) -> _OpenedPrivateFile | None:
     before: os.stat_result | None
@@ -589,21 +590,29 @@ def _open_private_file_at(
         if not _same_files(initial_snapshots):
             raise UnsafeFileError("private file changed while it was opened")
 
-        os.fchmod(file_fd, _FILE_MODE)
-        tightened = os.fstat(file_fd)
-        final = os.lstat(name, dir_fd=parent_fd)
-        final_snapshots = (*initial_snapshots, tightened, final)
-        for snapshot in final_snapshots:
-            _validate_file_snapshot(snapshot, platform)
-        if not _same_files(final_snapshots):
-            raise UnsafeFileError("private file changed while it was opened")
-        if any(stat.S_IMODE(snapshot.st_mode) != _FILE_MODE for snapshot in (tightened, final)):
-            raise UnsafeFileError("private file does not have private permissions")
+        if tighten:
+            os.fchmod(file_fd, _FILE_MODE)
+            tightened = os.fstat(file_fd)
+            final = os.lstat(name, dir_fd=parent_fd)
+            final_snapshots = (*initial_snapshots, tightened, final)
+            for snapshot in final_snapshots:
+                _validate_file_snapshot(snapshot, platform)
+            if not _same_files(final_snapshots):
+                raise UnsafeFileError("private file changed while it was opened")
+            if any(
+                stat.S_IMODE(snapshot.st_mode) != _FILE_MODE
+                for snapshot in (tightened, final)
+            ):
+                raise UnsafeFileError("private file does not have private permissions")
+            identity = tightened
+        else:
+            _validate_private_file_snapshots(initial_snapshots, platform)
+            identity = opened
         return _OpenedPrivateFile(
             fd=file_fd,
             parent_fd=parent_fd,
             name=name,
-            identity=tightened,
+            identity=identity,
             platform=platform,
         )
     except UnsafeFileError:
@@ -736,11 +745,32 @@ def read_private_tail(path: Path, max_bytes: int) -> bytes:
         return b""
 
 
+@overload
+def read_private_bytes(
+    path: Path,
+    max_bytes: int,
+    *,
+    missing_ok: Literal[False] = False,
+    tighten: bool = True,
+) -> bytes: ...
+
+
+@overload
+def read_private_bytes(
+    path: Path,
+    max_bytes: int,
+    *,
+    missing_ok: Literal[True],
+    tighten: bool = True,
+) -> bytes | None: ...
+
+
 def read_private_bytes(
     path: Path,
     max_bytes: int,
     *,
     missing_ok: bool = False,
+    tighten: bool = True,
 ) -> bytes | None:
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
         raise TypeError("max_bytes must be an integer")
@@ -748,6 +778,8 @@ def read_private_bytes(
         raise TypeError("max_bytes must be non-negative")
     if not isinstance(missing_ok, bool):
         raise TypeError("missing_ok must be a boolean")
+    if not isinstance(tighten, bool):
+        raise TypeError("tighten must be a boolean")
     parts = _validate_path(path, file_path=True)
     platform = _require_platform()
     try:
@@ -755,6 +787,7 @@ def read_private_bytes(
             parts[:-1],
             create=False,
             missing_ok=True,
+            tighten=tighten,
             platform=platform,
         ) as parent:
             opened_file = _open_private_file_at(
@@ -762,6 +795,7 @@ def read_private_bytes(
                 parts[-1],
                 append=False,
                 create=False,
+                tighten=tighten,
                 platform=platform,
             )
             if opened_file is None:
@@ -1112,12 +1146,23 @@ def validate_private_directory(path: Path) -> None:
 
 
 @contextmanager
-def pin_private_directory(path: Path) -> Iterator[_PinnedPrivateDirectory]:
+def pin_private_directory(
+    path: Path,
+    *,
+    tighten: bool = True,
+) -> Iterator[_PinnedPrivateDirectory]:
+    if not isinstance(tighten, bool):
+        raise TypeError("tighten must be a boolean")
     parts = _validate_path(path, file_path=False)
     platform = _require_platform()
     pinned_fd = -1
     try:
-        with _open_directory_path(parts, create=False, platform=platform) as opened:
+        with _open_directory_path(
+            parts,
+            create=False,
+            tighten=tighten,
+            platform=platform,
+        ) as opened:
             try:
                 pinned_fd = os.dup(opened.fd)
                 identity = os.fstat(pinned_fd)
@@ -1146,10 +1191,17 @@ def pin_private_directory(path: Path) -> Iterator[_PinnedPrivateDirectory]:
         _close_descriptor(pinned_fd, "pinned private directory")
 
 
-def ensure_private_directory(path: Path) -> None:
+def ensure_private_directory(path: Path, *, tighten_existing: bool = True) -> None:
+    if not isinstance(tighten_existing, bool):
+        raise TypeError("tighten_existing must be a boolean")
     parts = _validate_path(path, file_path=False)
     platform = _require_platform()
-    with _open_directory_path(parts, create=True, platform=platform):
+    with _open_directory_path(
+        parts,
+        create=True,
+        tighten=tighten_existing,
+        platform=platform,
+    ):
         pass
 
 

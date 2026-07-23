@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import os
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -147,6 +149,67 @@ class AuditStoreTests(unittest.TestCase):
         self.assertFalse((audits / run_id).exists())
         self.assertEqual([], list(audits.iterdir()))
 
+    def test_staging_creation_failure_after_mkdir_cleans_owned_directory(self) -> None:
+        run_id = "34343434343434343434343434343434"
+
+        with (
+            patch.object(
+                audit_store,
+                "_directory_flags",
+                side_effect=AuditStoreError("injected open preparation failure"),
+            ),
+            self.assertRaises(AuditStoreError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual([], list((self.state_dir / "audits").iterdir()))
+
+    def test_leaf_identity_capture_failure_cleans_installed_leaf_and_staging(self) -> None:
+        run_id = "35353535353535353535353535353535"
+        real_capture = audit_store._capture_staged_leaf
+        calls = 0
+
+        def fail_first_capture(
+            staging_fd: int,
+            name: str,
+            *,
+            expected_size: int,
+        ) -> os.stat_result:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise AuditStoreError("injected identity capture failure")
+            return real_capture(staging_fd, name, expected_size=expected_size)
+
+        with (
+            patch.object(
+                audit_store,
+                "_capture_staged_leaf",
+                side_effect=fail_first_capture,
+            ),
+            self.assertRaises(AuditStoreError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual([], list((self.state_dir / "audits").iterdir()))
+
+    def test_leaf_parent_fsync_failure_cleans_installed_leaf_and_staging(self) -> None:
+        run_id = "36363636363636363636363636363636"
+        real_fsync = os.fsync
+
+        def fail_directory_fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("injected parent fsync failure")
+            real_fsync(fd)
+
+        with (
+            patch.object(os, "fsync", side_effect=fail_directory_fsync),
+            self.assertRaises(UnsafeFileError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual([], list((self.state_dir / "audits").iterdir()))
+
     def test_failure_cleanup_preserves_replaced_ambiguous_staging_path(self) -> None:
         run_id = "44444444444444444444444444444444"
         replacement_seen: Path | None = None
@@ -197,6 +260,68 @@ class AuditStoreTests(unittest.TestCase):
 
         self.assertEqual(older, self.store.read_report(older.run_id))
         self.assertEqual(newer, self.store.read_report(newer.run_id))
+
+    def test_install_rejects_existing_insecure_hierarchy_without_repair(self) -> None:
+        run_id = "67676767676767676767676767676767"
+        for insecure_component in ("state", "audits"):
+            with (
+                self.subTest(component=insecure_component),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                state_dir = Path(temporary).resolve() / "state"
+                audits_dir = state_dir / "audits"
+                audits_dir.mkdir(parents=True, mode=0o700)
+                state_dir.chmod(0o700)
+                audits_dir.chmod(0o700)
+                path = state_dir if insecure_component == "state" else audits_dir
+                path.chmod(0o755)
+
+                with self.assertRaises((AuditStoreError, UnsafeFileError)):
+                    AuditStore(state_dir).install(_report(run_id))
+
+                self.assertEqual(0o755, stat.S_IMODE(path.stat().st_mode))
+                self.assertEqual([], list(audits_dir.iterdir()))
+
+    def test_reads_reject_existing_insecure_hierarchy_without_repair(self) -> None:
+        run_id = "68686868686868686868686868686868"
+        for insecure_component in ("state", "audits", "run"):
+            with (
+                self.subTest(component=insecure_component),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                state_dir = Path(temporary).resolve() / "state"
+                store = AuditStore(state_dir)
+                store.install(_report(run_id))
+                paths = {
+                    "state": state_dir,
+                    "audits": state_dir / "audits",
+                    "run": state_dir / "audits" / run_id,
+                }
+                path = paths[insecure_component]
+                path.chmod(0o755)
+
+                with self.assertRaises((AuditStoreError, UnsafeFileError)):
+                    store.read_report(run_id)
+
+                self.assertEqual(0o755, stat.S_IMODE(path.stat().st_mode))
+
+    def test_reads_reject_public_artifact_modes_without_repair(self) -> None:
+        run_id = "69696969696969696969696969696969"
+        for name in ("report.json", "report.md"):
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                state_dir = Path(temporary).resolve() / "state"
+                store = AuditStore(state_dir)
+                store.install(_report(run_id))
+                path = state_dir / "audits" / run_id / name
+                path.chmod(0o644)
+
+                with self.assertRaises(AuditStoreError):
+                    store.read_report(run_id)
+
+                self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
 
     def test_rejects_non_lowercase_uuid_hex_run_ids_before_path_access(self) -> None:
         invalid = (
@@ -300,6 +425,21 @@ class AuditStoreTests(unittest.TestCase):
         self.assertEqual((), self.store.list_reports())
         self.assertFalse(self.state_dir.exists())
 
+    def test_missing_and_incomplete_pairs_raise_consistent_store_errors(self) -> None:
+        missing_id = "abababababababababababababababab"
+        with self.assertRaisesRegex(AuditStoreError, "unavailable or unsafe"):
+            self.store.read_report(missing_id)
+
+        incomplete_id = "ac" * 16
+        report = _report(incomplete_id)
+        self.store.install(report)
+        self._artifact_path(incomplete_id, "report.md").unlink()
+
+        with self.assertRaisesRegex(AuditStoreError, "unavailable or unsafe"):
+            self.store.read_report(incomplete_id)
+        with self.assertRaisesRegex(AuditStoreError, "unavailable or unsafe"):
+            self.store.read_markdown(incomplete_id)
+
     def test_read_markdown_rejects_non_utf8_and_deterministic_mismatch(self) -> None:
         run_id = "dddddddddddddddddddddddddddddddd"
         report = _report(run_id)
@@ -343,9 +483,47 @@ class AuditStoreTests(unittest.TestCase):
         self.assertEqual(report, self.store.read_report(run_id))
         self.assertEqual(
             [run_id],
-            [
-                entry.name
-                for entry in (self.state_dir / "audits").iterdir()
-                if not entry.name.startswith(".")
-            ],
+            [entry.name for entry in (self.state_dir / "audits").iterdir()],
         )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux renameat2")
+    def test_linux_exclusive_rename_has_one_concurrent_winner(self) -> None:
+        parent = self.root / "exclusive-rename"
+        parent.mkdir(mode=0o700)
+        sources = ("first", "second")
+        for source in sources:
+            source_dir = parent / source
+            source_dir.mkdir(mode=0o700)
+            (source_dir / "winner").write_text(source, encoding="utf-8")
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        barrier = threading.Barrier(2)
+        winners: list[str] = []
+        failures: list[OSError] = []
+
+        def publish(source: str) -> None:
+            barrier.wait()
+            try:
+                audit_store._rename_directory_noreplace(parent_fd, source, "installed")
+                winners.append(source)
+            except OSError as exc:
+                failures.append(exc)
+
+        try:
+            threads = [threading.Thread(target=publish, args=(source,)) for source in sources]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+        finally:
+            os.close(parent_fd)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(1, len(winners))
+        self.assertEqual(1, len(failures))
+        self.assertEqual(errno.EEXIST, failures[0].errno)
+        self.assertEqual(
+            winners[0],
+            (parent / "installed" / "winner").read_text(encoding="utf-8"),
+        )
+        loser = next(source for source in sources if source != winners[0])
+        self.assertTrue((parent / loser).is_dir())

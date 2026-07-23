@@ -166,13 +166,17 @@ def _open_created_staging(
     parent_fd: int,
     staging_name: str,
 ) -> tuple[int, os.stat_result]:
+    created: os.stat_result | None = None
+    directory_fd = -1
     try:
-        os.mkdir(staging_name, _DIRECTORY_MODE, dir_fd=parent_fd)
-        created = os.lstat(staging_name, dir_fd=parent_fd)
-        directory_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
-    except (OSError, TypeError, ValueError) as exc:
-        raise AuditStoreError("private audit staging directory could not be created") from exc
-    try:
+        try:
+            os.mkdir(staging_name, _DIRECTORY_MODE, dir_fd=parent_fd)
+            created = os.lstat(staging_name, dir_fd=parent_fd)
+            directory_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
+        except (OSError, TypeError, ValueError) as exc:
+            raise AuditStoreError(
+                "private audit staging directory could not be created"
+            ) from exc
         os.fchmod(directory_fd, _DIRECTORY_MODE)
         opened = os.fstat(directory_fd)
         current = os.lstat(staging_name, dir_fd=parent_fd)
@@ -182,20 +186,42 @@ def _open_created_staging(
             raise AuditStoreError("audit staging directory changed while it was opened")
         return directory_fd, opened
     except BaseException:
-        with suppress(OSError):
-            os.close(directory_fd)
+        if created is not None:
+            if directory_fd >= 0:
+                _cleanup_owned_staging(
+                    parent_fd,
+                    staging_name,
+                    directory_fd,
+                    created,
+                    {},
+                )
+            else:
+                _cleanup_owned_empty_staging(parent_fd, staging_name, created)
+        if directory_fd >= 0:
+            with suppress(OSError):
+                os.close(directory_fd)
         raise
 
 
-def _ensure_private_audits_directory(path: Path) -> None:
+def _ensure_private_directory_without_repair(path: Path) -> None:
     for attempt in range(4):
         try:
-            ensure_private_directory(path)
+            ensure_private_directory(path, tighten_existing=False)
+            with pin_private_directory(path, tighten=False):
+                pass
             return
         except UnsafeFileError as exc:
             if "appeared while it was created" not in str(exc) or attempt == 3:
                 raise
-    raise AuditStoreError("private audits directory could not be created")
+    raise AuditStoreError("private directory could not be created")
+
+
+def _ensure_private_audits_directory(state_dir: Path, audits_dir: Path) -> None:
+    try:
+        _ensure_private_directory_without_repair(state_dir)
+        _ensure_private_directory_without_repair(audits_dir)
+    except UnsafeFileError as exc:
+        raise AuditStoreError("audit storage hierarchy is unavailable or unsafe") from exc
 
 
 def _capture_staged_leaf(
@@ -210,6 +236,33 @@ def _capture_staged_leaf(
         raise AuditStoreError("staged audit artifact could not be inspected") from exc
     _validate_leaf_snapshot(snapshot, expected_size=expected_size)
     return snapshot
+
+
+def _write_and_capture_staged_leaf(
+    path: Path,
+    data: bytes,
+    max_bytes: int,
+    staging_fd: int,
+    name: str,
+    leaves: dict[str, os.stat_result],
+) -> None:
+    try:
+        _write_private_bytes_atomic(path, data, max_bytes)
+        identity = _capture_staged_leaf(
+            staging_fd,
+            name,
+            expected_size=len(data),
+        )
+    except BaseException:
+        if name not in leaves:
+            with suppress(AuditStoreError):
+                leaves[name] = _capture_staged_leaf(
+                    staging_fd,
+                    name,
+                    expected_size=len(data),
+                )
+        raise
+    leaves[name] = identity
 
 
 def _validate_staging_binding(
@@ -275,6 +328,35 @@ def _cleanup_owned_staging(
         return
 
 
+def _cleanup_owned_empty_staging(
+    parent_fd: int,
+    staging_name: str,
+    identity: os.stat_result,
+) -> None:
+    try:
+        current = os.lstat(staging_name, dir_fd=parent_fd)
+        if not (
+            _same_file(identity, current)
+            and stat.S_ISDIR(identity.st_mode)
+            and stat.S_ISDIR(current.st_mode)
+            and identity.st_uid == os.geteuid()
+            and current.st_uid == os.geteuid()
+        ):
+            return
+        os.rmdir(staging_name, dir_fd=parent_fd)
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def _strict_private_directory_exists(path: Path) -> bool:
+    exists = inspect_private_directory(path, missing_ok=True)
+    if not exists:
+        return False
+    with pin_private_directory(path, tighten=False):
+        pass
+    return True
+
+
 class AuditStore:
     def __init__(
         self,
@@ -320,35 +402,31 @@ class AuditStore:
         if render_audit_markdown(parsed).encode("utf-8") != markdown_bytes:
             raise AuditStoreError("audit report Markdown is not deterministic")
 
-        _ensure_private_audits_directory(self.audits_dir)
+        _ensure_private_audits_directory(self.state_dir, self.audits_dir)
         staging_name = f".staging-{report.run_id}-{secrets.token_hex(16)}"
         staging_path = self.audits_dir / staging_name
-        with pin_private_directory(self.audits_dir) as audits:
+        with pin_private_directory(self.audits_dir, tighten=False) as audits:
             staging_fd, staging_identity = _open_created_staging(audits.fd, staging_name)
             staging_exists = True
             leaves: dict[str, os.stat_result] = {}
             try:
                 json_path = staging_path / _REPORT_JSON
                 markdown_path = staging_path / _REPORT_MARKDOWN
-                _write_private_bytes_atomic(
+                _write_and_capture_staged_leaf(
                     json_path,
                     json_bytes,
                     self.max_artifact_bytes,
-                )
-                leaves[_REPORT_JSON] = _capture_staged_leaf(
                     staging_fd,
                     _REPORT_JSON,
-                    expected_size=len(json_bytes),
+                    leaves,
                 )
-                _write_private_bytes_atomic(
+                _write_and_capture_staged_leaf(
                     markdown_path,
                     markdown_bytes,
                     self.max_artifact_bytes,
-                )
-                leaves[_REPORT_MARKDOWN] = _capture_staged_leaf(
                     staging_fd,
                     _REPORT_MARKDOWN,
-                    expected_size=len(markdown_bytes),
+                    leaves,
                 )
                 staged_json = read_private_bytes(json_path, self.max_artifact_bytes)
                 staged_markdown = read_private_bytes(markdown_path, self.max_artifact_bytes)
@@ -408,13 +486,30 @@ class AuditStore:
 
     def _read_pair(self, run_id: str) -> tuple[AuditReport, str]:
         paths = self._paths(run_id)
-        json_bytes = read_private_bytes(paths.json_path, self.max_artifact_bytes)
-        markdown_bytes = read_private_bytes(
-            paths.markdown_path,
-            self.max_artifact_bytes,
-        )
-        if json_bytes is None or markdown_bytes is None:
-            raise AuditStoreError("stored audit artifact pair is incomplete")
+        run_dir = paths.json_path.parent
+        try:
+            with (
+                pin_private_directory(self.state_dir, tighten=False) as state,
+                pin_private_directory(self.audits_dir, tighten=False) as audits,
+                pin_private_directory(run_dir, tighten=False) as run,
+            ):
+                json_bytes = read_private_bytes(
+                    paths.json_path,
+                    self.max_artifact_bytes,
+                    tighten=False,
+                )
+                markdown_bytes = read_private_bytes(
+                    paths.markdown_path,
+                    self.max_artifact_bytes,
+                    tighten=False,
+                )
+                run.validate_at(run_dir)
+                audits.validate_at(self.audits_dir)
+                state.validate_at(self.state_dir)
+        except UnsafeFileError as exc:
+            raise AuditStoreError(
+                "stored audit artifact pair is unavailable or unsafe"
+            ) from exc
         try:
             report = parse_audit_report(
                 json_bytes,
@@ -436,16 +531,22 @@ class AuditStore:
         return report, markdown
 
     def list_reports(self) -> tuple[AuditReport, ...]:
-        if not inspect_private_directory(self.audits_dir, missing_ok=True):
-            return ()
-        with pin_private_directory(self.audits_dir) as audits:
-            try:
+        try:
+            if not _strict_private_directory_exists(self.state_dir):
+                return ()
+            if not _strict_private_directory_exists(self.audits_dir):
+                return ()
+            with (
+                pin_private_directory(self.state_dir, tighten=False) as state,
+                pin_private_directory(self.audits_dir, tighten=False) as audits,
+            ):
                 names = tuple(os.listdir(audits.fd))
-            except (OSError, TypeError, ValueError) as exc:
-                raise AuditStoreError("stored audit reports could not be listed safely") from exc
-            run_ids = tuple(sorted(name for name in names if _RUN_ID.fullmatch(name)))
-            reports = tuple(self._read_pair(run_id)[0] for run_id in run_ids)
-            audits.validate_at(self.audits_dir)
+                run_ids = tuple(sorted(name for name in names if _RUN_ID.fullmatch(name)))
+                reports = tuple(self._read_pair(run_id)[0] for run_id in run_ids)
+                audits.validate_at(self.audits_dir)
+                state.validate_at(self.state_dir)
+        except (OSError, TypeError, ValueError, UnsafeFileError) as exc:
+            raise AuditStoreError("stored audit reports could not be listed safely") from exc
         return tuple(
             sorted(
                 reports,

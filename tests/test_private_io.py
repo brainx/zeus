@@ -181,6 +181,18 @@ raise SystemExit(1)
         ):
             private_io.read_private_bytes(path, 16)
 
+    def test_whole_file_read_can_reject_public_mode_without_repairing_it(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "state.bin"
+        path.write_bytes(b"state")
+        path.chmod(0o644)
+
+        with self.assertRaises(UnsafeFileError):
+            private_io.read_private_bytes(path, 16, tighten=False)
+
+        self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
+
     def test_whole_file_read_rejects_binding_replacement(self) -> None:
         private_dir = self.root / "state"
         private_dir.mkdir(mode=0o700)
@@ -425,6 +437,7 @@ raise SystemExit(1)
 
         invalid_calls = (
             lambda: private_io.read_private_bytes(path, 8, missing_ok=1),  # type: ignore[arg-type]
+            lambda: private_io.read_private_bytes(path, 8, tighten=1),  # type: ignore[arg-type]
             lambda: private_io.write_private_bytes_atomic(path, "snapshot", 8),  # type: ignore[arg-type]
             lambda: private_io.write_private_bytes_atomic(path, b"snapshot", 7),
             lambda: private_io.write_private_bytes_atomic(path, b"snapshot", 8, replace=1),  # type: ignore[arg-type]
@@ -657,6 +670,29 @@ raise SystemExit(1)
         self.assertEqual(0o755, stat.S_IMODE(ancestor.stat().st_mode))
         self.assertEqual(0o700, stat.S_IMODE(private_dir.stat().st_mode))
         self.assertEqual(0o700, stat.S_IMODE((private_dir / "nested").stat().st_mode))
+
+    def test_ensure_directory_can_reject_existing_public_mode_without_repair(self) -> None:
+        private_dir = self.root / "private"
+        private_dir.mkdir(mode=0o755)
+        private_dir.chmod(0o755)
+
+        with self.assertRaises(UnsafeFileError):
+            ensure_private_directory(private_dir, tighten_existing=False)
+
+        self.assertEqual(0o755, stat.S_IMODE(private_dir.stat().st_mode))
+
+    def test_pin_directory_can_reject_existing_public_mode_without_repair(self) -> None:
+        private_dir = self.root / "private"
+        private_dir.mkdir(mode=0o755)
+        private_dir.chmod(0o755)
+
+        with (
+            self.assertRaises(UnsafeFileError),
+            private_io.pin_private_directory(private_dir, tighten=False),
+        ):
+            pass
+
+        self.assertEqual(0o755, stat.S_IMODE(private_dir.stat().st_mode))
 
     def test_directory_link_count_is_not_restricted_to_one(self) -> None:
         private_dir = self.root / "private"
