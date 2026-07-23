@@ -253,6 +253,19 @@ raise SystemExit(1)
         self.assertEqual(1, snapshot.st_nlink)
         self.assert_no_atomic_temporary_files(path.parent)
 
+    def test_atomic_write_fchmods_temporary_created_under_restrictive_umask(self) -> None:
+        path = self.root / "state" / "snapshot.bin"
+        path.parent.mkdir(mode=0o700)
+        previous_umask = os.umask(0o777)
+        try:
+            private_io.write_private_bytes_atomic(path, b"snapshot", 32)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(b"snapshot", path.read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+        self.assert_no_atomic_temporary_files(path.parent)
+
     def test_atomic_write_refuses_existing_target_by_default(self) -> None:
         private_dir = self.root / "state"
         private_dir.mkdir(mode=0o700)

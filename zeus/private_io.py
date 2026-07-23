@@ -861,10 +861,9 @@ def _create_atomic_temporary_file(
             os.fchmod(file_fd, _FILE_MODE)
             tightened = os.fstat(file_fd)
             final = os.lstat(name, dir_fd=parent_fd)
-            _validate_private_file_snapshots(
-                (opened, current, tightened, final),
-                platform,
-            )
+            _validate_private_file_snapshots((tightened, final), platform)
+            if not _same_files((opened, current, tightened, final)):
+                raise UnsafeFileError("private temporary file changed while it was created")
             return name, file_fd, tightened
         except UnsafeFileError:
             _close_suppressing_error(file_fd)
