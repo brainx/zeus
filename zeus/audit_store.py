@@ -26,7 +26,7 @@ from zeus.private_io import (
     read_private_bytes,
 )
 from zeus.private_io import (
-    write_private_bytes_atomic as _write_private_bytes_atomic,
+    write_private_bytes_atomic_tracked as _write_private_bytes_atomic,
 )
 
 _DIRECTORY_MODE = 0o700
@@ -246,23 +246,42 @@ def _write_and_capture_staged_leaf(
     name: str,
     leaves: dict[str, os.stat_result],
 ) -> None:
-    try:
-        _write_private_bytes_atomic(path, data, max_bytes)
-        identity = _capture_staged_leaf(
+    def record_install(identity: os.stat_result) -> None:
+        leaves[name] = identity
+
+    _write_private_bytes_atomic(
+        path,
+        data,
+        max_bytes,
+        on_install=record_install,
+    )
+    installed = leaves.get(name)
+    if installed is None:
+        raise AuditStoreError("atomic audit artifact installation was not tracked")
+    current = _capture_staged_leaf(
+        staging_fd,
+        name,
+        expected_size=len(data),
+    )
+    if not _same_file(installed, current):
+        raise AuditStoreError("staged audit artifact binding changed after installation")
+
+
+def _revalidate_staged_leaves(
+    staging_fd: int,
+    leaves: dict[str, os.stat_result],
+    expected_sizes: dict[str, int],
+) -> None:
+    if leaves.keys() != expected_sizes.keys():
+        raise AuditStoreError("staged audit artifact identities are incomplete")
+    for name, expected_size in expected_sizes.items():
+        current = _capture_staged_leaf(
             staging_fd,
             name,
-            expected_size=len(data),
+            expected_size=expected_size,
         )
-    except BaseException:
-        if name not in leaves:
-            with suppress(AuditStoreError):
-                leaves[name] = _capture_staged_leaf(
-                    staging_fd,
-                    name,
-                    expected_size=len(data),
-                )
-        raise
-    leaves[name] = identity
+        if not _same_file(leaves[name], current):
+            raise AuditStoreError("staged audit artifact binding changed before publication")
 
 
 def _validate_staging_binding(
@@ -405,7 +424,10 @@ class AuditStore:
         _ensure_private_audits_directory(self.state_dir, self.audits_dir)
         staging_name = f".staging-{report.run_id}-{secrets.token_hex(16)}"
         staging_path = self.audits_dir / staging_name
-        with pin_private_directory(self.audits_dir, tighten=False) as audits:
+        with (
+            pin_private_directory(self.state_dir, tighten=False) as state,
+            pin_private_directory(self.audits_dir, tighten=False) as audits,
+        ):
             staging_fd, staging_identity = _open_created_staging(audits.fd, staging_name)
             staging_exists = True
             leaves: dict[str, os.stat_result] = {}
@@ -428,8 +450,16 @@ class AuditStore:
                     _REPORT_MARKDOWN,
                     leaves,
                 )
-                staged_json = read_private_bytes(json_path, self.max_artifact_bytes)
-                staged_markdown = read_private_bytes(markdown_path, self.max_artifact_bytes)
+                staged_json = read_private_bytes(
+                    json_path,
+                    self.max_artifact_bytes,
+                    tighten=False,
+                )
+                staged_markdown = read_private_bytes(
+                    markdown_path,
+                    self.max_artifact_bytes,
+                    tighten=False,
+                )
                 if staged_json != json_bytes or staged_markdown != markdown_bytes:
                     raise AuditStoreError("staged audit artifacts changed during validation")
                 staged_report = parse_audit_report(
@@ -449,6 +479,15 @@ class AuditStore:
                     staging_fd,
                     staging_identity,
                 )
+                _revalidate_staged_leaves(
+                    staging_fd,
+                    leaves,
+                    {
+                        _REPORT_JSON: len(json_bytes),
+                        _REPORT_MARKDOWN: len(markdown_bytes),
+                    },
+                )
+                state.validate_at(self.state_dir)
                 audits.validate_at(self.audits_dir)
                 try:
                     _rename_directory_noreplace(
@@ -472,6 +511,7 @@ class AuditStore:
                     raise AuditStoreError("installed audit report directory binding changed")
                 os.fsync(audits.fd)
                 audits.validate_at(self.audits_dir)
+                state.validate_at(self.state_dir)
             finally:
                 if staging_exists:
                     _cleanup_owned_staging(

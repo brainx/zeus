@@ -4,7 +4,7 @@ import os
 import secrets
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
@@ -1004,12 +1004,13 @@ def _validate_replacement_target_binding(
     _validate_private_file_snapshots((identity, current), platform)
 
 
-def write_private_bytes_atomic(
+def _write_private_bytes_atomic(
     path: Path,
     data: bytes,
     max_bytes: int,
     *,
-    replace: bool = False,
+    replace: bool,
+    on_install: Callable[[os.stat_result], None] | None,
 ) -> None:
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -1021,6 +1022,8 @@ def write_private_bytes_atomic(
         raise ValueError("data exceeds max_bytes")
     if not isinstance(replace, bool):
         raise TypeError("replace must be a boolean")
+    if on_install is not None and not callable(on_install):
+        raise TypeError("on_install must be callable")
     parts = _validate_path(path, file_path=True)
     platform = _require_platform()
     _require_atomic_file_operations()
@@ -1097,13 +1100,15 @@ def write_private_bytes_atomic(
             if not replace:
                 _unlink_proven_temporary_file(parent.fd, temporary_name, identity)
                 temporary_exists = False
-            _validate_atomic_target(
+            installed_identity = _validate_atomic_target(
                 parent.fd,
                 parts[-1],
                 identity,
                 platform,
                 len(data),
             )
+            if on_install is not None:
+                on_install(installed_identity)
             parent.validate_bindings()
             try:
                 os.fsync(parent.fd)
@@ -1136,6 +1141,39 @@ def write_private_bytes_atomic(
                 _close_suppressing_error(file_fd)
         if not installed:
             raise UnsafeFileError("private file was not installed")
+
+
+def write_private_bytes_atomic(
+    path: Path,
+    data: bytes,
+    max_bytes: int,
+    *,
+    replace: bool = False,
+) -> None:
+    _write_private_bytes_atomic(
+        path,
+        data,
+        max_bytes,
+        replace=replace,
+        on_install=None,
+    )
+
+
+def write_private_bytes_atomic_tracked(
+    path: Path,
+    data: bytes,
+    max_bytes: int,
+    *,
+    on_install: Callable[[os.stat_result], None],
+    replace: bool = False,
+) -> None:
+    _write_private_bytes_atomic(
+        path,
+        data,
+        max_bytes,
+        replace=replace,
+        on_install=on_install,
+    )
 
 
 def validate_private_directory(path: Path) -> None:

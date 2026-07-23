@@ -416,6 +416,33 @@ raise SystemExit(1)
         self.assertEqual(b"snapshot", path.read_bytes())
         self.assert_no_atomic_temporary_files(path.parent)
 
+    def test_tracked_atomic_write_reports_installed_identity_before_fsync_failure(
+        self,
+    ) -> None:
+        path = self.root / "state" / "snapshot.bin"
+        installed: list[os.stat_result] = []
+        real_fsync = os.fsync
+
+        def failing_parent_fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("parent fsync failed")
+            real_fsync(fd)
+
+        with (
+            patch.object(private_io.os, "fsync", side_effect=failing_parent_fsync),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.write_private_bytes_atomic_tracked(
+                path,
+                b"snapshot",
+                32,
+                on_install=installed.append,
+            )
+
+        self.assertEqual(1, len(installed))
+        self.assertEqual(path.stat().st_dev, installed[0].st_dev)
+        self.assertEqual(path.stat().st_ino, installed[0].st_ino)
+
     def test_whole_file_argument_validation_precedes_filesystem_mutation(self) -> None:
         path = self.root / "missing" / "snapshot.bin"
 

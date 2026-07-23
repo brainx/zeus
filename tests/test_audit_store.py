@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -21,7 +22,7 @@ from zeus.audit_models import (
 )
 from zeus.audit_report import REPORT_SCHEMA_VERSION, render_audit_markdown
 from zeus.audit_store import AuditStore, AuditStoreError
-from zeus.private_io import UnsafeFileError, write_private_bytes_atomic
+from zeus.private_io import UnsafeFileError, write_private_bytes_atomic_tracked
 
 
 def _report(
@@ -125,15 +126,21 @@ class AuditStoreTests(unittest.TestCase):
 
     def test_failure_before_publish_leaves_no_visible_run_and_cleans_owned_staging(self) -> None:
         run_id = "33333333333333333333333333333333"
-        real_write = write_private_bytes_atomic
+        real_write = write_private_bytes_atomic_tracked
         calls = 0
 
-        def fail_second_write(path: Path, data: bytes, max_bytes: int) -> None:
+        def fail_second_write(
+            path: Path,
+            data: bytes,
+            max_bytes: int,
+            *,
+            on_install: Callable[[os.stat_result], None],
+        ) -> None:
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise OSError("injected write failure")
-            real_write(path, data, max_bytes)
+            real_write(path, data, max_bytes, on_install=on_install)
 
         with (
             patch.object(
@@ -210,13 +217,55 @@ class AuditStoreTests(unittest.TestCase):
 
         self.assertEqual([], list((self.state_dir / "audits").iterdir()))
 
+    def test_foreign_same_name_leaf_after_writer_failure_is_not_adopted_or_removed(
+        self,
+    ) -> None:
+        run_id = "37373737373737373737373737373737"
+        foreign_path: Path | None = None
+
+        def install_foreign_then_fail(
+            path: Path,
+            data: bytes,
+            max_bytes: int,
+            *,
+            on_install: Callable[[os.stat_result], None] | None = None,
+        ) -> None:
+            del max_bytes, on_install
+            nonlocal foreign_path
+            path.write_bytes(data)
+            path.chmod(0o600)
+            foreign_path = path
+            raise UnsafeFileError("injected foreign EEXIST race")
+
+        with (
+            patch.object(
+                audit_store,
+                "_write_private_bytes_atomic",
+                side_effect=install_foreign_then_fail,
+            ),
+            self.assertRaises(UnsafeFileError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertIsNotNone(foreign_path)
+        assert foreign_path is not None
+        self.assertTrue(foreign_path.is_file())
+        self.assertEqual(0o600, stat.S_IMODE(foreign_path.stat().st_mode))
+        self.assertFalse((self.state_dir / "audits" / run_id).exists())
+
     def test_failure_cleanup_preserves_replaced_ambiguous_staging_path(self) -> None:
         run_id = "44444444444444444444444444444444"
         replacement_seen: Path | None = None
-        real_write = write_private_bytes_atomic
+        real_write = write_private_bytes_atomic_tracked
         calls = 0
 
-        def replace_staging_then_fail(path: Path, data: bytes, max_bytes: int) -> None:
+        def replace_staging_then_fail(
+            path: Path,
+            data: bytes,
+            max_bytes: int,
+            *,
+            on_install: Callable[[os.stat_result], None],
+        ) -> None:
             nonlocal calls, replacement_seen
             calls += 1
             if calls == 2:
@@ -228,7 +277,7 @@ class AuditStoreTests(unittest.TestCase):
                 marker.write_text("preserve", encoding="utf-8")
                 replacement_seen = staging
                 raise OSError("injected replacement")
-            real_write(path, data, max_bytes)
+            real_write(path, data, max_bytes, on_install=on_install)
 
         with (
             patch.object(
@@ -281,6 +330,103 @@ class AuditStoreTests(unittest.TestCase):
 
                 self.assertEqual(0o755, stat.S_IMODE(path.stat().st_mode))
                 self.assertEqual([], list(audits_dir.iterdir()))
+
+    def test_install_rejects_state_mode_drift_before_publish_without_repair(
+        self,
+    ) -> None:
+        run_id = "70707070707070707070707070707070"
+        real_validate = audit_store._validate_staging_binding
+
+        def drift_state_mode(
+            parent_fd: int,
+            staging_name: str,
+            staging_fd: int,
+            identity: os.stat_result,
+        ) -> None:
+            real_validate(parent_fd, staging_name, staging_fd, identity)
+            self.state_dir.chmod(0o755)
+
+        with (
+            patch.object(
+                audit_store,
+                "_validate_staging_binding",
+                side_effect=drift_state_mode,
+            ),
+            self.assertRaises((AuditStoreError, UnsafeFileError)),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual(0o755, stat.S_IMODE(self.state_dir.stat().st_mode))
+        self.assertFalse((self.state_dir / "audits" / run_id).exists())
+        self.assertEqual([], list((self.state_dir / "audits").iterdir()))
+
+    def test_install_rejects_state_binding_drift_before_publish(self) -> None:
+        run_id = "71717171717171717171717171717171"
+        real_validate = audit_store._validate_staging_binding
+        displaced = self.root / "state-displaced"
+
+        def replace_state_binding(
+            parent_fd: int,
+            staging_name: str,
+            staging_fd: int,
+            identity: os.stat_result,
+        ) -> None:
+            real_validate(parent_fd, staging_name, staging_fd, identity)
+            self.state_dir.rename(displaced)
+            self.state_dir.mkdir(mode=0o700)
+            (self.state_dir / "audits").mkdir(mode=0o700)
+
+        with (
+            patch.object(
+                audit_store,
+                "_validate_staging_binding",
+                side_effect=replace_state_binding,
+            ),
+            self.assertRaises((AuditStoreError, UnsafeFileError)),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertFalse((self.state_dir / "audits" / run_id).exists())
+        self.assertEqual([], list((self.state_dir / "audits").iterdir()))
+        self.assertEqual([], list((displaced / "audits").iterdir()))
+
+    def test_install_rejects_staged_public_mode_before_publish_without_repair(
+        self,
+    ) -> None:
+        run_id = "72727272727272727272727272727272"
+        real_validate = audit_store._validate_staging_binding
+        drifted_path: Path | None = None
+
+        def drift_staged_mode(
+            parent_fd: int,
+            staging_name: str,
+            staging_fd: int,
+            identity: os.stat_result,
+        ) -> None:
+            nonlocal drifted_path
+            real_validate(parent_fd, staging_name, staging_fd, identity)
+            descriptor = os.open("report.json", os.O_RDONLY, dir_fd=staging_fd)
+            try:
+                os.fchmod(descriptor, 0o644)
+            finally:
+                os.close(descriptor)
+            drifted_path = self.state_dir / "audits" / staging_name / "report.json"
+
+        with (
+            patch.object(
+                audit_store,
+                "_validate_staging_binding",
+                side_effect=drift_staged_mode,
+            ),
+            self.assertRaises((AuditStoreError, UnsafeFileError)),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertIsNotNone(drifted_path)
+        assert drifted_path is not None
+        self.assertTrue(drifted_path.is_file())
+        self.assertEqual(0o644, stat.S_IMODE(drifted_path.stat().st_mode))
+        self.assertFalse((self.state_dir / "audits" / run_id).exists())
 
     def test_reads_reject_existing_insecure_hierarchy_without_repair(self) -> None:
         run_id = "68686868686868686868686868686868"
