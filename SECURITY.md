@@ -24,6 +24,18 @@ Do not open public issues for vulnerabilities involving secrets, process control
   a protocol boundary, not isolation from arbitrary processes running as the same
   operating-system user: same-UID writers that modify marker or lock files without
   honoring the protocol are outside the supported trust model.
+- Repository audits are report-only and analyze the exact committed `HEAD`, never
+  dirty or untracked worktree content. The audit command does not remediate,
+  schedule work, mutate source, or perform cross-host coordination.
+- Audit repository commands run in a prevalidated Docker container with network
+  mode `none`, no host bind mounts, an unprivileged UID, dropped capabilities,
+  a read-only root filesystem, and bounded tmpfs storage. The audit path is
+  available only when the exact Hermes Agent 0.19.0 executable and a preloaded
+  digest-qualified image pass preflight; it has no local-terminal fallback.
+- Hermes is a host process for the operator-selected provider. `zeus audit
+  doctor` discloses that provider and model, and an audit can send selected
+  committed-source excerpts and bounded terminal output to it. Do not use the
+  audit feature when that disclosure is incompatible with the provider policy.
 
 ## Operational Guidance
 

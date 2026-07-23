@@ -569,6 +569,91 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("Repository readiness check passed.", script)
         self.assertIn("internal planning path must not be published", script)
 
+    def test_repository_audit_contract_is_documented_and_packaged(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        security = Path("SECURITY.md").read_text(encoding="utf-8")
+        changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+        audit = Path("docs/AUDIT.md").read_text(encoding="utf-8")
+        architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
+        operations = Path("docs/OPERATIONS.md").read_text(encoding="utf-8")
+        compatibility = Path("docs/COMPATIBILITY.md").read_text(encoding="utf-8")
+        roadmap = Path("docs/ROADMAP.md").read_text(encoding="utf-8")
+        repo_check = Path("scripts/repo_check.sh").read_text(encoding="utf-8")
+        pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertIn("docs/AUDIT.md", repo_check)
+        self.assertIn("zeus/bundled_skills/audit/SKILL.md", repo_check)
+        self.assertIn('"zeus.bundled_skills.audit" = ["SKILL.md"]', pyproject)
+        self.assertIn("Status: implemented.", audit)
+        self.assertIn("environment-dependent release verification", audit)
+
+        readme_audit = readme.split("## Repository Audit", 1)[1].split("\n## ", 1)[0]
+        readiness_docs = readme_audit.split("### Check readiness", 1)[1].split(
+            "### Run an audit", 1
+        )[0]
+        run_docs = readme_audit.split("### Run an audit", 1)[1].split("### Read stored reports", 1)[
+            0
+        ]
+        stored_report_docs = readme_audit.split("### Read stored reports", 1)[1]
+        self.assertIn("zeus audit doctor", readiness_docs)
+        self.assertNotIn("zeus audit run", readiness_docs)
+        self.assertIn("zeus audit run", run_docs)
+        for prerequisite in (
+            "Docker",
+            "Hermes Agent 0.19.0",
+            "provider credentials",
+            "preloaded",
+        ):
+            with self.subTest(run_prerequisite=prerequisite):
+                self.assertIn(prerequisite, readiness_docs + run_docs)
+        self.assertIn("zeus audit list", stored_report_docs)
+        self.assertIn("zeus audit show <run-id>", stored_report_docs)
+        self.assertNotIn("zeus audit run", stored_report_docs)
+        for runtime_check in ("Docker", "Hermes", "credential", "image"):
+            with self.subTest(stored_report_runtime_check=runtime_check):
+                self.assertRegex(stored_report_docs, rf"do not invoke[^.]*{runtime_check}")
+
+        for command in (
+            "zeus audit doctor [--json]",
+            "zeus audit run [--json]",
+            "zeus audit list [--json]",
+            "zeus audit show <run-id> [--json]",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, audit)
+                self.assertIn(command.split(" [", 1)[0], readme)
+
+        for text in (readme, security, audit, architecture, operations, compatibility, roadmap):
+            with self.subTest(document=text[:24]):
+                self.assertIn("committed `HEAD`", text)
+                self.assertIn("Hermes Agent 0.19.0", text)
+                self.assertIn("cross-host", text)
+
+        self.assertIn("preloaded", readme)
+        self.assertIn("provider", readme.lower())
+        self.assertIn("network mode `none`", " ".join(security.split()))
+        self.assertIn("Linux Docker isolation", " ".join(compatibility.split()))
+        self.assertIn("ZEUS_RUN_DOCKER_ISOLATION=1", compatibility)
+        self.assertIn("does not establish runtime isolation", compatibility)
+        self.assertIn("report.json", operations)
+        self.assertIn("report.md", operations)
+        self.assertIn("one concurrent audit per repository", audit)
+        self.assertIn("never remediates", audit)
+        self.assertIn("does not schedule", audit)
+        self.assertIn("Human\noutput shows run ID, status, and target commit.", audit)
+        self.assertIn("fails during pre-run validation\nwithout creating an audit artifact", audit)
+        self.assertIn("Cleanup attempts to stop run-owned processes", operations)
+        self.assertIn("$ZEUS_STATE_DIR/audit/runs/<run-id>", audit)
+        self.assertIn("no stale-resource scanner or cleanup command", audit)
+        self.assertIn("explicit operator\ninspection and removal", audit)
+        self.assertNotIn("stale cleanup", audit)
+        self.assertEqual(1, audit.count("- `check`: the name of a check present in the report"))
+        self.assertEqual(
+            1,
+            audit.count("The test also inspects the effective container network mode"),
+        )
+        self.assertIn("repository audit", changelog.lower())
+
     def test_readme_has_informative_github_landing_sections(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
 

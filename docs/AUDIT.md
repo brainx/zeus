@@ -1,13 +1,20 @@
 # Zeus Repository Audit
 
-Status: approved design; not yet implemented.
+Status: implemented.
+
+Real Linux Docker isolation and pinned-Hermes broker gates remain
+environment-dependent release verification. This status does not imply that
+either runtime gate ran on a particular developer machine.
 
 ## Purpose
 
-Zeus will provide a host-local, report-only repository audit. The operator runs
+Zeus provides a host-local, report-only repository audit. The operator runs
 one command from a Git worktree, Zeus analyzes the committed `HEAD` in an
 isolated disposable environment, and Zeus stores a bounded report under its
 existing state directory.
+
+The audit runner accepts only Hermes Agent 0.19.0 and a preloaded,
+digest-qualified Docker image.
 
 The first version is intentionally narrow:
 
@@ -19,6 +26,8 @@ The first version is intentionally narrow:
 - It does not add a general plugin platform or enable template-provided skills.
 - It does not add an HTTP API, a SQLite migration, or cross-host coordination.
 - It does not audit dirty or untracked worktree content.
+- It never remediates findings and does not schedule audit runs; an operator
+  explicitly invokes one of the four local audit commands.
 
 ## Chosen Architecture
 
@@ -319,24 +328,33 @@ zeus audit list [--json]
 zeus audit show <run-id> [--json]
 ```
 
-`audit doctor` performs all non-model preflight checks. It does not create a run
-or download dependencies.
+All four commands discover the containing Git repository and its Zeus state
+context. `audit doctor` performs all non-model readiness checks. It reports
+missing Docker, pinned Hermes, credential, or image prerequisites without
+creating a run or downloading dependencies.
 
-`audit run` audits the repository containing the current directory. Human
+`audit run` requires those runtime prerequisites and audits the repository
+containing the current directory. Human
 output contains a concise status, finding counts, target commit, and relative
 report path. JSON output emits the final report envelope. Exit status is zero
 only for `completed`; `partial`, `blocked`, `failed`, and `cancelled` return
 nonzero.
 
-If the effective state directory is inside the worktree and is not ignored,
-audit artifacts can appear as new untracked state paths. Zeus does not modify
-`.gitignore` or `.git/info/exclude`; it reports this condition during preflight.
+If the effective state directory is inside the worktree, it must be both
+ignored and untracked. Otherwise `audit run` fails during pre-run validation
+without creating an audit artifact. Zeus does not modify `.gitignore` or
+`.git/info/exclude`.
 
 `audit list` reads validated report envelopes and sorts newest first. Human
-output shows run ID, status, target commit, time, and severity counts.
+output shows run ID, status, and target commit. `--json` emits the complete
+validated report envelopes, including timestamps and severity counts.
 
 `audit show` validates the run ID before accessing storage. Human output prints
 the generated Markdown report; `--json` prints the JSON report.
+
+`audit list` and `audit show` do not invoke Docker, Hermes, provider credential,
+or image readiness checks. They read stored reports in the discovered
+repository and state context.
 
 No audit command initializes `StateStore`, changes SQLite, starts a gateway, or
 uses the public bot lifecycle facade.
@@ -355,7 +373,7 @@ settings are loaded without repository `.env` input.
    `$ZEUS_STATE_DIR/locks/audits/<repository-id>.lock`. A concurrent run for the
    same repository fails without creating or changing a run.
 3. Create a private control directory under
-   `$ZEUS_STATE_DIR/audit/workspaces/<run-id>`, where the run ID is UUID hex.
+   `$ZEUS_STATE_DIR/audit/runs/<run-id>`, where the run ID is UUID hex.
 4. Re-resolve and validate the worktree, Git directory, and exact
    `HEAD^{commit}` under the lock, then record whether tracked, staged, or
    untracked changes exist. File names and contents are not copied into
@@ -374,15 +392,15 @@ settings are loaded without repository `.env` input.
 10. Terminate remaining run-owned processes, remove the exact run-owned
     container if present, and attempt to destroy the snapshot and ephemeral
     Hermes home.
-11. Build authoritative run metadata after cleanup, including any cleanup
+11. Build final run metadata after cleanup, including any cleanup
     failure, and render `report.md` from `report.json`.
 12. Atomically install both files in the final run directory and release the
     lock.
 
-On the next invocation, Zeus may remove stale staging directories or containers
-only when their private metadata and unique Zeus audit labels identify them as
-expired audit-owned resources. It never deletes an unlabeled or ambiguous
-resource.
+Zeus has no stale-resource scanner or cleanup command. Abrupt host termination
+or an ambiguous ownership boundary can leave private staging, control, or
+container remnants. Zeus retains those remnants for explicit operator
+inspection and removal rather than deleting them on a later invocation.
 
 ## Report Contract
 
@@ -409,18 +427,22 @@ The JSON envelope has schema version 1 and contains:
 - `run_id`;
 - an opaque repository ID, never an absolute repository path;
 - `status`: `completed`, `partial`, `blocked`, `failed`, or `cancelled`;
-- authoritative metadata: Zeus, Hermes, skill, and image versions; target
-  commit; UTC start and finish times; termination reason; model and provider;
-  and whether worktree changes were excluded;
+- deterministic or configured metadata: Zeus version, required Hermes version,
+  skill version, configured image reference, target commit, UTC start and
+  finish times, termination reason, model and provider, and whether worktree
+  changes were excluded;
 - bounded summary text;
 - checks run and skipped, with name, disposition, duration, and redacted
   observation but no raw command output;
 - findings;
 - severity counts and report completeness.
 
-Fields unavailable at the point a run is blocked are `null` rather than
-guessed. In particular, target commit, Hermes version, image digest, provider,
-and model become required only after their corresponding preflight succeeds.
+Blocked reports retain the discovered target commit and the required or
+configured Hermes, image, provider, and model metadata. Individual doctor
+checks establish whether the corresponding runtime prerequisite was observed.
+These metadata entries are not assertions that an unavailable Hermes binary or
+image was inspected successfully. Provider and model remain `null` only when
+they are omitted from configuration.
 
 Each final finding receives a unique Zeus-generated ID and has:
 
@@ -466,8 +488,8 @@ Status classification is authoritative Zeus behavior:
 A process timeout sends termination to the audit process group, waits a bounded
 grace period, then escalates only against the exact run-owned processes. Cleanup
 failure is recorded and makes an otherwise complete run partial. Abrupt host
-termination may leave private staging state, which the next invocation handles
-through the ownership rules above.
+termination can leave private remnants; Zeus retains them for explicit operator
+inspection and removal.
 
 No failure path fabricates a complete report, mutates an older report, falls
 back to host-local command execution, enables network access, or automatically
@@ -485,8 +507,11 @@ The feature is additive and host-local:
 - Hermes bot profiles, template schema, renderer behavior, and lifecycle
   ordering remain unchanged.
 - Runtime Python dependencies remain standard-library only.
-- Git, the supported Hermes release, Docker, and a preloaded immutable audit
-  image are external runtime prerequisites for audit commands only.
+- Git repository discovery applies to every audit command. The supported Hermes
+  release, Docker, configured provider credentials, and a preloaded immutable
+  audit image are external runtime prerequisites for `audit run` only;
+  `audit doctor` checks readiness, while `audit list` and `audit show` do not
+  invoke those runtime checks.
 - The existing generic Hermes adapter is not reused because it loads complete
   profile environments, permits generic passthrough, and buffers unbounded
   output. Audit subprocess construction has its own strict environment and
@@ -514,7 +539,7 @@ Unit tests cover:
   handling of unsupported Hermes Docker behavior;
 - report schema validation, evidence verification, redaction, size limits,
   deterministic Markdown, and atomic installation;
-- run locking, status classification, cancellation, timeout, and stale cleanup;
+- run locking, status classification, cancellation, and timeout;
 - CLI human and JSON output plus exit behavior;
 - installed-wheel access to the bundled skill.
 
@@ -549,13 +574,12 @@ the Docker isolation test passes on Linux, the wheel contains and can load the
 skill, repository checks pass, and no existing CLI, API, schema, marker, or
 lifecycle contract changes.
 
-## Scheduling Boundary
+## No Scheduling or Remediation
 
-Scheduling is a separate follow-up phase. A host-local systemd timer or launchd
-job may invoke the same `zeus audit run` command and consume its exit status.
-Scheduled execution receives no additional tools, credentials, network,
-authority, or report behavior.
+Audit version 1 does not schedule work or add timer, service, API, database,
+or cross-host control-plane behavior. It only produces local reports when an
+operator invokes `zeus audit run`. It never remediates findings, opens issues,
+creates branches, commits, pushes, deploys, publishes, or sends notifications.
 
-The first version does not send notifications, open issues, create branches,
-commit, push, deploy, or remediate findings. Cross-host placement, approvals,
-rollout policy, and aggregation remain outside Zeus.
+Cross-host placement, approvals, rollout policy, and aggregation remain outside
+Zeus.

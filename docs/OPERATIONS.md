@@ -496,3 +496,56 @@ Mirror failures do not erase the SQLite event or fail an already committed
 transition, and the v2-to-v3 migration does not import this intentionally
 incomplete JSONL file. Entries exclude environment maps and redact secret-like
 fields before writing.
+
+## Repository Audit
+
+Repository audit is a manually invoked, report-only review of the exact
+committed `HEAD`; dirty and untracked worktree content is excluded. It is not a
+replacement for the lifecycle `audit.jsonl` mirror above. Start with:
+
+```bash
+zeus audit doctor
+```
+
+Every audit command discovers the containing Git repository and state context.
+`audit doctor` is the non-mutating readiness preflight: it reports the selected
+provider and model and whether Docker, the exact Hermes Agent 0.19.0 executable,
+configured credentials, and the preloaded digest-qualified image are ready. It
+does not create a run or download dependencies.
+
+Only `audit run` requires those runtime prerequisites:
+
+```bash
+zeus audit run
+```
+
+Running an audit authorizes those selected
+committed-source excerpts and bounded terminal output to be sent to that
+provider; provider-side retention and the host Hermes process are not isolated
+by the repository-command container.
+
+`audit run` reports status, run ID, target commit, severity counts, and the
+relative report path. Only `completed` exits successfully; `partial`,
+`blocked`, `failed`, and `cancelled` exit nonzero. Reports are installed as
+`$ZEUS_STATE_DIR/audits/<run-id>/report.json` and `report.md`, under a mode
+`0700` run directory with mode `0600` files. One concurrent audit is permitted
+per repository. Cleanup attempts to stop run-owned processes, remove the exact
+labelled container, and remove disposable snapshot, control, and Hermes-home
+state. Any cleanup failure is recorded and makes an otherwise complete report
+partial.
+
+Read stored reports with:
+
+```bash
+zeus audit list
+zeus audit show <run-id>
+```
+
+These commands retain repository and state discovery but do not invoke Docker,
+Hermes, provider credential, or image readiness checks.
+
+The Docker command container has network mode `none`, no host bind mounts, an
+unprivileged identity, read-only root, and fixed CPU, memory, PID, tmpfs,
+output, and deadline ceilings. The feature does not remediate findings,
+schedule audits, alter lifecycle state, or coordinate cross-host work. See
+[AUDIT.md](AUDIT.md) for its complete configuration and resource contract.

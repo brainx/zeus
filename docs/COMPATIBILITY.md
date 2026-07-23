@@ -78,6 +78,29 @@ check still uses whichever `hermes` executable is installed on `PATH` unless
 evidence. Passing the pinned baseline does not establish compatibility with every
 Hermes release or optional integration.
 
+## Repository audit boundary
+
+Every audit command discovers a Git repository and its Zeus state context.
+`zeus audit run` additionally requires the exact Hermes Agent 0.19.0 release,
+Docker, configured provider credentials, and a preloaded digest-qualified audit
+image. `zeus audit doctor` checks that readiness and reports the selected
+provider and model. `zeus audit list` and `zeus audit show` read stored reports
+without invoking those runtime checks. A run may send selected committed
+`HEAD` source excerpts and bounded terminal output to the provider; it does not
+establish provider retention guarantees or network isolation for the host
+Hermes process.
+
+The repository-command container is admitted only after Zeus validates network
+mode `none`, no host bind mounts, an unprivileged UID, dropped capabilities,
+read-only root, bounded tmpfs, and the pinned image. The real Linux Docker
+isolation gate is deliberately opt-in: set `ZEUS_RUN_DOCKER_ISOLATION=1` and
+`ZEUS_AUDIT_TEST_IMAGE` on a Linux Docker host to execute it. A skipped gate,
+including when Docker is unavailable, does not establish runtime isolation.
+
+Audit always examines the exact committed `HEAD`, not dirty or untracked
+content. It is report-only: it does not remediate, schedule work, or coordinate
+cross-host work.
+
 ## Updating this policy
 
 Update this file in the same change that adds or removes a CI runner, Python

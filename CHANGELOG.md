@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added the host-local, report-only repository audit: exact committed `HEAD`
+  snapshots, a private packaged audit skill, strict Hermes Agent 0.19.0 and
+  preloaded digest-image prerequisites, bounded private reports, and
+  fail-closed Docker broker isolation. The feature does not remediate,
+  schedule, or coordinate across hosts.
 - Added descriptive CLI help and a state-free `zeus --version` command backed by the package
   version.
 - Required future release tags and their referenced commits to be signed and GitHub-verified

@@ -14,6 +14,10 @@ profiles, processes, lifecycle safety, and reconciliation evidence on one host.
 - Credential-free fake-Hermes demo, hash-locked real-Hermes CI, and manual
   real-Hermes verification scripts.
 - Wheel builds, installed-wheel smoke checks, and GitHub release artifacts.
+- Host-local repository audits of committed `HEAD` with a packaged skill,
+  Hermes Agent 0.19.0 compatibility gate, preloaded Docker image, bounded
+  private reports, cleanup, and fail-closed isolation controls. Audits are
+  report-only: they do not remediate or schedule work.
 
 ## Near term
 
@@ -32,6 +36,7 @@ profiles, processes, lifecycle safety, and reconciliation evidence on one host.
 ## Out of scope
 
 The out-of-scope responsibilities are cross-host placement, distributed
-approvals, fleet rollout policy, and control-plane ownership. They belong to
+approvals, fleet rollout policy, audit scheduling or remediation, and
+control-plane ownership. They belong to
 [Olymp](https://github.com/brainx/olymp), not Zeus. Zeus will keep a narrow
 host-local API and durable evidence boundary that Olymp can consume.

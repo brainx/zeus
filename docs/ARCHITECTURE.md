@@ -55,6 +55,27 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.supervisor`: Public lifecycle facade, locks, durable intent transitions, and audit ordering.
 - `zeus.api`: Local HTTP routes and compatibility facade.
 - `zeus.cli`: Operator CLI.
+- `zeus.audit_*`: Native, report-only audit components for committed `HEAD`
+  snapshots, bounded report storage, an ephemeral Hermes profile, and the
+  prevalidated Docker broker. They do not use `StateStore`, lifecycle APIs,
+  SQLite migrations, scheduling, remediation, or cross-host coordination.
+
+## Repository Audit Boundary
+
+Repository audit is a host-local command path with four actions: doctor, run,
+list, and show. It materializes the exact committed `HEAD`, never a dirty or
+untracked worktree. `AuditService` starts before normal service construction,
+loads settings without repository `.env`, and stores only private report
+artifacts. The packaged `zeus.bundled_skills.audit` instruction is the sole
+audit skill; general skill loading remains unavailable.
+
+The audit path accepts only Hermes Agent 0.19.0 and an already preloaded,
+digest-qualified Docker image. A broker seals one Docker container with network
+mode `none`, no host mounts, fixed resource ceilings, and an unprivileged
+command identity before Hermes can execute repository commands. Hermes is a
+host process solely for the selected provider, so provider and model are
+reported and selected committed-source excerpts can leave the host. Audit does
+not remediate, schedule, or coordinate across hosts.
 - `zeus.doctor`: Readiness diagnostics.
 
 ## SQLite Durability

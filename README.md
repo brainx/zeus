@@ -46,6 +46,61 @@ cross-host coordination, rollout policy, and approvals. Zeus deliberately does n
 cluster-wide placement or rollout decisions; Olymp can consume Zeus' local API and persisted
 run summaries at that boundary.
 
+## Repository Audit
+
+`zeus audit` is a report-only, host-local review of the exact committed `HEAD`.
+It never reads dirty or untracked worktree content, and it does not edit,
+remediate, commit, push, schedule, deploy, notify, or coordinate across hosts.
+Cross-host policy remains outside Zeus.
+
+All four audit commands first discover the containing Git repository and its
+Zeus state context.
+
+### Check readiness
+
+Run the non-mutating readiness preflight:
+
+```bash
+zeus audit doctor
+```
+
+`audit doctor` reports whether Docker, the exact Hermes Agent 0.19.0 executable,
+configured provider credentials, and the preloaded digest-qualified image are
+ready. It also discloses the configured provider and model, creates no run, and
+downloads nothing.
+
+### Run an audit
+
+Only `audit run` requires those runtime prerequisites. Zeus never pulls the
+image.
+
+```bash
+zeus audit run
+```
+
+An audit sends
+the prompt, selected committed-source excerpts, and bounded terminal output to
+that provider; it does not claim provider-side retention or network isolation.
+Repository commands run only in a prevalidated Docker container with network
+disabled, while Hermes remains a host process for the selected provider.
+
+`audit run` prints status, run ID, target commit, severity counts, and the
+relative Markdown-report path; completed is the only successful audit status.
+
+### Read stored reports
+
+```bash
+zeus audit list
+zeus audit show <run-id>
+```
+
+`audit list` and `audit show` read existing private reports in the discovered
+repository and state context. They do not invoke Docker, Hermes, provider
+credential, or image readiness checks. Reports are stored as `report.json` and
+`report.md` under `$ZEUS_STATE_DIR/audits/<run-id>/`. See
+[the audit contract](docs/AUDIT.md) for configuration, ceilings, cleanup, and
+compatibility constraints.
+
 ## Quick Start
 
 ### 1. Credential-free offline demo

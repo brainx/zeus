@@ -29,6 +29,7 @@ pyproject.toml
 .github/ISSUE_TEMPLATE/config.yml
 .github/pull_request_template.md
 docs/ARCHITECTURE.md
+docs/AUDIT.md
 docs/API.md
 docs/TEMPLATE_AUTHORING.md
 docs/REAL_HERMES_VERIFICATION.md
@@ -66,6 +67,9 @@ zeus/bundled_templates/gateway-operator.toml
 zeus/bundled_templates/log-triage-bot.toml
 zeus/bundled_templates/research-bot.toml
 zeus/bundled_templates/support-gateway.toml
+zeus/bundled_skills/__init__.py
+zeus/bundled_skills/audit/__init__.py
+zeus/bundled_skills/audit/SKILL.md
 "
 
 for file in $required_files; do
