@@ -58,6 +58,7 @@ version = {attr = "zeus.__version__"}
 
 [tool.setuptools.package-data]
 "zeus.bundled_templates" = ["*.toml"]
+"zeus.bundled_skills.audit" = ["SKILL.md"]
 
 [tool.ruff]
 target-version = "py311"

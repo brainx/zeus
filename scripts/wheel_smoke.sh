@@ -77,6 +77,10 @@ case "$module_path" in
   "$tmp_dir"/venv/*) ;;
   *) fail "zeus imported outside the isolated virtual environment: $module_path" ;;
 esac
+[ "$($venv_python -c 'from importlib.resources import files; print(files("zeus.bundled_skills.audit").joinpath("SKILL.md").is_file())')" = "True" ] ||
+  fail "installed wheel is missing the bundled audit skill"
+[ "$($venv_python -c 'from zeus.audit_profile import AUDIT_SKILL_VERSION, load_audit_skill; print(f"version: {AUDIT_SKILL_VERSION}" in load_audit_skill())')" = "True" ] ||
+  fail "installed wheel cannot load the bundled audit skill"
 [ ! -e "$state_dir" ] || fail "help or version checks created runtime state"
 
 "$venv_python" -m pip check

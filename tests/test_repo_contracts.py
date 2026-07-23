@@ -173,6 +173,10 @@ class RepoContractTests(unittest.TestCase):
             "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
+            "zeus/bundled_skills/__init__.py",
+            "zeus/bundled_skills/audit/__init__.py",
+            "zeus/bundled_skills/audit/SKILL.md",
+            "zeus/audit_profile.py",
             "zeus/bundled_templates/__init__.py",
             "zeus/bundled_templates/coding-bot.toml",
             "zeus/bundled_templates/deepseek-coding-bot.toml",
@@ -941,6 +945,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertNotIn('version = "0.1.3"', pyproject)
         self.assertIn("[tool.setuptools.package-data]", pyproject)
         self.assertIn('"zeus.bundled_templates" = ["*.toml"]', pyproject)
+        self.assertIn('"zeus.bundled_skills.audit" = ["SKILL.md"]', pyproject)
         self.assertIn("[tool.ruff]", pyproject)
         self.assertIn("[tool.mypy]", pyproject)
         self.assertIn("[tool.bandit]", pyproject)
