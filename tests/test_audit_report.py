@@ -681,9 +681,7 @@ class AuditReportTests(unittest.TestCase):
                     )
 
         with self.assertRaises(AuditReportError):
-            serialize_audit_report(
-                replace(report, checks=tuple(reversed(report.checks)))
-            )
+            serialize_audit_report(replace(report, checks=tuple(reversed(report.checks))))
         with self.assertRaises(AuditReportError):
             serialize_audit_report(
                 replace(

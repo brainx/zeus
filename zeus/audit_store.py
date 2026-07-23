@@ -174,9 +174,7 @@ def _open_created_staging(
             created = os.lstat(staging_name, dir_fd=parent_fd)
             directory_fd = os.open(staging_name, _directory_flags(), dir_fd=parent_fd)
         except (OSError, TypeError, ValueError) as exc:
-            raise AuditStoreError(
-                "private audit staging directory could not be created"
-            ) from exc
+            raise AuditStoreError("private audit staging directory could not be created") from exc
         os.fchmod(directory_fd, _DIRECTORY_MODE)
         opened = os.fstat(directory_fd)
         current = os.lstat(staging_name, dir_fd=parent_fd)
@@ -468,8 +466,7 @@ class AuditStore:
                 )
                 if (
                     staged_report.run_id != report.run_id
-                    or render_audit_markdown(staged_report).encode("utf-8")
-                    != staged_markdown
+                    or render_audit_markdown(staged_report).encode("utf-8") != staged_markdown
                 ):
                     raise AuditStoreError("staged audit artifact pair is inconsistent")
                 os.fsync(staging_fd)
@@ -547,9 +544,7 @@ class AuditStore:
                 audits.validate_at(self.audits_dir)
                 state.validate_at(self.state_dir)
         except UnsafeFileError as exc:
-            raise AuditStoreError(
-                "stored audit artifact pair is unavailable or unsafe"
-            ) from exc
+            raise AuditStoreError("stored audit artifact pair is unavailable or unsafe") from exc
         try:
             report = parse_audit_report(
                 json_bytes,

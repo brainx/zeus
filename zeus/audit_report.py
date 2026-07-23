@@ -46,13 +46,9 @@ _FINDING_FIELDS = frozenset(
         "verification",
     }
 )
-_SOURCE_EVIDENCE_FIELDS = frozenset(
-    {"type", "path", "start_line", "end_line", "observation"}
-)
+_SOURCE_EVIDENCE_FIELDS = frozenset({"type", "path", "start_line", "end_line", "observation"})
 _CHECK_EVIDENCE_FIELDS = frozenset({"type", "check_name", "observation"})
-_REPOSITORY_EVIDENCE_FIELDS = frozenset(
-    {"type", "observation", "inspection_method"}
-)
+_REPOSITORY_EVIDENCE_FIELDS = frozenset({"type", "observation", "inspection_method"})
 _REPORT_FIELDS = frozenset(
     {
         "schema_version",
@@ -87,9 +83,7 @@ _CHECK_FIELDS = frozenset({"name", "disposition", "duration_seconds", "observati
 _SKIPPED_CONTENT_FIELDS = frozenset({"path", "reason"})
 _STORED_FINDING_FIELDS = _FINDING_FIELDS | {"finding_id"}
 _COUNTS_FIELDS = frozenset({"critical", "high", "medium", "low", "note"})
-_COMPLETENESS_FIELDS = frozenset(
-    {"complete", "rejected_findings", "truncated_findings", "reasons"}
-)
+_COMPLETENESS_FIELDS = frozenset({"complete", "rejected_findings", "truncated_findings", "reasons"})
 _SEVERITY_ORDER = {
     AuditSeverity.critical: 0,
     AuditSeverity.high: 1,
@@ -657,9 +651,7 @@ def build_audit_report(
         "truncated_findings",
     )
     safe_run_id, run_id_truncated = _sanitize_report_text(run_id, "run_id")
-    safe_repository_id, repository_truncated = _sanitize_report_text(
-        repository_id, "repository_id"
-    )
+    safe_repository_id, repository_truncated = _sanitize_report_text(repository_id, "repository_id")
     safe_metadata, metadata_truncated = _sanitize_metadata(metadata)
     summary, summary_truncated = _sanitize_report_text(model_result.summary, "summary")
 
@@ -688,9 +680,7 @@ def build_audit_report(
     skipped_truncated = False
     for skipped in skipped_content:
         path, path_truncated = _sanitize_report_text(skipped.path, "skipped content path")
-        reason, reason_truncated = _sanitize_report_text(
-            skipped.reason, "skipped content reason"
-        )
+        reason, reason_truncated = _sanitize_report_text(skipped.reason, "skipped content reason")
         safe_skipped.append(replace(skipped, path=path, reason=reason))
         skipped_truncated = skipped_truncated or path_truncated or reason_truncated
     safe_skipped.sort(key=lambda skipped: (skipped.path, skipped.reason))
@@ -706,9 +696,7 @@ def build_audit_report(
     reasons: list[str] = []
     reasons_truncated = False
     for reason in model_result.completeness.reasons:
-        safe_reason, reason_truncated = _sanitize_report_text(
-            reason, "completeness reason"
-        )
+        safe_reason, reason_truncated = _sanitize_report_text(reason, "completeness reason")
         if safe_reason in reasons:
             _error("completeness reasons must be unique")
         reasons.append(safe_reason)
@@ -822,8 +810,7 @@ def _report_value(report: AuditReport) -> dict[str, object]:
             for check in report.checks
         ],
         "skipped_content": [
-            {"path": skipped.path, "reason": skipped.reason}
-            for skipped in report.skipped_content
+            {"path": skipped.path, "reason": skipped.reason} for skipped in report.skipped_content
         ],
         "findings": [
             {
@@ -899,14 +886,10 @@ def _validate_report_invariants(report: AuditReport) -> None:
                 if type(evidence.start_line) is not int or evidence.start_line < 1:
                     _error("source evidence start_line must be a positive integer")
                 if evidence.end_line is not None and (
-                    type(evidence.end_line) is not int
-                    or evidence.end_line < evidence.start_line
+                    type(evidence.end_line) is not int or evidence.end_line < evidence.start_line
                 ):
                     _error("source evidence end_line must not precede start_line")
-            elif (
-                isinstance(evidence, CheckEvidence)
-                and evidence.check_name not in check_names
-            ):
+            elif isinstance(evidence, CheckEvidence) and evidence.check_name not in check_names:
                 _error("check evidence must reference a recorded check")
 
 
@@ -975,13 +958,9 @@ def _parse_check(value: object) -> AuditCheck:
     check = _exact_object(value, _CHECK_FIELDS, "report check")
     return AuditCheck(
         name=_stored_text(check["name"], "check name"),
-        disposition=_enum_value(
-            CheckDisposition, check["disposition"], "check disposition"
-        ),
+        disposition=_enum_value(CheckDisposition, check["disposition"], "check disposition"),
         duration_seconds=_check_duration_seconds(check["duration_seconds"]),
-        observation=_stored_text(
-            check["observation"], "check observation", allow_empty=True
-        ),
+        observation=_stored_text(check["observation"], "check observation", allow_empty=True),
     )
 
 
@@ -1003,9 +982,7 @@ def _parse_stored_evidence(value: object) -> AuditEvidence:
         start_line = _strict_int(source["start_line"], "source start_line", minimum=1)
         end_value = source["end_line"]
         end_line = (
-            None
-            if end_value is None
-            else _strict_int(end_value, "source end_line", minimum=1)
+            None if end_value is None else _strict_int(end_value, "source end_line", minimum=1)
         )
         if end_line is not None and end_line < start_line:
             _error("source end_line must not precede start_line")
@@ -1028,9 +1005,7 @@ def _parse_stored_evidence(value: object) -> AuditEvidence:
             "stored repository evidence",
         )
         return RepositoryEvidence(
-            observation=_stored_text(
-                repository["observation"], "repository observation"
-            ),
+            observation=_stored_text(repository["observation"], "repository observation"),
             inspection_method=_stored_text(
                 repository["inspection_method"], "repository inspection_method"
             ),
@@ -1047,9 +1022,7 @@ def _parse_stored_finding(value: object) -> AuditFinding:
         finding_id=_stored_text(finding["finding_id"], "finding_id"),
         category=_enum_value(AuditCategory, finding["category"], "finding category"),
         severity=_enum_value(AuditSeverity, finding["severity"], "finding severity"),
-        confidence=_enum_value(
-            AuditConfidence, finding["confidence"], "finding confidence"
-        ),
+        confidence=_enum_value(AuditConfidence, finding["confidence"], "finding confidence"),
         title=_stored_text(finding["title"], "finding title"),
         evidence=tuple(_parse_stored_evidence(item) for item in evidence_value),
         impact=_stored_text(finding["impact"], "finding impact"),
@@ -1079,12 +1052,8 @@ def _parse_completeness(value: object) -> AuditCompleteness:
         _error("completeness reasons must be unique")
     return AuditCompleteness(
         complete=_strict_bool(completeness["complete"], "completeness complete"),
-        rejected_findings=_strict_int(
-            completeness["rejected_findings"], "rejected_findings"
-        ),
-        truncated_findings=_strict_int(
-            completeness["truncated_findings"], "truncated_findings"
-        ),
+        rejected_findings=_strict_int(completeness["rejected_findings"], "rejected_findings"),
+        truncated_findings=_strict_int(completeness["truncated_findings"], "truncated_findings"),
         reasons=reasons,
     )
 
@@ -1225,14 +1194,8 @@ def render_audit_markdown(report: AuditReport) -> str:
     lines.extend(["## Completeness", ""])
     lines.append("Complete." if report.completeness.complete else "Incomplete.")
     if report.completeness.rejected_findings:
-        lines.append(
-            f"- Rejected findings: {report.completeness.rejected_findings}"
-        )
+        lines.append(f"- Rejected findings: {report.completeness.rejected_findings}")
     if report.completeness.truncated_findings:
-        lines.append(
-            f"- Truncated findings: {report.completeness.truncated_findings}"
-        )
-    lines.extend(
-        f"- {_markdown_text(reason)}" for reason in report.completeness.reasons
-    )
+        lines.append(f"- Truncated findings: {report.completeness.truncated_findings}")
+    lines.extend(f"- {_markdown_text(reason)}" for reason in report.completeness.reasons)
     return "\n".join(lines).rstrip() + "\n"

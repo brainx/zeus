@@ -599,10 +599,7 @@ def _open_private_file_at(
                 _validate_file_snapshot(snapshot, platform)
             if not _same_files(final_snapshots):
                 raise UnsafeFileError("private file changed while it was opened")
-            if any(
-                stat.S_IMODE(snapshot.st_mode) != _FILE_MODE
-                for snapshot in (tightened, final)
-            ):
+            if any(stat.S_IMODE(snapshot.st_mode) != _FILE_MODE for snapshot in (tightened, final)):
                 raise UnsafeFileError("private file does not have private permissions")
             identity = tightened
         else:
