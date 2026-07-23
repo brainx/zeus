@@ -1535,7 +1535,6 @@ class AuditWorkspace:
             raise AuditWorkspaceError(
                 "snapshot destination parent cannot be opened safely"
             ) from exc
-        created = False
         root_descriptor: int | None = None
         try:
             parent_opened = os.fstat(parent_descriptor)
@@ -1558,7 +1557,6 @@ class AuditWorkspace:
                 _PRIVATE_DIRECTORY_MODE,
                 dir_fd=parent_descriptor,
             )
-            created = True
         except FileExistsError as exc:
             with suppress(OSError):
                 os.close(parent_descriptor)
@@ -1575,11 +1573,8 @@ class AuditWorkspace:
             with suppress(OSError):
                 os.close(parent_descriptor)
             raise
-        created_identity: _PathIdentity | None = None
-        root_identity: _PathIdentity | None = None
         try:
             before = os.lstat(safe_destination.name, dir_fd=parent_descriptor)
-            created_identity = _path_identity(before)
             root_descriptor = os.open(
                 safe_destination.name,
                 directory_flags,
@@ -1615,25 +1610,9 @@ class AuditWorkspace:
         except BaseException:
             if root_descriptor is not None:
                 with suppress(OSError):
+                    os.fchmod(root_descriptor, _PRIVATE_DIRECTORY_MODE)
+                with suppress(OSError):
                     os.close(root_descriptor)
-            if created:
-                try:
-                    current = os.lstat(
-                        safe_destination.name,
-                        dir_fd=parent_descriptor,
-                    )
-                    expected_identity = root_identity or created_identity
-                    if (
-                        expected_identity is not None
-                        and stat.S_ISDIR(current.st_mode)
-                        and _same_identity(_path_identity(current), expected_identity)
-                    ):
-                        os.rmdir(
-                            safe_destination.name,
-                            dir_fd=parent_descriptor,
-                        )
-                except OSError:
-                    pass
             with suppress(OSError):
                 os.close(parent_descriptor)
             raise
@@ -2098,118 +2077,23 @@ class AuditWorkspace:
         opened_destination: _OpenedSnapshotDestination,
     ) -> None:
         try:
-            parent_opened = os.fstat(opened_destination.parent_descriptor)
             root_opened = os.fstat(opened_destination.root_descriptor)
-            root_relative = os.lstat(
-                opened_destination.name,
-                dir_fd=opened_destination.parent_descriptor,
-            )
         except OSError:
             return
         if (
-            _path_identity(parent_opened) != opened_destination.parent_identity
-            or _path_identity(root_opened) != opened_destination.root_identity
-            or _path_identity(root_relative) != opened_destination.root_identity
-            or not stat.S_ISDIR(root_opened.st_mode)
-            or not stat.S_ISDIR(root_relative.st_mode)
+            not stat.S_ISDIR(root_opened.st_mode)
+            or root_opened.st_uid != os.geteuid()
+            or not _same_identity(
+                _path_identity(root_opened),
+                opened_destination.root_identity,
+            )
         ):
             return
-        if not self._clear_snapshot_directory(opened_destination.root_descriptor):
-            return
-        try:
-            root_opened = os.fstat(opened_destination.root_descriptor)
-            root_relative = os.lstat(
-                opened_destination.name,
-                dir_fd=opened_destination.parent_descriptor,
+        with suppress(OSError):
+            os.fchmod(
+                opened_destination.root_descriptor,
+                _PRIVATE_DIRECTORY_MODE,
             )
-        except OSError:
-            return
-        if (
-            _path_identity(root_opened) != opened_destination.root_identity
-            or _path_identity(root_relative) != opened_destination.root_identity
-            or not stat.S_ISDIR(root_opened.st_mode)
-            or not stat.S_ISDIR(root_relative.st_mode)
-        ):
-            return
-        with suppress(OSError, TypeError, ValueError, NotImplementedError):
-            os.rmdir(
-                opened_destination.name,
-                dir_fd=opened_destination.parent_descriptor,
-            )
-
-    def _clear_snapshot_directory(self, directory_descriptor: int) -> bool:
-        try:
-            with os.scandir(directory_descriptor) as iterator:
-                children = list(iterator)
-        except (OSError, TypeError, ValueError, NotImplementedError):
-            return False
-        directory_flags = _required_posix_open_flags(
-            "O_DIRECTORY",
-            "O_NOFOLLOW",
-            "O_CLOEXEC",
-        )
-        for child in children:
-            try:
-                before = child.stat(follow_symlinks=False)
-            except OSError:
-                return False
-            before_identity = _path_identity(before)
-            if stat.S_ISDIR(before.st_mode):
-                child_descriptor: int | None = None
-                try:
-                    child_descriptor = os.open(
-                        child.name,
-                        directory_flags,
-                        dir_fd=directory_descriptor,
-                    )
-                    opened = os.fstat(child_descriptor)
-                except (OSError, TypeError, ValueError, NotImplementedError):
-                    if child_descriptor is not None:
-                        with suppress(OSError):
-                            os.close(child_descriptor)
-                    return False
-                try:
-                    if (
-                        not stat.S_ISDIR(opened.st_mode)
-                        or _path_identity(opened) != before_identity
-                        or not self._clear_snapshot_directory(child_descriptor)
-                    ):
-                        return False
-                    current = os.lstat(
-                        child.name,
-                        dir_fd=directory_descriptor,
-                    )
-                    final_opened = os.fstat(child_descriptor)
-                    if (
-                        _path_identity(current) != before_identity
-                        or _path_identity(final_opened) != before_identity
-                        or not stat.S_ISDIR(current.st_mode)
-                        or not stat.S_ISDIR(final_opened.st_mode)
-                    ):
-                        return False
-                except OSError:
-                    return False
-                finally:
-                    with suppress(OSError):
-                        os.close(child_descriptor)
-                try:
-                    os.rmdir(child.name, dir_fd=directory_descriptor)
-                except (OSError, TypeError, ValueError, NotImplementedError):
-                    return False
-                continue
-            try:
-                current = os.lstat(
-                    child.name,
-                    dir_fd=directory_descriptor,
-                )
-                if _path_identity(current) != before_identity or stat.S_IFMT(
-                    current.st_mode
-                ) != stat.S_IFMT(before.st_mode):
-                    return False
-                os.unlink(child.name, dir_fd=directory_descriptor)
-            except (OSError, TypeError, ValueError, NotImplementedError):
-                return False
-        return True
 
     def materialize(
         self,

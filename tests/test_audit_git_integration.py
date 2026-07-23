@@ -371,7 +371,12 @@ class GitIntegrationTests(unittest.TestCase):
                         deadline=time.monotonic() + 5,
                     )
                 self.assertLess(time.monotonic() - started, 1.8)
-                self.assertFalse(destination.exists())
+                if command == "cat-file":
+                    result = destination.lstat()
+                    self.assertTrue(stat.S_ISDIR(result.st_mode))
+                    self.assertEqual(0o700, stat.S_IMODE(result.st_mode))
+                else:
+                    self.assertFalse(destination.exists())
 
     def test_sha256_repository_is_supported_when_git_supports_it(self) -> None:
         repository = self.temp_root / "sha256-repository"

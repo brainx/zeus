@@ -8,7 +8,6 @@ import tempfile
 import time
 import unittest
 import zlib
-from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -87,6 +86,12 @@ class TemporaryGitRepository(unittest.TestCase):
     def inspect(self) -> RepositoryInspection:
         location = self.workspace.discover(self.repository, deadline=_deadline())
         return self.workspace.inspect(location, deadline=_deadline())
+
+    def _assert_private_directory(self, path: Path) -> None:
+        result = path.lstat()
+        self.assertTrue(stat.S_ISDIR(result.st_mode))
+        self.assertEqual(os.geteuid(), result.st_uid)
+        self.assertEqual(0o700, stat.S_IMODE(result.st_mode))
 
     def materialize(
         self,
@@ -489,7 +494,7 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
         skipped_paths = {item.path for item in snapshot.skipped_content}
         self.assertTrue(skipped_paths.isdisjoint(near_pointers))
 
-    def test_rejects_unsafe_symlink_targets_and_cleans_owned_destination(self) -> None:
+    def test_rejects_unsafe_symlink_targets_and_preserves_private_destination(self) -> None:
         for index, target in enumerate(("/absolute", "../../escape", "C:/outside")):
             with self.subTest(target=target):
                 link = self.repository / "unsafe-link"
@@ -502,7 +507,7 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
                 with self.assertRaisesRegex(AuditWorkspaceError, "symlink"):
                     self.materialize(destination_name)
 
-                self.assertFalse((self.temp_root / destination_name).exists())
+                self._assert_private_directory(self.temp_root / destination_name)
 
     def test_rejects_existing_destination_without_changing_it(self) -> None:
         destination = self.temp_root / "existing"
@@ -534,7 +539,7 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
         self.assertEqual(b"committed\n", (snapshot.root / "README.md").read_bytes())
         self.workspace.validate_snapshot(snapshot)
 
-    def test_rejects_destination_parent_swap_and_cleans_bound_leaf(self) -> None:
+    def test_rejects_destination_parent_swap_and_preserves_bound_leaf(self) -> None:
         output_parent = self.temp_root / "output"
         moved_parent = self.temp_root / "output-original"
         attacker = self.temp_root / "attacker"
@@ -583,42 +588,164 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
 
             self.assertTrue(swapped)
             self.assertFalse((attacker / destination.name).exists())
-            self.assertFalse((moved_parent / destination.name).exists())
+            self._assert_private_directory(moved_parent / destination.name)
         finally:
             if output_parent.is_symlink():
                 output_parent.unlink()
             if moved_parent.exists():
                 moved_parent.rename(output_parent)
 
-    def test_cleanup_preserves_a_replacement_snapshot_leaf(self) -> None:
+    def test_failure_cleanup_never_removes_root_by_name(self) -> None:
         inspection = self.inspect()
-        destination = self.temp_root / "cleanup-race"
-        orphan = self.temp_root / "cleanup-race-original"
+        destination = self.temp_root / "cleanup-root"
+        orphan = self.temp_root / "cleanup-root-original"
         opened = self.workspace._prepare_destination(
             inspection.location,
             destination,
         )
-        original_scandir = os.scandir
+        original_rmdir = os.rmdir
         swapped = False
 
-        def swapping_scandir(path: int) -> Iterator[os.DirEntry[str]]:
+        def swapping_rmdir(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
             nonlocal swapped
-            if isinstance(path, int) and not swapped:
+            if (
+                os.fsdecode(path) == destination.name
+                and dir_fd == opened.parent_descriptor
+                and not swapped
+            ):
                 destination.rename(orphan)
                 destination.mkdir(mode=0o700)
                 swapped = True
-            return original_scandir(path)
+            if dir_fd is None:
+                original_rmdir(path)
+            else:
+                original_rmdir(path, dir_fd=dir_fd)
 
         try:
             with patch(
-                "zeus.audit_workspace.os.scandir",
-                side_effect=swapping_scandir,
-            ):
+                "zeus.audit_workspace.os.rmdir",
+                side_effect=swapping_rmdir,
+            ) as remove_directory:
                 self.workspace._cleanup_opened_snapshot(opened)
 
-            self.assertTrue(swapped)
-            self.assertTrue(destination.is_dir())
-            self.assertTrue(orphan.is_dir())
+            remove_directory.assert_not_called()
+            self.assertFalse(swapped)
+            self._assert_private_directory(destination)
+            self.assertFalse(orphan.exists())
+        finally:
+            with suppress(OSError):
+                os.close(opened.root_descriptor)
+            with suppress(OSError):
+                os.close(opened.parent_descriptor)
+
+    def test_failure_cleanup_never_unlinks_child_by_name(self) -> None:
+        inspection = self.inspect()
+        destination = self.temp_root / "cleanup-file"
+        opened = self.workspace._prepare_destination(
+            inspection.location,
+            destination,
+        )
+        payload = destination / "payload"
+        payload.write_bytes(b"original")
+        payload.chmod(0o600)
+        original_unlink = os.unlink
+        swapped = False
+
+        def swapping_unlink(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal swapped
+            if os.fsdecode(path) == payload.name and dir_fd is not None and not swapped:
+                os.rename(
+                    payload.name,
+                    "payload-original",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+                replacement = os.open(
+                    payload.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    os.write(replacement, b"replacement")
+                finally:
+                    os.close(replacement)
+                swapped = True
+            if dir_fd is None:
+                original_unlink(path)
+            else:
+                original_unlink(path, dir_fd=dir_fd)
+
+        try:
+            with patch(
+                "zeus.audit_workspace.os.unlink",
+                side_effect=swapping_unlink,
+            ) as unlink:
+                self.workspace._cleanup_opened_snapshot(opened)
+
+            unlink.assert_not_called()
+            self.assertFalse(swapped)
+            self.assertEqual(b"original", payload.read_bytes())
+            self.assertFalse((destination / "payload-original").exists())
+            self._assert_private_directory(destination)
+        finally:
+            with suppress(OSError):
+                os.close(opened.root_descriptor)
+            with suppress(OSError):
+                os.close(opened.parent_descriptor)
+
+    def test_failure_cleanup_never_removes_child_directory_by_name(self) -> None:
+        inspection = self.inspect()
+        destination = self.temp_root / "cleanup-directory"
+        opened = self.workspace._prepare_destination(
+            inspection.location,
+            destination,
+        )
+        child = destination / "nested"
+        child.mkdir(mode=0o700)
+        original_rmdir = os.rmdir
+        swapped = False
+
+        def swapping_rmdir(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal swapped
+            if os.fsdecode(path) == child.name and dir_fd is not None and not swapped:
+                os.rename(
+                    child.name,
+                    "nested-original",
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                )
+                os.mkdir(child.name, mode=0o700, dir_fd=dir_fd)
+                swapped = True
+            if dir_fd is None:
+                original_rmdir(path)
+            else:
+                original_rmdir(path, dir_fd=dir_fd)
+
+        try:
+            with patch(
+                "zeus.audit_workspace.os.rmdir",
+                side_effect=swapping_rmdir,
+            ) as remove_directory:
+                self.workspace._cleanup_opened_snapshot(opened)
+
+            remove_directory.assert_not_called()
+            self.assertFalse(swapped)
+            self._assert_private_directory(child)
+            self.assertFalse((destination / "nested-original").exists())
+            self._assert_private_directory(destination)
         finally:
             with suppress(OSError):
                 os.close(opened.root_descriptor)
@@ -710,7 +837,7 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
 
         self.assertEqual(1, hash_file.call_count)
         self.assertEqual([caller_deadline], observed_deadlines)
-        self.assertFalse(destination.exists())
+        self._assert_private_directory(destination)
 
     def test_validate_snapshot_rejects_content_mode_and_extra_entry_changes(self) -> None:
         snapshot = self.materialize()
