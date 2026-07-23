@@ -23,13 +23,13 @@ DEFAULT_AUDIT_IMAGE = (
 )
 
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
-_IMAGE_NAME_COMPONENT = r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?"
-_IMAGE_REPOSITORY = (
-    rf"(?:{_IMAGE_NAME_COMPONENT}/)*"
-    r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
-    r"(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?"
+_SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_REGISTRY_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+_REGISTRY_AUTHORITY_RE = re.compile(
+    rf"^(?:{_REGISTRY_HOST_LABEL})(?:\.{_REGISTRY_HOST_LABEL})*(?::[0-9]+)?$"
 )
-_IMAGE_RE = re.compile(rf"^(?:sha256:[0-9a-f]{{64}}|{_IMAGE_REPOSITORY}@sha256:[0-9a-f]{{64}})$")
+_IMAGE_PATH_COMPONENT_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$")
+_IMAGE_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 _TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -102,8 +102,35 @@ def _provider_env(value: object) -> tuple[str, ...]:
 
 
 def _image(value: object) -> str:
-    if not isinstance(value, str) or not _IMAGE_RE.fullmatch(value):
+    if not isinstance(value, str):
         _error("image must be a SHA-256 digest or digest-qualified image reference")
+    if _SHA256_DIGEST_RE.fullmatch(value):
+        return value
+    try:
+        repository, digest_hex = value.rsplit("@sha256:", 1)
+    except ValueError:
+        _error("image must be a SHA-256 digest or digest-qualified image reference")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest_hex):
+        _error("image must be a SHA-256 digest or digest-qualified image reference")
+
+    components = repository.split("/")
+    if len(components) > 1 and (
+        components[0] == "localhost" or "." in components[0] or ":" in components[0]
+    ):
+        authority = components.pop(0)
+        if not _REGISTRY_AUTHORITY_RE.fullmatch(authority):
+            _error("image contains an invalid registry authority")
+    if not components:
+        _error("image must contain a repository name")
+
+    last_component = components[-1]
+    if ":" in last_component:
+        repository_name, tag = last_component.rsplit(":", 1)
+        if not _IMAGE_TAG_RE.fullmatch(tag):
+            _error("image contains an invalid tag")
+        components[-1] = repository_name
+    if not all(_IMAGE_PATH_COMPONENT_RE.fullmatch(component) for component in components):
+        _error("image contains an invalid repository path")
     return value
 
 
@@ -156,11 +183,15 @@ def _suggested_commands(value: object) -> tuple[SuggestedCommand, ...]:
         _error("suggested_commands must be an object")
     if len(value) > 64:
         _error("suggested_commands may contain at most 64 commands")
+    names: list[str] = []
+    for name in value:
+        if not isinstance(name, str):
+            _error("suggested command names must be strings")
+        names.append(name)
     commands: list[SuggestedCommand] = []
-    for name in sorted(value):
+    for name in sorted(names):
         if (
-            not isinstance(name, str)
-            or not name
+            not name
             or name != name.strip()
             or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
         ):

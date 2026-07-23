@@ -197,6 +197,28 @@ class AuditConfigTests(unittest.TestCase):
             with self.subTest(image=image), self.assertRaises(AuditConfigError):
                 parse_audit_config({"schema_version": 1, "image": image})
 
+    def test_digest_reference_allows_port_only_on_registry_authority(self) -> None:
+        digest = "a" * 64
+        valid_images = (
+            f"localhost:5000/team/audit@sha256:{digest}",
+            f"team:6000/audit@sha256:{digest}",
+            f"registry.example:5000/team/nested/audit:3.11@sha256:{digest}",
+        )
+        for image in valid_images:
+            with self.subTest(image=image):
+                self.assertEqual(
+                    image,
+                    parse_audit_config({"schema_version": 1, "image": image}).image,
+                )
+
+        invalid_images = (
+            f"registry:5000/team:6000/audit@sha256:{digest}",
+            f"registry.example/team:6000/audit@sha256:{digest}",
+        )
+        for image in invalid_images:
+            with self.subTest(image=image), self.assertRaises(AuditConfigError):
+                parse_audit_config({"schema_version": 1, "image": image})
+
     def test_categories_are_a_non_empty_unique_supported_subset(self) -> None:
         values = [category.value for category in AuditCategory]
         self.assertEqual(
@@ -259,6 +281,15 @@ class AuditConfigTests(unittest.TestCase):
         for commands_value in invalid_commands:
             with self.subTest(commands=commands_value), self.assertRaises(AuditConfigError):
                 parse_audit_config({"schema_version": 1, "suggested_commands": commands_value})
+
+    def test_suggested_command_keys_are_validated_before_sorting(self) -> None:
+        commands: dict[object, object] = {
+            "test": ["python3", "-m", "unittest"],
+            1: ["tool"],
+        }
+
+        with self.assertRaises(AuditConfigError):
+            parse_audit_config({"schema_version": 1, "suggested_commands": commands})
 
     def test_every_configurable_limit_can_only_lower_its_hard_ceiling(self) -> None:
         for name, ceiling in CONFIGURABLE_LIMITS.items():
