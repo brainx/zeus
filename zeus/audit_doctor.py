@@ -73,52 +73,93 @@ def _command(argv: Sequence[str], *, deadline: float) -> tuple[bool, str]:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return False, "overall audit deadline has expired"
+    process: subprocess.Popen[bytes] | None = None
+    returncode: int | None = None
+    error: str | None = None
     try:
-        result = subprocess.run(  # nosec B603
+        process = subprocess.Popen(  # nosec B603
             tuple(argv),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
             shell=False,
-            check=False,
-            timeout=min(remaining, 30),
+            close_fds=True,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False, "command could not complete"
-    return result.returncode == 0, "available" if result.returncode == 0 else "unavailable"
-
-
-def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
-    with suppress(OSError):
-        os.killpg(process.pid, signal.SIGTERM)
-    term_deadline = time.monotonic() + _PROCESS_TERM_SECONDS
-    group_present = True
-    while group_present and time.monotonic() < term_deadline:
-        process.poll()
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            group_present = False
-        except OSError:
-            break
-        if group_present:
-            time.sleep(0.01)
-    if group_present:
-        with suppress(OSError):
-            os.killpg(process.pid, signal.SIGKILL)
-        kill_deadline = time.monotonic() + _PROCESS_KILL_SECONDS
-        while time.monotonic() < kill_deadline:
-            process.poll()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error = "command exceeded its deadline"
+        else:
             try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                break
-            except OSError:
-                break
-            time.sleep(0.01)
-    with suppress(OSError, subprocess.TimeoutExpired):
-        process.wait(timeout=_PROCESS_KILL_SECONDS)
+                returncode = process.wait(timeout=min(remaining, 30))
+            except subprocess.TimeoutExpired:
+                error = "command exceeded its deadline"
+    except (OSError, TypeError, ValueError):
+        error = "command could not complete"
+    finally:
+        if process is not None and not _stop_process_group(process):
+            error = "command process group cleanup could not be verified"
+    if error is not None:
+        return False, error
+    return returncode == 0, "available" if returncode == 0 else "unavailable"
+
+
+def _process_group_absent(process: subprocess.Popen[bytes]) -> bool:
+    process.poll()
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _wait_for_process_group_absence(
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float,
+) -> bool:
+    while True:
+        if _process_group_absent(process):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
+def _signal_process_group(process: subprocess.Popen[bytes], sent_signal: signal.Signals) -> bool:
+    try:
+        os.killpg(process.pid, sent_signal)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _stop_process_group(process: subprocess.Popen[bytes]) -> bool:
+    group_absent = _process_group_absent(process)
+    if not group_absent:
+        _signal_process_group(process, signal.SIGTERM)
+        group_absent = _wait_for_process_group_absence(
+            process,
+            deadline=time.monotonic() + _PROCESS_TERM_SECONDS,
+        )
+    if not group_absent:
+        _signal_process_group(process, signal.SIGKILL)
+        group_absent = _wait_for_process_group_absence(
+            process,
+            deadline=time.monotonic() + _PROCESS_KILL_SECONDS,
+        )
+    if process.poll() is None:
+        try:
+            process.wait(timeout=_PROCESS_KILL_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return group_absent and _process_group_absent(process)
 
 
 def _bounded_version_process(
@@ -134,6 +175,8 @@ def _bounded_version_process(
     stdout = bytearray()
     stderr = bytearray()
     total = 0
+    returncode: int | None = None
+    error: str | None = None
     try:
         process = subprocess.Popen(  # nosec B603
             (str(executable), "--version"),
@@ -147,36 +190,41 @@ def _bounded_version_process(
             bufsize=0,
         )
         if process.stdout is None or process.stderr is None:
-            return None, b"", b"", "version command pipes are unavailable"
-        selector.register(process.stdout, selectors.EVENT_READ, stdout)
-        selector.register(process.stderr, selectors.EVENT_READ, stderr)
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None, bytes(stdout), bytes(stderr), "version command exceeded its deadline"
-            events = selector.select(min(0.05, remaining))
-            for key, _mask in events:
-                allowance = _VERSION_OUTPUT_BYTES + 1 - total
-                if allowance <= 0:
-                    return None, bytes(stdout), bytes(stderr), "version output exceeded its limit"
-                chunk = os.read(key.fd, min(_PROCESS_CHUNK, allowance))
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                total += len(chunk)
-                if total > _VERSION_OUTPUT_BYTES:
-                    return None, bytes(stdout), bytes(stderr), "version output exceeded its limit"
-                key.data.extend(chunk)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None, bytes(stdout), bytes(stderr), "version command exceeded its deadline"
-        try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            return None, bytes(stdout), bytes(stderr), "version command exceeded its deadline"
-        return returncode, bytes(stdout), bytes(stderr), None
+            error = "version command pipes are unavailable"
+        else:
+            selector.register(process.stdout, selectors.EVENT_READ, stdout)
+            selector.register(process.stderr, selectors.EVENT_READ, stderr)
+            while selector.get_map() and error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error = "version command exceeded its deadline"
+                    break
+                events = selector.select(min(0.05, remaining))
+                for key, _mask in events:
+                    allowance = _VERSION_OUTPUT_BYTES + 1 - total
+                    if allowance <= 0:
+                        error = "version output exceeded its limit"
+                        break
+                    chunk = os.read(key.fd, min(_PROCESS_CHUNK, allowance))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(chunk)
+                    if total > _VERSION_OUTPUT_BYTES:
+                        error = "version output exceeded its limit"
+                        break
+                    key.data.extend(chunk)
+            if error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    error = "version command exceeded its deadline"
+                else:
+                    try:
+                        returncode = process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        error = "version command exceeded its deadline"
     except (OSError, TypeError, ValueError):
-        return None, bytes(stdout), bytes(stderr), "version command could not complete"
+        error = "version command could not complete"
     finally:
         selector.close()
         if process is not None:
@@ -184,8 +232,11 @@ def _bounded_version_process(
                 if stream is not None:
                     with suppress(OSError):
                         stream.close()
-            if process.poll() is None:
-                _stop_process_group(process)
+            if not _stop_process_group(process):
+                error = "version process group cleanup could not be verified"
+    if error is None and returncode is None:
+        error = "version command could not complete"
+    return returncode, bytes(stdout), bytes(stderr), error
 
 
 def _pinned_hermes_version(executable: Path, *, deadline: float) -> tuple[bool, str]:
