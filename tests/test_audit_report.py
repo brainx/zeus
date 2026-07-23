@@ -751,6 +751,36 @@ class AuditReportTests(unittest.TestCase):
         with self.assertRaises(AuditReportError):
             serialize_audit_report(report)
 
+    def test_boolean_duration_is_rejected_by_build_serialize_and_parse(self) -> None:
+        boolean_check = AuditCheck(
+            "lint",
+            CheckDisposition.passed,
+            True,
+            "not a numeric duration",
+        )
+        with self.subTest(boundary="build"), self.assertRaises(AuditReportError):
+            build_audit_report(
+                run_id="run-123",
+                repository_id="repo-456",
+                status=AuditStatus.completed,
+                metadata=_metadata(),
+                checks=(boolean_check,),
+                skipped_content=(),
+                model_result=self._model_result(),
+            )
+
+        report = replace(self._report(), checks=(boolean_check,))
+        with self.subTest(boundary="serialize"), self.assertRaises(AuditReportError):
+            serialize_audit_report(report)
+
+        decoded = json.loads(serialize_audit_report(self._report()))
+        decoded["checks"][0]["duration_seconds"] = True
+        with self.assertRaises(AuditReportError):
+            parse_audit_report(
+                json.dumps(decoded).encode(),
+                max_bytes=HARD_LIMITS.artifact_bytes,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

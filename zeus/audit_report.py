@@ -212,6 +212,17 @@ def _strict_bool(value: object, name: str) -> bool:
     return value
 
 
+def _check_duration_seconds(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        _error("check duration_seconds must be a finite non-negative number")
+    return float(value)
+
+
 def _enum_value(
     enum_type: type[EnumT],
     value: object,
@@ -655,13 +666,19 @@ def build_audit_report(
     safe_checks: list[AuditCheck] = []
     check_truncated = False
     for check in checks:
-        if not math.isfinite(check.duration_seconds) or check.duration_seconds < 0:
-            _error("check duration_seconds must be finite and non-negative")
+        duration_seconds = _check_duration_seconds(check.duration_seconds)
         name, name_truncated = _sanitize_report_text(check.name, "check name")
         observation, observation_truncated = _sanitize_report_text(
             check.observation, "check observation", allow_empty=True
         )
-        safe_checks.append(replace(check, name=name, observation=observation))
+        safe_checks.append(
+            replace(
+                check,
+                name=name,
+                duration_seconds=duration_seconds,
+                observation=observation,
+            )
+        )
         check_truncated = check_truncated or name_truncated or observation_truncated
     safe_checks.sort(key=lambda check: check.name)
     if len({check.name for check in safe_checks}) != len(safe_checks):
@@ -874,8 +891,7 @@ def _validate_report_invariants(report: AuditReport) -> None:
     if len(check_names) != len(report.checks):
         _error("report check names must be unique")
     for check in report.checks:
-        if not math.isfinite(check.duration_seconds) or check.duration_seconds < 0:
-            _error("check duration_seconds must be finite and non-negative")
+        _check_duration_seconds(check.duration_seconds)
     for finding in report.findings:
         for evidence in finding.evidence:
             if isinstance(evidence, SourceEvidence):
@@ -957,20 +973,12 @@ def _parse_metadata(value: object) -> AuditMetadata:
 
 def _parse_check(value: object) -> AuditCheck:
     check = _exact_object(value, _CHECK_FIELDS, "report check")
-    duration = check["duration_seconds"]
-    if (
-        isinstance(duration, bool)
-        or not isinstance(duration, (int, float))
-        or not math.isfinite(duration)
-        or duration < 0
-    ):
-        _error("check duration_seconds must be finite and non-negative")
     return AuditCheck(
         name=_stored_text(check["name"], "check name"),
         disposition=_enum_value(
             CheckDisposition, check["disposition"], "check disposition"
         ),
-        duration_seconds=float(duration),
+        duration_seconds=_check_duration_seconds(check["duration_seconds"]),
         observation=_stored_text(
             check["observation"], "check observation", allow_empty=True
         ),
