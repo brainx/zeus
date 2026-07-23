@@ -838,7 +838,6 @@ def _run_audit(args: argparse.Namespace) -> int:
                 print(serialize_audit_report(audit_report).decode("utf-8"))
             else:
                 counts = audit_report.severity_counts
-                markdown = service.settings.state_dir / "audits" / audit_report.run_id / "report.md"
                 print(f"status: {audit_report.status.value}")
                 print(f"run_id: {audit_report.run_id}")
                 print(f"target_commit: {audit_report.metadata.target_commit or '-'}")
@@ -847,7 +846,7 @@ def _run_audit(args: argparse.Namespace) -> int:
                     f"critical={counts.critical} high={counts.high} medium={counts.medium} "
                     f"low={counts.low} note={counts.note}"
                 )
-                print(f"markdown: {_display_path(str(markdown))}")
+                print(f"markdown: audits/{audit_report.run_id}/report.md")
             return 0 if audit_report.status.value == "completed" else 1
         if args.action == "list":
             audit_reports = service.list_reports()

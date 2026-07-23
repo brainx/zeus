@@ -13,6 +13,7 @@ from zeus.audit_models import AuditConfig
 AUDIT_SKILL_VERSION = "1.0.0"
 MAX_AUDIT_SKILL_BYTES = 16 * 1024
 MAX_AUDIT_PROMPT_BYTES = 32 * 1024
+MAX_AUDIT_PROFILE_CONFIG_BYTES = 16 * 1024
 MAX_UNTRUSTED_CONFIG_BYTES = 8 * 1024
 _VERSION_LINE = re.compile(r"(?m)^version: ([0-9]+\.[0-9]+\.[0-9]+)$")
 
@@ -122,6 +123,58 @@ def build_audit_profile(config: AuditConfig) -> AuditProfile:
         docker_volumes=(),
         docker_environment={},
     )
+
+
+def render_audit_profile_config(profile: AuditProfile) -> bytes:
+    """Render the sealed audit Hermes settings without using normal bot profiles."""
+    if not isinstance(profile, AuditProfile):
+        raise AuditProfileError("audit profile is invalid")
+    rendered = _yaml(profile.hermes).encode("utf-8", errors="strict")
+    if len(rendered) > MAX_AUDIT_PROFILE_CONFIG_BYTES:
+        raise AuditProfileError("audit profile configuration exceeds its byte limit")
+    return rendered
+
+
+def _yaml(value: Any, indent: int = 0) -> str:
+    spaces = " " * indent
+    if isinstance(value, dict):
+        if not value:
+            return f"{spaces}{{}}\n"
+        lines: list[str] = []
+        for key, child in value.items():
+            if isinstance(child, (dict, list)):
+                if child:
+                    lines.append(f"{spaces}{key}:")
+                    lines.append(_yaml(child, indent + 2).rstrip())
+                else:
+                    lines.append(f"{spaces}{key}: {'{}' if isinstance(child, dict) else '[]'}")
+            else:
+                lines.append(f"{spaces}{key}: {_yaml_scalar(child)}")
+        return "\n".join(lines) + "\n"
+    if isinstance(value, list):
+        if not value:
+            return f"{spaces}[]\n"
+        lines = []
+        for child in value:
+            if isinstance(child, (dict, list)):
+                lines.append(f"{spaces}-")
+                lines.append(_yaml(child, indent + 2).rstrip())
+            else:
+                lines.append(f"{spaces}- {_yaml_scalar(child)}")
+        return "\n".join(lines) + "\n"
+    return f"{spaces}{_yaml_scalar(value)}\n"
+
+
+def _yaml_scalar(value: object) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value))
 
 
 def _bounded_config_json(config: AuditConfig) -> str:

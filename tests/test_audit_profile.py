@@ -52,6 +52,38 @@ class AuditProfileTests(unittest.TestCase):
         self.assertFalse(profile.hermes["gateway"]["enabled"])
         self.assertEqual(1, profile.hermes["delegation"]["max_concurrent_children"])
 
+    def test_rendered_profile_preserves_empty_and_disabled_controls(self) -> None:
+        from zeus.audit_profile import (
+            MAX_AUDIT_PROFILE_CONFIG_BYTES,
+            build_audit_profile,
+            render_audit_profile_config,
+        )
+
+        rendered = render_audit_profile_config(
+            build_audit_profile(parse_audit_config({"schema_version": 1}))
+        )
+        self.assertLessEqual(len(rendered), MAX_AUDIT_PROFILE_CONFIG_BYTES)
+        text = rendered.decode("utf-8", errors="strict")
+        for expected in (
+            "model: {}",
+            "docker_volumes: []",
+            "environment: {}",
+            "gateway:\n  enabled: false",
+            "mcp:\n    enabled: false",
+            "memory:\n    enabled: false",
+            "web:\n    enabled: false",
+            "browser:\n    enabled: false",
+            "delegation:\n    enabled: false",
+            "cron:\n    enabled: false",
+            "messaging:\n    enabled: false",
+            "file_editing:\n    enabled: false",
+            "skill_management:\n    enabled: false",
+            "code_execution:\n    enabled: false",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, text)
+        self.assertNotRegex(text, r"(?m)^(?:model|docker_volumes|environment):\s*$")
+
     def test_prompt_has_bounded_untrusted_data_contract_and_schema(self) -> None:
         from zeus.audit_profile import MAX_AUDIT_PROMPT_BYTES, build_audit_profile
 

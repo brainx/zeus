@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from zeus.models import TemplateError
 from zeus.process_lock import BotProcessLock, LockTimeoutError
@@ -78,6 +79,53 @@ class LifecycleLockTests(unittest.TestCase):
                 BotProcessLock(lock_path, timeout_seconds=0),
             ):
                 pass
+
+    def test_bot_process_lock_rejects_leaf_replacement_after_acquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "locks" / "bots" / "coder.lock"
+            original_lock = BotProcessLock._lock
+
+            def replace_then_lock(lock: BotProcessLock, handle) -> None:
+                replacement = lock._private_lock_path.with_name("replacement")
+                lock._private_lock_path.replace(replacement)
+                lock._private_lock_path.touch()
+                lock._private_lock_path.chmod(0o600)
+                original_lock(lock, handle)
+
+            with (
+                mock.patch.object(BotProcessLock, "_lock", replace_then_lock),
+                self.assertRaises(OSError),
+                BotProcessLock(lock_path, timeout_seconds=0),
+            ):
+                pass
+
+    def test_bot_process_lock_closes_immediately_on_binding_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "locks" / "bots" / "coder.lock"
+            handle_path = Path(tmp) / "opened"
+            handle = handle_path.open("a+b")
+            private_handle = mock.MagicMock()
+            private_handle.__enter__.return_value = handle
+            private_handle.__exit__.side_effect = lambda *_args: handle.close()
+            started = time.monotonic()
+            with (
+                mock.patch(
+                    "zeus.process_lock.open_private_append",
+                    return_value=private_handle,
+                ),
+                mock.patch.object(BotProcessLock, "_lock"),
+                mock.patch.object(
+                    BotProcessLock,
+                    "_validate_lock_binding",
+                    side_effect=OSError("binding mismatch"),
+                ),
+                self.assertRaisesRegex(OSError, "binding mismatch"),
+                BotProcessLock(lock_path, timeout_seconds=10),
+            ):
+                pass
+            self.assertLess(time.monotonic() - started, 0.1)
+            private_handle.__exit__.assert_called_once()
+            self.assertTrue(handle.closed)
 
     def test_supervisor_rejects_invalid_bot_id_before_lock_path_creation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

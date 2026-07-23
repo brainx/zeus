@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
+import sys
 import time
 from pathlib import Path
 from types import TracebackType
@@ -26,26 +28,32 @@ class LockTimeoutError(TimeoutError):
 
 class BotProcessLock:
     def __init__(self, lock_path: Path, timeout_seconds: float = 30.0) -> None:
-        self.lock_path = nofollow_absolute_path(lock_path)
+        self.lock_path = lock_path
+        self._private_lock_path = nofollow_absolute_path(lock_path)
         self.timeout_seconds = timeout_seconds
         self._handle: BinaryIO | None = None
         self._private_handle: contextlib.AbstractContextManager[BinaryIO] | None = None
 
     def __enter__(self) -> BotProcessLock:
-        private_handle = open_private_append(self.lock_path)
+        private_handle = open_private_append(self._private_lock_path)
         handle = private_handle.__enter__()
         deadline = time.monotonic() + self.timeout_seconds
-        while True:
-            try:
-                self._lock(handle)
-                self._handle = handle
-                self._private_handle = private_handle
-                return self
-            except OSError as exc:
-                if time.monotonic() >= deadline:
-                    private_handle.__exit__(None, None, None)
-                    raise LockTimeoutError(self.lock_path, self.timeout_seconds) from exc
-                time.sleep(0.05)
+        try:
+            while True:
+                try:
+                    self._lock(handle)
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeoutError(self.lock_path, self.timeout_seconds) from exc
+                    time.sleep(0.05)
+                else:
+                    self._validate_lock_binding(handle)
+                    self._handle = handle
+                    self._private_handle = private_handle
+                    return self
+        except BaseException:
+            private_handle.__exit__(*sys.exc_info())
+            raise
 
     def __exit__(
         self,
@@ -63,6 +71,23 @@ class BotProcessLock:
             self._private_handle = None
             if private_handle is not None:
                 private_handle.__exit__(exc_type, exc, tb)
+
+    def _validate_lock_binding(self, handle: BinaryIO) -> None:
+        opened = os.fstat(handle.fileno())
+        current = os.lstat(self._private_lock_path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+            or opened.st_uid != os.geteuid()
+            or current.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or current.st_nlink != 1
+        ):
+            raise OSError("lock path binding changed while it was acquired")
 
     def _lock(self, handle: BinaryIO) -> None:
         if os.name == "posix":

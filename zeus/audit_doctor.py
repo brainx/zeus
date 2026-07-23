@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
+import inspect
 import os
+import selectors
 import shutil
+import signal
 import subprocess  # nosec B404
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +22,12 @@ from zeus.audit_models import AuditConfig
 from zeus.audit_workspace import AuditWorkspace, RepositoryLocation
 from zeus.config import Settings
 from zeus.private_io import UnsafeFileError, inspect_private_directory
+
+_VERSION_OUTPUT_BYTES = 4096
+_VERSION_FIRST_LINE = f"Hermes Agent v{HERMES_VERSION} (2026.7.20)"
+_PROCESS_CHUNK = 64 * 1024
+_PROCESS_TERM_SECONDS = 0.2
+_PROCESS_KILL_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,196 @@ def _command(argv: Sequence[str], *, deadline: float) -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired):
         return False, "command could not complete"
     return result.returncode == 0, "available" if result.returncode == 0 else "unavailable"
+
+
+def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+    with suppress(OSError):
+        os.killpg(process.pid, signal.SIGTERM)
+    term_deadline = time.monotonic() + _PROCESS_TERM_SECONDS
+    group_present = True
+    while group_present and time.monotonic() < term_deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            group_present = False
+        except OSError:
+            break
+        if group_present:
+            time.sleep(0.01)
+    if group_present:
+        with suppress(OSError):
+            os.killpg(process.pid, signal.SIGKILL)
+        kill_deadline = time.monotonic() + _PROCESS_KILL_SECONDS
+        while time.monotonic() < kill_deadline:
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            except OSError:
+                break
+            time.sleep(0.01)
+    with suppress(OSError, subprocess.TimeoutExpired):
+        process.wait(timeout=_PROCESS_KILL_SECONDS)
+
+
+def _bounded_version_process(
+    executable: Path,
+    *,
+    deadline: float,
+) -> tuple[int | None, bytes, bytes, str | None]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None, b"", b"", "overall audit deadline has expired"
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    total = 0
+    try:
+        process = subprocess.Popen(  # nosec B603
+            (str(executable), "--version"),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            shell=False,
+            close_fds=True,
+            start_new_session=True,
+            bufsize=0,
+        )
+        if process.stdout is None or process.stderr is None:
+            return None, b"", b"", "version command pipes are unavailable"
+        selector.register(process.stdout, selectors.EVENT_READ, stdout)
+        selector.register(process.stderr, selectors.EVENT_READ, stderr)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, bytes(stdout), bytes(stderr), "version command exceeded its deadline"
+            events = selector.select(min(0.05, remaining))
+            for key, _mask in events:
+                allowance = _VERSION_OUTPUT_BYTES + 1 - total
+                if allowance <= 0:
+                    return None, bytes(stdout), bytes(stderr), "version output exceeded its limit"
+                chunk = os.read(key.fd, min(_PROCESS_CHUNK, allowance))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                total += len(chunk)
+                if total > _VERSION_OUTPUT_BYTES:
+                    return None, bytes(stdout), bytes(stderr), "version output exceeded its limit"
+                key.data.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, bytes(stdout), bytes(stderr), "version command exceeded its deadline"
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            return None, bytes(stdout), bytes(stderr), "version command exceeded its deadline"
+        return returncode, bytes(stdout), bytes(stderr), None
+    except (OSError, TypeError, ValueError):
+        return None, bytes(stdout), bytes(stderr), "version command could not complete"
+    finally:
+        selector.close()
+        if process is not None:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    with suppress(OSError):
+                        stream.close()
+            if process.poll() is None:
+                _stop_process_group(process)
+
+
+def _pinned_hermes_version(executable: Path, *, deadline: float) -> tuple[bool, str]:
+    returncode, stdout, _stderr, error = _bounded_version_process(
+        executable,
+        deadline=deadline,
+    )
+    if error is not None:
+        return False, error
+    if returncode != 0:
+        return False, "version command failed"
+    try:
+        output = stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False, "version output was not valid UTF-8"
+    if "\x00" in output:
+        return False, "version output contained NUL"
+    first_line = output.split("\n", 1)[0]
+    if first_line != _VERSION_FIRST_LINE:
+        return False, "version did not match the supported release"
+    if len(stdout) > _VERSION_OUTPUT_BYTES:
+        return False, "version output exceeded its limit"
+    return True, f"version {HERMES_VERSION}"
+
+
+def _broker_isolation_supported() -> bool:
+    required_flags = (
+        ("O_RDONLY", True),
+        ("O_WRONLY", False),
+        ("O_APPEND", False),
+        ("O_CREAT", False),
+        ("O_EXCL", False),
+        ("O_DIRECTORY", False),
+        ("O_NOFOLLOW", False),
+        ("O_CLOEXEC", False),
+        ("O_NONBLOCK", False),
+    )
+    required_functions = (
+        "close",
+        "dup",
+        "fchmod",
+        "fsync",
+        "fstat",
+        "geteuid",
+        "killpg",
+        "link",
+        "lstat",
+        "mkdir",
+        "open",
+        "read",
+        "replace",
+        "stat",
+        "unlink",
+        "write",
+    )
+    dir_fd_probes = (os.open, os.stat, os.mkdir, os.rename, os.unlink, os.link)
+    follow_symlink_probes = (os.stat, os.link)
+    return (
+        os.name == "posix"
+        and Path(sys.executable).is_file()
+        and callable(getattr(fcntl, "flock", None))
+        and callable(getattr(selectors, "DefaultSelector", None))
+        and all(callable(getattr(os, name, None)) for name in required_functions)
+        and all(
+            type(getattr(os, name, None)) is int and (allow_zero or getattr(os, name) != 0)
+            for name, allow_zero in required_flags
+        )
+        and all(probe in os.supports_dir_fd for probe in dir_fd_probes)
+        and all(probe in os.supports_follow_symlinks for probe in follow_symlink_probes)
+        and _supports_keywords(os.open, ("dir_fd",))
+        and _supports_keywords(os.stat, ("dir_fd", "follow_symlinks"))
+        and _supports_keywords(os.replace, ("src_dir_fd", "dst_dir_fd"))
+        and _supports_keywords(os.unlink, ("dir_fd",))
+        and isinstance(getattr(signal, "SIGTERM", None), signal.Signals)
+        and isinstance(getattr(signal, "SIGKILL", None), signal.Signals)
+    )
+
+
+def _supports_keywords(function: object, names: tuple[str, ...]) -> bool:
+    if not callable(function):
+        return False
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+    return all(
+        name in parameters
+        and parameters[name].kind
+        in {inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+        for name in names
+    )
 
 
 def run_audit_doctor(
@@ -151,7 +352,7 @@ def run_audit_doctor(
     if hermes is None:
         checks.append(AuditDoctorCheck("hermes", False, "pinned Hermes executable is unavailable"))
     else:
-        version_ok, version_note = _command((str(hermes), "--version"), deadline=deadline)
+        version_ok, version_note = _pinned_hermes_version(hermes, deadline=deadline)
         checks.append(
             AuditDoctorCheck(
                 "hermes",
@@ -159,11 +360,14 @@ def run_audit_doctor(
                 f"expected {HERMES_VERSION}; {version_note}",
             )
         )
+    broker_supported = _broker_isolation_supported()
     checks.append(
         AuditDoctorCheck(
             "broker_isolation",
-            os.name == "posix" and bool(sys.executable),
-            "private Docker broker is supported" if os.name == "posix" else "POSIX is required",
+            broker_supported,
+            "private Docker broker primitives are supported"
+            if broker_supported
+            else "required private broker primitives are unavailable",
         )
     )
     return AuditDoctorReport(tuple(checks))
