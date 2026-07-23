@@ -189,6 +189,37 @@ class AuditWorkspaceDiscoveryTests(TemporaryGitRepository):
         self.assertTrue(inspection.changes.has_changes)
         self.assertNotIn("secret", repr(inspection.changes))
 
+    def test_inspection_stops_the_metadata_walk_at_the_caller_deadline(self) -> None:
+        for index in range(8):
+            self.write(f"tracked-{index}.txt", b"tracked\n")
+        self.commit("tracked deadline fixtures")
+        location = self.workspace.discover(self.repository, deadline=_deadline())
+        original_lstat = audit_workspace._lstat_tracked_path
+        caller_deadline = time.monotonic() + 0.5
+        first_call = True
+
+        def slow_lstat(root_descriptor: int, path: str) -> os.stat_result | None:
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                time.sleep(max(0.0, caller_deadline - time.monotonic() + 0.02))
+            else:
+                time.sleep(0.06)
+            return original_lstat(root_descriptor, path)
+
+        started = time.monotonic()
+        with (
+            patch(
+                "zeus.audit_workspace._lstat_tracked_path",
+                side_effect=slow_lstat,
+            ) as tracked_lstat,
+            self.assertRaisesRegex(AuditWorkspaceError, "deadline"),
+        ):
+            self.workspace.inspect(location, deadline=caller_deadline)
+
+        self.assertEqual(1, tracked_lstat.call_count)
+        self.assertLess(time.monotonic() - started, 0.75)
+
     def test_directory_owner_mismatch_is_rejected(self) -> None:
         with (
             patch(
@@ -357,8 +388,37 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
             skipped,
         )
 
-    def test_treats_only_canonical_small_lfs_v1_pointers_as_pointers(self) -> None:
+    def test_records_valid_sorted_extended_lfs_v1_pointer_as_skipped(self) -> None:
         oid = b"a" * 64
+        pointer = (
+            b"version https://git-lfs.github.com/spec/v1\n"
+            b"custom metadata value \xe2\x9c\x93\n"
+            b"ext-0-example sha256:" + b"b" * 64 + b"\n"
+            b"oid sha256:" + oid + b"\n"
+            b"size 1\n"
+            b"x-note preserved\n"
+        )
+        self.write("extended.dat", pointer)
+        self.commit("extended LFS pointer")
+
+        snapshot = self.materialize()
+
+        self.assertFalse((snapshot.root / "extended.dat").exists())
+        self.assertIn(
+            ("extended.dat", "git-lfs-pointer"),
+            {(item.path, item.reason) for item in snapshot.skipped_content},
+        )
+
+    def test_treats_malformed_or_oversized_lfs_v1_forms_as_ordinary_files(self) -> None:
+        oid = b"a" * 64
+        oversize_prefix = (
+            b"version https://git-lfs.github.com/spec/v1\n"
+            b"oid sha256:" + oid + b"\n"
+            b"size 1\n"
+            b"x-padding "
+        )
+        oversized = oversize_prefix + b"a" * (1024 - len(oversize_prefix) - 1) + b"\n"
+        self.assertEqual(1024, len(oversized))
         near_pointers = {
             "missing-final-lf.dat": (
                 b"version https://git-lfs.github.com/spec/v1\noid sha256:" + oid + b"\nsize 1"
@@ -374,12 +434,46 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
             "leading-zero-size.dat": (
                 b"version https://git-lfs.github.com/spec/v1\noid sha256:" + oid + b"\nsize 01\n"
             ),
-            "extension.dat": (
+            "unsorted-extension.dat": (
                 b"version https://git-lfs.github.com/spec/v1\n"
+                b"oid sha256:" + oid + b"\n"
                 b"ext-0-example value\n"
+                b"size 1\n"
+            ),
+            "duplicate-key.dat": (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"custom first\n"
+                b"custom second\n"
                 b"oid sha256:" + oid + b"\n"
                 b"size 1\n"
             ),
+            "double-space.dat": (
+                b"version https://git-lfs.github.com/spec/v1\noid  sha256:" + oid + b"\nsize 1\n"
+            ),
+            "invalid-key.dat": (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"Bad_key value\n"
+                b"oid sha256:" + oid + b"\n"
+                b"size 1\n"
+            ),
+            "invalid-utf8.dat": (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"custom \xff\n"
+                b"oid sha256:" + oid + b"\n"
+                b"size 1\n"
+            ),
+            "duplicate-oid.dat": (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"oid sha256:" + oid + b"\n"
+                b"oid sha256:" + oid + b"\n"
+                b"size 1\n"
+            ),
+            "uppercase-oid.dat": (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"oid sha256:" + b"A" * 64 + b"\n"
+                b"size 1\n"
+            ),
+            "oversized.dat": oversized,
         }
         for path, content in near_pointers.items():
             self.write(path, content)

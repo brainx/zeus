@@ -30,11 +30,10 @@ _SYMLINK_TARGET_BYTES = 8 * 1024
 _PROCESS_READ_CHUNK = 64 * 1024
 _OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:")
-_LFS_POINTER_RE = re.compile(
-    rb"\Aversion https://git-lfs.github.com/spec/v1\n"
-    rb"oid sha256:[0-9a-f]{64}\n"
-    rb"size (?:0|[1-9][0-9]*)\n\Z"
-)
+_LFS_VERSION_VALUE = "https://git-lfs.github.com/spec/v1"
+_LFS_KEY_RE = re.compile(r"[a-z0-9.-]+\Z")
+_LFS_OID_VALUE_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_LFS_SIZE_VALUE_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _INDEX_DEBUG_RE = re.compile(
     rb"  ctime: (?P<ctime_seconds>[0-9]{1,20}):(?P<ctime_nanoseconds>[0-9]{1,20})\n"
     rb"  mtime: (?P<mtime_seconds>[0-9]{1,20}):(?P<mtime_nanoseconds>[0-9]{1,20})\n"
@@ -843,7 +842,10 @@ def _index_entry_matches_worktree(
 def _tracked_worktree_is_dirty(
     location: RepositoryLocation,
     entries: tuple[_IndexEntry, ...],
+    *,
+    deadline: float,
 ) -> bool:
+    _remaining(deadline)
     if any(entry.stage != 0 for entry in entries):
         return True
     flags = _required_posix_open_flags(
@@ -860,7 +862,9 @@ def _tracked_worktree_is_dirty(
         if _path_identity(opened) != location._root_identity:
             _error("repository root binding changed")
         for entry in entries:
+            _remaining(deadline)
             result = _lstat_tracked_path(root_descriptor, entry.path)
+            _remaining(deadline)
             if result is None or not _index_entry_matches_worktree(entry, result):
                 return True
         return False
@@ -872,7 +876,44 @@ def _tracked_worktree_is_dirty(
 
 
 def _looks_like_lfs_pointer(data: bytes) -> bool:
-    return len(data) < _LFS_POINTER_MAX_BYTES and _LFS_POINTER_RE.fullmatch(data) is not None
+    if not data or len(data) >= _LFS_POINTER_MAX_BYTES or not data.endswith(b"\n"):
+        return False
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    if "\r" in text or "\0" in text:
+        return False
+    lines = text[:-1].split("\n")
+    if not lines or lines[0] != f"version {_LFS_VERSION_VALUE}":
+        return False
+
+    seen = {"version"}
+    previous_key = ""
+    has_oid = False
+    has_size = False
+    for line in lines[1:]:
+        key, separator, value = line.partition(" ")
+        if (
+            separator != " "
+            or not value
+            or value.startswith(" ")
+            or _LFS_KEY_RE.fullmatch(key) is None
+            or key in seen
+            or key <= previous_key
+        ):
+            return False
+        seen.add(key)
+        previous_key = key
+        if key == "oid":
+            if _LFS_OID_VALUE_RE.fullmatch(value) is None:
+                return False
+            has_oid = True
+        elif key == "size":
+            if _LFS_SIZE_VALUE_RE.fullmatch(value) is None:
+                return False
+            has_size = True
+    return has_oid and has_size
 
 
 def _git_blob_digest(object_id: str, size: int) -> _Digest:
@@ -1385,7 +1426,11 @@ class AuditWorkspace:
         }
         staged = any(entry.stage != 0 for entry in index_entries) or stage_zero != head_entries
         changes = RepositoryChanges(
-            dirty=_tracked_worktree_is_dirty(location, index_entries),
+            dirty=_tracked_worktree_is_dirty(
+                location,
+                index_entries,
+                deadline=deadline,
+            ),
             staged=staged,
             untracked=_parse_untracked_metadata(untracked_data),
         )
