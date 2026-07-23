@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import math
 import os
@@ -24,13 +25,23 @@ _PRIVATE_FILE_MODE = 0o600
 _PRIVATE_EXECUTABLE_MODE = 0o700
 _DISCOVERY_OUTPUT_BYTES = 64 * 1024
 _BATCH_HEADER_BYTES = 256
-_LFS_POINTER_BYTES = 8 * 1024
+_LFS_POINTER_MAX_BYTES = 1024
+_SYMLINK_TARGET_BYTES = 8 * 1024
 _PROCESS_READ_CHUNK = 64 * 1024
 _OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
-_WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:\Z")
-_LFS_VERSION = b"version https://git-lfs.github.com/spec/v1"
-_LFS_OID_RE = re.compile(rb"oid sha256:[0-9a-f]{64}\Z")
-_LFS_SIZE_RE = re.compile(rb"size [0-9]+\Z")
+_WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:")
+_LFS_POINTER_RE = re.compile(
+    rb"\Aversion https://git-lfs.github.com/spec/v1\n"
+    rb"oid sha256:[0-9a-f]{64}\n"
+    rb"size (?:0|[1-9][0-9]*)\n\Z"
+)
+_INDEX_DEBUG_RE = re.compile(
+    rb"  ctime: (?P<ctime_seconds>[0-9]{1,20}):(?P<ctime_nanoseconds>[0-9]{1,20})\n"
+    rb"  mtime: (?P<mtime_seconds>[0-9]{1,20}):(?P<mtime_nanoseconds>[0-9]{1,20})\n"
+    rb"  dev: (?P<device>[0-9]{1,20})\tino: (?P<inode>[0-9]{1,20})\n"
+    rb"  uid: (?P<uid>[0-9]{1,20})\tgid: (?P<gid>[0-9]{1,20})\n"
+    rb"  size: (?P<size>[0-9]{1,20})\tflags: (?P<flags>[0-9a-f]{1,16})\n"
+)
 
 
 GIT_HARDENING_ARGUMENTS = (
@@ -146,6 +157,22 @@ class _TreeEntry:
     object_id: str
     size: int | None
     path: str
+
+
+@dataclass(frozen=True)
+class _IndexEntry:
+    mode: str
+    object_id: str
+    stage: int
+    path: str
+    ctime_seconds: int
+    ctime_nanoseconds: int
+    mtime_seconds: int
+    mtime_nanoseconds: int
+    inode: int
+    uid: int
+    gid: int
+    size: int
 
 
 def _error(message: str) -> NoReturn:
@@ -333,6 +360,7 @@ def _git_environment() -> dict[str, str]:
         "GIT_ASKPASS": os.devnull,
         "GIT_SSH_COMMAND": os.devnull,
         "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_PAGER": "cat",
     }
@@ -439,7 +467,7 @@ def _validate_relative_path_text(value: str, description: str) -> str:
     if (
         any(component in {"", ".", ".."} for component in components)
         or any(component.casefold() == ".git" for component in components)
-        or _WINDOWS_DRIVE_RE.fullmatch(components[0]) is not None
+        or _WINDOWS_DRIVE_RE.match(components[0]) is not None
         or posixpath.normpath(value) != value
     ):
         _error(f"{description} is not a confined relative POSIX path")
@@ -465,6 +493,25 @@ def _validate_exclusions(exclude_paths: tuple[str, ...]) -> tuple[str, ...]:
 
 def _is_excluded(path: str, exclusions: tuple[str, ...]) -> bool:
     return any(path == exclusion or path.startswith(f"{exclusion}/") for exclusion in exclusions)
+
+
+def _path_is_within(path: Path, boundary: Path) -> bool:
+    try:
+        return Path(os.path.commonpath((path, boundary))) == boundary
+    except ValueError:
+        return False
+
+
+def _existing_directory_is_within(directory: Path, boundary: Path) -> bool:
+    for candidate in (directory, *directory.parents):
+        try:
+            if candidate.samefile(boundary):
+                return True
+        except OSError as exc:
+            raise AuditWorkspaceError(
+                "snapshot destination ancestry could not be inspected"
+            ) from exc
+    return False
 
 
 def _validate_limits(limits: AuditLimits) -> None:
@@ -561,59 +608,271 @@ def _parse_tree(data: bytes, limits: AuditLimits) -> tuple[tuple[_TreeEntry, ...
     return tuple(entries), blob_bytes
 
 
-def _parse_status(data: bytes) -> RepositoryChanges:
+def _parse_index_metadata(
+    data: bytes,
+    limits: AuditLimits,
+) -> tuple[_IndexEntry, ...]:
     if not data:
-        return RepositoryChanges(dirty=False, staged=False, untracked=False)
+        return ()
+    entries: list[_IndexEntry] = []
+    keys: set[tuple[str, int]] = set()
+    oid_length: int | None = None
+    position = 0
+    while position < len(data):
+        terminator = data.find(b"\0", position)
+        if terminator < 0:
+            _error("Git index metadata has an unterminated record")
+        header = data[position:terminator]
+        position = terminator + 1
+        try:
+            metadata, path_bytes = header.split(b"\t", 1)
+            mode_bytes, object_id_bytes, stage_bytes = metadata.split(b" ")
+            mode = mode_bytes.decode("ascii", errors="strict")
+            object_id = object_id_bytes.decode("ascii", errors="strict")
+            stage_text = stage_bytes.decode("ascii", errors="strict")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise AuditWorkspaceError("Git index metadata has an invalid record") from exc
+        if mode not in {"100644", "100755", "120000", "160000"}:
+            _error("Git index metadata contains an unsupported mode")
+        if _OBJECT_ID_RE.fullmatch(object_id) is None:
+            _error("Git index metadata contains an invalid object ID")
+        if oid_length is None:
+            oid_length = len(object_id)
+        elif len(object_id) != oid_length:
+            _error("Git index metadata mixes object ID formats")
+        if stage_text not in {"0", "1", "2", "3"}:
+            _error("Git index metadata contains an invalid stage")
+        stage = int(stage_text)
+        path = _decode_tree_path(path_bytes)
+        key = (path, stage)
+        if key in keys:
+            _error("Git index metadata contains a duplicate path and stage")
+        keys.add(key)
+        match = _INDEX_DEBUG_RE.match(data, position)
+        if match is None:
+            _error("Git index debug metadata has an invalid record")
+        position = match.end()
+        try:
+            values = {
+                name: int(match.group(name), 10)
+                for name in (
+                    "ctime_seconds",
+                    "ctime_nanoseconds",
+                    "mtime_seconds",
+                    "mtime_nanoseconds",
+                    "inode",
+                    "uid",
+                    "gid",
+                    "size",
+                )
+            }
+        except ValueError as exc:
+            raise AuditWorkspaceError("Git index debug metadata has an invalid number") from exc
+        if values["ctime_nanoseconds"] >= 1_000_000_000:
+            _error("Git index debug metadata has an invalid ctime")
+        if values["mtime_nanoseconds"] >= 1_000_000_000:
+            _error("Git index debug metadata has an invalid mtime")
+        entries.append(
+            _IndexEntry(
+                mode=mode,
+                object_id=object_id,
+                stage=stage,
+                path=path,
+                ctime_seconds=values["ctime_seconds"],
+                ctime_nanoseconds=values["ctime_nanoseconds"],
+                mtime_seconds=values["mtime_seconds"],
+                mtime_nanoseconds=values["mtime_nanoseconds"],
+                inode=values["inode"],
+                uid=values["uid"],
+                gid=values["gid"],
+                size=values["size"],
+            )
+        )
+        if len(entries) > limits.snapshot_entries * 4:
+            _error("Git index entry count exceeded the metadata entry limit")
+    return tuple(entries)
+
+
+def _parse_head_index_metadata(
+    data: bytes,
+    limits: AuditLimits,
+) -> dict[str, tuple[str, str]]:
+    if not data:
+        return {}
     if not data.endswith(b"\0"):
-        _error("Git status metadata is not NUL terminated")
+        _error("Git HEAD metadata is not NUL terminated")
     records = data[:-1].split(b"\0")
-    dirty = False
-    staged = False
-    untracked = False
-    skip_rename_source = False
+    if len(records) > limits.snapshot_entries:
+        _error("Git HEAD entry count exceeded the metadata entry limit")
+    result: dict[str, tuple[str, str]] = {}
+    oid_length: int | None = None
     for record in records:
-        if skip_rename_source:
-            skip_rename_source = False
-            continue
-        if record.startswith((b"1 ", b"2 ")):
-            if len(record) < 5:
-                _error("Git status metadata has an invalid tracked record")
-            staged = staged or record[2:3] != b"."
-            dirty = dirty or record[3:4] != b"."
-            skip_rename_source = record.startswith(b"2 ")
-        elif record.startswith(b"u "):
-            if len(record) < 5:
-                _error("Git status metadata has an invalid unmerged record")
-            staged = True
-            dirty = True
-        elif record.startswith(b"? "):
-            untracked = True
-        elif record.startswith(b"! "):
-            continue
+        try:
+            metadata, path_bytes = record.split(b"\t", 1)
+            mode_bytes, type_bytes, object_id_bytes = metadata.split(b" ")
+            mode = mode_bytes.decode("ascii", errors="strict")
+            object_type = type_bytes.decode("ascii", errors="strict")
+            object_id = object_id_bytes.decode("ascii", errors="strict")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise AuditWorkspaceError("Git HEAD metadata has an invalid record") from exc
+        if mode in {"100644", "100755", "120000"}:
+            if object_type != "blob":
+                _error("Git HEAD metadata contains an invalid blob entry")
+        elif mode == "160000":
+            if object_type != "commit":
+                _error("Git HEAD metadata contains an invalid gitlink entry")
         else:
-            _error("Git status metadata contains an unsupported record")
-    if skip_rename_source:
-        _error("Git status metadata has an incomplete rename record")
-    return RepositoryChanges(dirty=dirty, staged=staged, untracked=untracked)
+            _error("Git HEAD metadata contains an unsupported mode")
+        if _OBJECT_ID_RE.fullmatch(object_id) is None:
+            _error("Git HEAD metadata contains an invalid object ID")
+        if oid_length is None:
+            oid_length = len(object_id)
+        elif len(object_id) != oid_length:
+            _error("Git HEAD metadata mixes object ID formats")
+        path = _decode_tree_path(path_bytes)
+        if path in result:
+            _error("Git HEAD metadata contains a duplicate path")
+        result[path] = (mode, object_id)
+    return result
+
+
+def _parse_untracked_metadata(data: bytes) -> bool:
+    if not data:
+        return False
+    if not data.endswith(b"\0"):
+        _error("Git untracked metadata is not NUL terminated")
+    records = data[:-1].split(b"\0")
+    if any(not record for record in records):
+        _error("Git untracked metadata contains an empty record")
+    seen: set[bytes] = set()
+    for record in records:
+        if record in seen:
+            _error("Git untracked metadata contains a duplicate path")
+        seen.add(record)
+        try:
+            path = record.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise AuditWorkspaceError("Git untracked path is not valid UTF-8") from exc
+        if path.endswith("/"):
+            path = path[:-1]
+        _validate_relative_path_text(path, "Git untracked path")
+    return True
+
+
+def _required_posix_open_flags(*names: str) -> int:
+    flags = os.O_RDONLY
+    for name in names:
+        value = getattr(os, name, None)
+        if not isinstance(value, int) or value == 0:
+            _error(f"required POSIX flag {name} is unavailable")
+        flags |= value
+    return flags
+
+
+def _lstat_tracked_path(root_descriptor: int, path: str) -> os.stat_result | None:
+    components = path.split("/")
+    directory_descriptor = root_descriptor
+    owned_descriptor: int | None = None
+    directory_flags = _required_posix_open_flags(
+        "O_DIRECTORY",
+        "O_NOFOLLOW",
+        "O_CLOEXEC",
+    )
+    try:
+        for component in components[:-1]:
+            try:
+                next_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as exc:
+                if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+                    return None
+                raise AuditWorkspaceError(
+                    "tracked worktree parent metadata could not be inspected"
+                ) from exc
+            if owned_descriptor is not None:
+                os.close(owned_descriptor)
+            owned_descriptor = next_descriptor
+            directory_descriptor = next_descriptor
+        try:
+            return os.lstat(components[-1], dir_fd=directory_descriptor)
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+                return None
+            raise AuditWorkspaceError("tracked worktree metadata could not be inspected") from exc
+    finally:
+        if owned_descriptor is not None:
+            with suppress(OSError):
+                os.close(owned_descriptor)
+
+
+def _index_entry_matches_worktree(
+    entry: _IndexEntry,
+    result: os.stat_result,
+) -> bool:
+    if entry.mode in {"100644", "100755"}:
+        if not stat.S_ISREG(result.st_mode):
+            return False
+        if bool(result.st_mode & 0o111) != (entry.mode == "100755"):
+            return False
+    elif entry.mode == "120000":
+        if not stat.S_ISLNK(result.st_mode):
+            return False
+    elif entry.mode == "160000":
+        if not stat.S_ISDIR(result.st_mode):
+            return False
+    else:
+        _error("Git index metadata contains an unsupported mode")
+    ctime_seconds, ctime_nanoseconds = divmod(result.st_ctime_ns, 1_000_000_000)
+    mtime_seconds, mtime_nanoseconds = divmod(result.st_mtime_ns, 1_000_000_000)
+    mask = 0xFFFF_FFFF
+    return (
+        entry.ctime_seconds == ctime_seconds & mask
+        and entry.ctime_nanoseconds == ctime_nanoseconds
+        and entry.mtime_seconds == mtime_seconds & mask
+        and entry.mtime_nanoseconds == mtime_nanoseconds
+        and entry.inode == result.st_ino & mask
+        and entry.uid == result.st_uid & mask
+        and entry.gid == result.st_gid & mask
+        and entry.size == result.st_size & mask
+    )
+
+
+def _tracked_worktree_is_dirty(
+    location: RepositoryLocation,
+    entries: tuple[_IndexEntry, ...],
+) -> bool:
+    if any(entry.stage != 0 for entry in entries):
+        return True
+    flags = _required_posix_open_flags(
+        "O_DIRECTORY",
+        "O_NOFOLLOW",
+        "O_CLOEXEC",
+    )
+    try:
+        root_descriptor = os.open(location.root, flags)
+    except OSError as exc:
+        raise AuditWorkspaceError("repository root could not be opened safely") from exc
+    try:
+        opened = os.fstat(root_descriptor)
+        if _path_identity(opened) != location._root_identity:
+            _error("repository root binding changed")
+        for entry in entries:
+            result = _lstat_tracked_path(root_descriptor, entry.path)
+            if result is None or not _index_entry_matches_worktree(entry, result):
+                return True
+        return False
+    except OSError as exc:
+        raise AuditWorkspaceError("tracked worktree metadata could not be inspected") from exc
+    finally:
+        with suppress(OSError):
+            os.close(root_descriptor)
 
 
 def _looks_like_lfs_pointer(data: bytes) -> bool:
-    if len(data) > _LFS_POINTER_BYTES:
-        return False
-    lines = data.rstrip(b"\n").splitlines()
-    if not lines or lines[0].rstrip(b"\r") != _LFS_VERSION:
-        return False
-    normalized = [line.rstrip(b"\r") for line in lines[1:]]
-    return (
-        sum(_LFS_OID_RE.fullmatch(line) is not None for line in normalized) == 1
-        and sum(_LFS_SIZE_RE.fullmatch(line) is not None for line in normalized) == 1
-        and all(
-            line.startswith(b"ext-")
-            or _LFS_OID_RE.fullmatch(line) is not None
-            or _LFS_SIZE_RE.fullmatch(line) is not None
-            for line in normalized
-        )
-    )
+    return len(data) < _LFS_POINTER_MAX_BYTES and _LFS_POINTER_RE.fullmatch(data) is not None
 
 
 def _git_blob_digest(object_id: str, size: int) -> _Digest:
@@ -642,7 +901,7 @@ def _blob_size(entry: _TreeEntry) -> int:
 
 
 def _decode_symlink_target(data: bytes, path: str) -> str:
-    if len(data) > _LFS_POINTER_BYTES:
+    if len(data) > _SYMLINK_TARGET_BYTES:
         _error(f"snapshot symlink target for {path} is too large")
     try:
         target = data.decode("utf-8", errors="strict")
@@ -654,7 +913,7 @@ def _decode_symlink_target(data: bytes, path: str) -> str:
         or target.startswith("/")
         or "\\" in target
         or "\0" in target
-        or _WINDOWS_DRIVE_RE.fullmatch(target.split("/", 1)[0]) is not None
+        or _WINDOWS_DRIVE_RE.match(target.split("/", 1)[0]) is not None
     ):
         _error(f"snapshot symlink target for {path} is not confined")
     resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
@@ -846,9 +1105,11 @@ class AuditWorkspace:
         arguments: tuple[str, ...],
         *,
         deadline: float,
+        command_seconds: int,
         max_output_bytes: int,
         description: str,
     ) -> bytes:
+        command_deadline = _bounded_deadline(deadline, command_seconds)
         process = self._spawn(
             cwd,
             arguments,
@@ -857,7 +1118,7 @@ class AuditWorkspace:
         )
         return _collect_bounded_process(
             process,
-            deadline=deadline,
+            deadline=command_deadline,
             max_output_bytes=max_output_bytes,
             description=description,
         )
@@ -868,12 +1129,14 @@ class AuditWorkspace:
         argument: str,
         *,
         deadline: float,
+        command_seconds: int,
         description: str,
     ) -> Path:
         output = self._run(
             cwd,
             ("rev-parse", "--path-format=absolute", argument),
             deadline=deadline,
+            command_seconds=command_seconds,
             max_output_bytes=_DISCOVERY_OUTPUT_BYTES,
             description=description,
         )
@@ -883,36 +1146,52 @@ class AuditWorkspace:
             _error(f"{description} is not absolute")
         return _absolute_lexical_path(path, description)
 
-    def _resolve_head(self, cwd: Path, *, deadline: float) -> str:
+    def _resolve_head(
+        self,
+        cwd: Path,
+        *,
+        deadline: float,
+        command_seconds: int,
+    ) -> str:
         output = self._run(
             cwd,
             ("rev-parse", "--verify", "HEAD^{commit}"),
             deadline=deadline,
+            command_seconds=command_seconds,
             max_output_bytes=_DISCOVERY_OUTPUT_BYTES,
             description="committed HEAD discovery",
         )
         return _single_oid(output, "committed HEAD")
 
-    def discover(self, cwd: Path, *, deadline: float) -> RepositoryLocation:
-        command_deadline = _bounded_deadline(deadline, HARD_LIMITS.git_command_seconds)
+    def _discover(
+        self,
+        cwd: Path,
+        *,
+        deadline: float,
+        command_seconds: int,
+    ) -> RepositoryLocation:
+        _validate_deadline(deadline)
         safe_cwd = _absolute_lexical_path(cwd, "repository discovery directory")
         _capture_safe_directory(safe_cwd, "repository discovery directory")
         root = self._resolve_path(
             safe_cwd,
             "--show-toplevel",
-            deadline=command_deadline,
+            deadline=deadline,
+            command_seconds=command_seconds,
             description="repository root discovery",
         )
         git_dir = self._resolve_path(
             safe_cwd,
             "--absolute-git-dir",
-            deadline=command_deadline,
+            deadline=deadline,
+            command_seconds=command_seconds,
             description="Git directory discovery",
         )
         common_git_dir = self._resolve_path(
             safe_cwd,
             "--git-common-dir",
-            deadline=command_deadline,
+            deadline=deadline,
+            command_seconds=command_seconds,
             description="common Git directory discovery",
         )
         root_identity = _capture_safe_directory(root, "repository root")
@@ -922,7 +1201,11 @@ class AuditWorkspace:
         )
         git_marker_identity = _capture_repository_marker(root)
         _validate_repository_metadata(git_dir, common_git_dir)
-        head = self._resolve_head(root, deadline=command_deadline)
+        head = self._resolve_head(
+            root,
+            deadline=deadline,
+            command_seconds=command_seconds,
+        )
         repository_id = hashlib.sha256(str(root).encode("utf-8", errors="strict")).hexdigest()
         return RepositoryLocation(
             root=root,
@@ -936,18 +1219,54 @@ class AuditWorkspace:
             _common_git_dir_identity=common_git_dir_identity,
         )
 
+    def discover(self, cwd: Path, *, deadline: float) -> RepositoryLocation:
+        return self._discover(
+            cwd,
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
+        )
+
+    def _revalidate(
+        self,
+        location: RepositoryLocation,
+        *,
+        deadline: float,
+        command_seconds: int,
+    ) -> RepositoryLocation:
+        if not isinstance(location, RepositoryLocation):
+            _error("repository location is invalid")
+        _validate_deadline(deadline)
+        self._validate_location_bindings(location)
+        self._reject_external_object_sources(
+            location,
+            deadline=deadline,
+            command_seconds=command_seconds,
+        )
+        current = self._discover(
+            location.root,
+            deadline=deadline,
+            command_seconds=command_seconds,
+        )
+        if current != location:
+            _error("repository binding or committed HEAD changed")
+        self._reject_external_object_sources(
+            current,
+            deadline=deadline,
+            command_seconds=command_seconds,
+        )
+        return current
+
     def revalidate(
         self,
         location: RepositoryLocation,
         *,
         deadline: float,
     ) -> RepositoryLocation:
-        if not isinstance(location, RepositoryLocation):
-            _error("repository location is invalid")
-        current = self.discover(location.root, deadline=deadline)
-        if current != location:
-            _error("repository binding or committed HEAD changed")
-        return current
+        return self._revalidate(
+            location,
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
+        )
 
     def _validate_location_bindings(self, location: RepositoryLocation) -> None:
         _validate_identity(
@@ -975,6 +1294,7 @@ class AuditWorkspace:
         location: RepositoryLocation,
         *,
         deadline: float,
+        command_seconds: int,
     ) -> None:
         checked: set[Path] = set()
         for git_directory in (location.git_dir, location.common_git_dir):
@@ -998,6 +1318,7 @@ class AuditWorkspace:
             location.root,
             ("for-each-ref", "--format=%(refname)", "refs/replace/"),
             deadline=deadline,
+            command_seconds=command_seconds,
             max_output_bytes=_DISCOVERY_OUTPUT_BYTES,
             description="Git replacement reference inspection",
         )
@@ -1010,25 +1331,78 @@ class AuditWorkspace:
         *,
         deadline: float,
     ) -> RepositoryInspection:
-        command_deadline = _bounded_deadline(deadline, HARD_LIMITS.git_command_seconds)
-        self.revalidate(location, deadline=command_deadline)
-        self._reject_external_object_sources(location, deadline=command_deadline)
-        status = self._run(
+        _validate_deadline(deadline)
+        self._revalidate(
+            location,
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
+        )
+        index_data = self._run(
             location.root,
             (
-                "status",
-                "--porcelain=v2",
+                "ls-files",
+                "--stage",
+                "--debug",
                 "-z",
-                "--untracked-files=normal",
-                "--ignore-submodules=all",
+                "--full-name",
             ),
-            deadline=command_deadline,
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
             max_output_bytes=HARD_LIMITS.git_metadata_bytes,
-            description="Git status metadata",
+            description="Git index metadata",
         )
-        changes = _parse_status(status)
+        head_data = self._run(
+            location.root,
+            (
+                "ls-tree",
+                "-rz",
+                "--full-tree",
+                location.head,
+            ),
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
+            max_output_bytes=HARD_LIMITS.git_metadata_bytes,
+            description="Git HEAD metadata",
+        )
+        untracked_data = self._run(
+            location.root,
+            (
+                "ls-files",
+                "--others",
+                "--directory",
+                "-z",
+                "--full-name",
+            ),
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
+            max_output_bytes=HARD_LIMITS.git_metadata_bytes,
+            description="Git untracked metadata",
+        )
+        index_entries = _parse_index_metadata(index_data, HARD_LIMITS)
+        head_entries = _parse_head_index_metadata(head_data, HARD_LIMITS)
+        stage_zero = {
+            entry.path: (entry.mode, entry.object_id) for entry in index_entries if entry.stage == 0
+        }
+        staged = any(entry.stage != 0 for entry in index_entries) or stage_zero != head_entries
+        changes = RepositoryChanges(
+            dirty=_tracked_worktree_is_dirty(location, index_entries),
+            staged=staged,
+            untracked=_parse_untracked_metadata(untracked_data),
+        )
         self._validate_location_bindings(location)
-        if self._resolve_head(location.root, deadline=command_deadline) != location.head:
+        self._reject_external_object_sources(
+            location,
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
+        )
+        if (
+            self._resolve_head(
+                location.root,
+                deadline=deadline,
+                command_seconds=HARD_LIMITS.git_command_seconds,
+            )
+            != location.head
+        ):
             _error("committed HEAD changed during repository inspection")
         return RepositoryInspection(location=location, changes=changes)
 
@@ -1038,6 +1412,7 @@ class AuditWorkspace:
         *,
         limits: AuditLimits,
         deadline: float,
+        command_seconds: int,
     ) -> tuple[tuple[_TreeEntry, ...], int]:
         output = self._run(
             inspection.location.root,
@@ -1049,6 +1424,7 @@ class AuditWorkspace:
                 inspection.location.head,
             ),
             deadline=deadline,
+            command_seconds=command_seconds,
             max_output_bytes=limits.git_metadata_bytes,
             description="Git tree metadata",
         )
@@ -1056,11 +1432,26 @@ class AuditWorkspace:
 
     def _prepare_destination(
         self,
+        location: RepositoryLocation,
         destination: Path,
     ) -> tuple[Path, _PathIdentity]:
         safe_destination = Path(os.path.abspath(destination))
         _strict_utf8_path_text(str(safe_destination), "snapshot destination")
+        for boundary in {
+            location.root,
+            location.git_dir,
+            location.common_git_dir,
+        }:
+            if _path_is_within(safe_destination, boundary):
+                _error("snapshot destination is inside repository boundaries")
         parent = _absolute_lexical_path(safe_destination.parent, "snapshot destination parent")
+        for boundary in {
+            location.root,
+            location.git_dir,
+            location.common_git_dir,
+        }:
+            if _existing_directory_is_within(parent, boundary):
+                _error("snapshot destination is inside repository boundaries")
         _capture_safe_directory(parent, "snapshot destination parent", private=True)
         try:
             os.mkdir(safe_destination, _PRIVATE_DIRECTORY_MODE)
@@ -1229,6 +1620,7 @@ class AuditWorkspace:
         limits: AuditLimits,
         deadline: float,
     ) -> tuple[tuple[SnapshotManifestEntry, ...], tuple[SkippedContent, ...]]:
+        command_deadline = _bounded_deadline(deadline, limits.git_command_seconds)
         manifest: list[SnapshotManifestEntry] = []
         skipped = [
             SkippedContent(path=entry.path, reason="gitlink")
@@ -1255,12 +1647,12 @@ class AuditWorkspace:
         )
         reader = _BoundedPipeReader(
             process.stdout,
-            deadline=deadline,
+            deadline=command_deadline,
             byte_limit=limits.snapshot_blob_bytes + header_allowance + len(requested),
         )
         try:
             for entry in requested:
-                _remaining(deadline)
+                _remaining(command_deadline)
                 try:
                     process.stdin.write(f"{entry.object_id}\n".encode("ascii"))
                     process.stdin.flush()
@@ -1268,18 +1660,24 @@ class AuditWorkspace:
                     raise AuditWorkspaceError("Git blob request could not be written") from exc
                 self._read_batch_header(reader, entry)
                 entry_size = _blob_size(entry)
-                if entry.mode == "120000" or entry_size <= _LFS_POINTER_BYTES:
+                if entry.mode == "120000":
+                    if entry_size > _SYMLINK_TARGET_BYTES:
+                        _error(f"snapshot symlink target for {entry.path} is too large")
                     data = reader.read_exact(entry_size)
                     if reader.read_exact(1) != b"\n":
                         _error("Git blob stream returned an invalid object terminator")
                     _verify_small_git_blob(entry, data)
-                    if entry.mode != "120000" and _looks_like_lfs_pointer(data):
+                    manifest.append(self._write_symlink(root, entry, data))
+                    continue
+                if entry_size < _LFS_POINTER_MAX_BYTES:
+                    data = reader.read_exact(entry_size)
+                    if reader.read_exact(1) != b"\n":
+                        _error("Git blob stream returned an invalid object terminator")
+                    _verify_small_git_blob(entry, data)
+                    if _looks_like_lfs_pointer(data):
                         skipped.append(SkippedContent(path=entry.path, reason="git-lfs-pointer"))
                         continue
-                    if entry.mode == "120000":
-                        manifest.append(self._write_symlink(root, entry, data))
-                    else:
-                        manifest.append(self._write_small_regular_file(root, entry, data))
+                    manifest.append(self._write_small_regular_file(root, entry, data))
                     continue
                 manifest.append(self._write_streamed_regular_file(root, entry, reader))
                 if reader.read_exact(1) != b"\n":
@@ -1287,7 +1685,7 @@ class AuditWorkspace:
             try:
                 process.stdin.close()
                 reader.ensure_eof()
-                return_code = process.wait(timeout=_remaining(deadline))
+                return_code = process.wait(timeout=_remaining(command_deadline))
             except subprocess.TimeoutExpired:
                 _stop_process(process)
                 _error("Git blob stream exceeded its deadline")
@@ -1332,18 +1730,29 @@ class AuditWorkspace:
         exclusions = _validate_exclusions(exclude_paths)
         materialization_deadline = _bounded_deadline(deadline, limits.materialization_seconds)
         location = inspection.location
-        self.revalidate(location, deadline=materialization_deadline)
-        self._reject_external_object_sources(location, deadline=materialization_deadline)
+        self._revalidate(
+            location,
+            deadline=materialization_deadline,
+            command_seconds=limits.git_command_seconds,
+        )
         entries, blob_bytes = self._tree_entries(
             inspection,
             limits=limits,
             deadline=materialization_deadline,
+            command_seconds=limits.git_command_seconds,
         )
         self._validate_location_bindings(location)
-        if self._resolve_head(location.root, deadline=materialization_deadline) != location.head:
+        if (
+            self._resolve_head(
+                location.root,
+                deadline=materialization_deadline,
+                command_seconds=limits.git_command_seconds,
+            )
+            != location.head
+        ):
             _error("committed HEAD changed during tree enumeration")
 
-        root, root_identity = self._prepare_destination(destination)
+        root, root_identity = self._prepare_destination(location, destination)
         try:
             manifest, skipped = self._materialize_blobs(
                 location,
@@ -1357,10 +1766,12 @@ class AuditWorkspace:
             self._reject_external_object_sources(
                 location,
                 deadline=materialization_deadline,
+                command_seconds=limits.git_command_seconds,
             )
             final_head = self._resolve_head(
                 location.root,
                 deadline=materialization_deadline,
+                command_seconds=limits.git_command_seconds,
             )
             if final_head != location.head:
                 _error("committed HEAD changed during snapshot materialization")

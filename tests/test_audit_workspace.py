@@ -10,7 +10,9 @@ import unittest
 import zlib
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from unittest.mock import patch
 
+import zeus.audit_workspace as audit_workspace
 from zeus.audit_models import HARD_LIMITS, AuditLimits
 from zeus.audit_workspace import (
     AuditWorkspace,
@@ -164,6 +166,14 @@ class AuditWorkspaceDiscoveryTests(TemporaryGitRepository):
         with self.assertRaisesRegex(AuditWorkspaceError, "changed"):
             self.workspace.revalidate(location, deadline=_deadline())
 
+    def test_revalidate_repeats_external_object_source_checks(self) -> None:
+        location = self.workspace.discover(self.repository, deadline=_deadline())
+        alternates = self.repository / ".git" / "objects" / "info" / "alternates"
+        alternates.write_text("/untrusted/object/store\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(AuditWorkspaceError, "alternate"):
+            self.workspace.revalidate(location, deadline=_deadline())
+
     def test_inspection_records_only_dirty_staged_and_untracked_state(self) -> None:
         self.write("README.md", b"dirty worktree sentinel\n")
         self.write("staged.txt", b"staged content sentinel\n")
@@ -178,6 +188,19 @@ class AuditWorkspaceDiscoveryTests(TemporaryGitRepository):
         self.assertTrue(inspection.changes.untracked)
         self.assertTrue(inspection.changes.has_changes)
         self.assertNotIn("secret", repr(inspection.changes))
+
+    def test_directory_owner_mismatch_is_rejected(self) -> None:
+        with (
+            patch(
+                "zeus.audit_workspace.os.geteuid",
+                return_value=os.geteuid() + 1,
+            ),
+            self.assertRaisesRegex(AuditWorkspaceError, "owner"),
+        ):
+            audit_workspace._capture_safe_directory(
+                self.repository,
+                "repository root",
+            )
 
     def test_rejects_group_or_other_writable_repository_boundaries(self) -> None:
         cases = (self.repository, self.repository / ".git")
@@ -334,6 +357,42 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
             skipped,
         )
 
+    def test_treats_only_canonical_small_lfs_v1_pointers_as_pointers(self) -> None:
+        oid = b"a" * 64
+        near_pointers = {
+            "missing-final-lf.dat": (
+                b"version https://git-lfs.github.com/spec/v1\noid sha256:" + oid + b"\nsize 1"
+            ),
+            "crlf.dat": (
+                b"version https://git-lfs.github.com/spec/v1\r\n"
+                b"oid sha256:" + oid + b"\r\n"
+                b"size 1\r\n"
+            ),
+            "reordered.dat": (
+                b"version https://git-lfs.github.com/spec/v1\nsize 1\noid sha256:" + oid + b"\n"
+            ),
+            "leading-zero-size.dat": (
+                b"version https://git-lfs.github.com/spec/v1\noid sha256:" + oid + b"\nsize 01\n"
+            ),
+            "extension.dat": (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"ext-0-example value\n"
+                b"oid sha256:" + oid + b"\n"
+                b"size 1\n"
+            ),
+        }
+        for path, content in near_pointers.items():
+            self.write(path, content)
+        self.commit("near LFS pointers")
+
+        snapshot = self.materialize()
+
+        for path, content in near_pointers.items():
+            with self.subTest(path=path):
+                self.assertEqual(content, (snapshot.root / path).read_bytes())
+        skipped_paths = {item.path for item in snapshot.skipped_content}
+        self.assertTrue(skipped_paths.isdisjoint(near_pointers))
+
     def test_rejects_unsafe_symlink_targets_and_cleans_owned_destination(self) -> None:
         for index, target in enumerate(("/absolute", "../../escape", "C:/outside")):
             with self.subTest(target=target):
@@ -366,6 +425,29 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
             )
 
         self.assertEqual(b"preserve", marker.read_bytes())
+
+    def test_rejects_destinations_inside_repository_boundaries(self) -> None:
+        inspection = self.inspect()
+        destinations = [
+            self.repository / "snapshot",
+            self.repository / ".git" / "snapshot",
+        ]
+        case_alias = self.repository.with_name(self.repository.name.upper())
+        if case_alias != self.repository and case_alias.exists():
+            destinations.append(case_alias / "case-alias-snapshot")
+        for destination in destinations:
+            with (
+                self.subTest(destination=destination),
+                self.assertRaisesRegex(AuditWorkspaceError, "inside repository"),
+            ):
+                self.workspace.materialize(
+                    inspection,
+                    destination,
+                    exclude_paths=(),
+                    limits=HARD_LIMITS,
+                    deadline=_deadline(),
+                )
+            self.assertFalse(destination.exists())
 
     def test_rejects_git_metadata_output_ceiling_and_expired_materialization_deadline(
         self,
@@ -443,6 +525,7 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
                 ),
             ),
             ("traversal", ((b"100644", b"..", blob_id),)),
+            ("drive-relative", ((b"100644", b"C:outside", blob_id),)),
             ("invalid-utf8", ((b"100644", b"\xff", blob_id),)),
             (
                 "non-normalized-unicode",
@@ -479,3 +562,32 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
 
         with self.assertRaisesRegex(AuditWorkspaceError, "unsupported mode"):
             _parse_tree(record, HARD_LIMITS)
+
+    def test_rejects_index_and_untracked_protocol_drift(self) -> None:
+        oid = b"a" * 40
+        valid = (
+            b"100644 " + oid + b" 0\ttracked.txt\0"
+            b"  ctime: 1:2\n"
+            b"  mtime: 3:4\n"
+            b"  dev: 5\tino: 6\n"
+            b"  uid: 7\tgid: 8\n"
+            b"  size: 9\tflags: 0\n"
+        )
+        malformed_index_records = (
+            valid[:-1],
+            valid + valid,
+            valid.replace(b"  mtime:", b" mtime:", 1),
+        )
+        for record in malformed_index_records:
+            with (
+                self.subTest(record=record),
+                self.assertRaises(AuditWorkspaceError),
+            ):
+                audit_workspace._parse_index_metadata(record, HARD_LIMITS)
+
+        for record in (b"unterminated", b"path\0\0"):
+            with (
+                self.subTest(untracked=record),
+                self.assertRaises(AuditWorkspaceError),
+            ):
+                audit_workspace._parse_untracked_metadata(record)
