@@ -237,9 +237,9 @@ def _relative_source_path(value: object) -> str:
         or (components and components[0].endswith(":"))
     ):
         _error("source evidence path must be a confined relative POSIX path")
-    bounded, truncated = _truncate_utf8(value, MAX_REPORT_TEXT_BYTES)
-    if truncated or bounded != value:
-        _error("source evidence path exceeds its byte limit")
+    sanitized, truncated = _sanitize_report_text(value, "source evidence path")
+    if truncated or sanitized != value:
+        _error("source evidence path must be redacted and within its byte limit")
     return value
 
 
@@ -637,6 +637,14 @@ def build_audit_report(
     skipped_content: Sequence[SkippedContent],
     model_result: ModelAuditResult,
 ) -> AuditReport:
+    _strict_int(
+        model_result.completeness.rejected_findings,
+        "rejected_findings",
+    )
+    _strict_int(
+        model_result.completeness.truncated_findings,
+        "truncated_findings",
+    )
     safe_run_id, run_id_truncated = _sanitize_report_text(run_id, "run_id")
     safe_repository_id, repository_truncated = _sanitize_report_text(
         repository_id, "repository_id"
@@ -723,7 +731,7 @@ def build_audit_report(
     )
     if status is AuditStatus.completed and not completeness.complete:
         status = AuditStatus.partial
-    return AuditReport(
+    report = AuditReport(
         schema_version=REPORT_SCHEMA_VERSION,
         run_id=safe_run_id,
         repository_id=safe_repository_id,
@@ -736,6 +744,8 @@ def build_audit_report(
         severity_counts=_severity_counts(sorted_findings),
         completeness=completeness,
     )
+    _validate_report_invariants(report)
+    return report
 
 
 def _evidence_value(evidence: AuditEvidence) -> dict[str, object]:
@@ -833,6 +843,15 @@ def _validate_report_invariants(report: AuditReport) -> None:
         _error(f"report schema_version must be exactly {REPORT_SCHEMA_VERSION}")
     if report.findings != _sort_findings(report.findings):
         _error("report findings are not in canonical order")
+    if report.checks != tuple(sorted(report.checks, key=lambda check: check.name)):
+        _error("report checks are not in canonical order")
+    if report.skipped_content != tuple(
+        sorted(
+            report.skipped_content,
+            key=lambda skipped: (skipped.path, skipped.reason),
+        )
+    ):
+        _error("report skipped content is not in canonical order")
     if report.severity_counts != _severity_counts(report.findings):
         _error("report severity counts do not match findings")
     if len({finding.finding_id for finding in report.findings}) != len(report.findings):
@@ -859,7 +878,19 @@ def _validate_report_invariants(report: AuditReport) -> None:
             _error("check duration_seconds must be finite and non-negative")
     for finding in report.findings:
         for evidence in finding.evidence:
-            if isinstance(evidence, CheckEvidence) and evidence.check_name not in check_names:
+            if isinstance(evidence, SourceEvidence):
+                _relative_source_path(evidence.path)
+                if type(evidence.start_line) is not int or evidence.start_line < 1:
+                    _error("source evidence start_line must be a positive integer")
+                if evidence.end_line is not None and (
+                    type(evidence.end_line) is not int
+                    or evidence.end_line < evidence.start_line
+                ):
+                    _error("source evidence end_line must not precede start_line")
+            elif (
+                isinstance(evidence, CheckEvidence)
+                and evidence.check_name not in check_names
+            ):
                 _error("check evidence must reference a recorded check")
 
 
@@ -1094,7 +1125,7 @@ def _markdown_text(value: str) -> str:
                 result.append("<br>")
         elif character == "\t":
             result.append(" ")
-        elif ord(character) < 0x20 or ord(character) == 0x7F:
+        elif ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F:
             result.append(f"\\u{ord(character):04x}")
         else:
             result.append(character)

@@ -296,6 +296,30 @@ class ModelOutputValidationTests(unittest.TestCase):
                 result = _validate(_model_bytes([finding]))
                 self.assertEqual((), result.findings)
 
+    def test_source_evidence_rejects_paths_that_would_be_redacted(self) -> None:
+        secret = "path-secret"
+        secret_path = f"src/token={secret}.py"
+        finding = _finding(
+            evidence=[
+                {
+                    "type": "source",
+                    "path": secret_path,
+                    "start_line": 1,
+                    "end_line": None,
+                    "observation": "claim",
+                }
+            ]
+        )
+
+        result = _validate(
+            _model_bytes([finding]),
+            source_line_counts={secret_path: 2},
+        )
+
+        self.assertEqual((), result.findings)
+        self.assertEqual(1, result.completeness.rejected_findings)
+        self.assertNotIn(secret, repr(result))
+
     def test_check_and_repository_evidence_must_be_verifiable(self) -> None:
         invalid_evidence = (
             {"type": "check", "check_name": "missing", "observation": "claim"},
@@ -454,6 +478,29 @@ class AuditReportTests(unittest.TestCase):
             report.completeness.reasons,
         )
 
+    def test_build_rejects_negative_completeness_counters(self) -> None:
+        invalid_completeness = (
+            replace(
+                self._model_result().completeness,
+                rejected_findings=-1,
+            ),
+            replace(
+                self._model_result().completeness,
+                truncated_findings=-1,
+            ),
+        )
+        for completeness in invalid_completeness:
+            with self.subTest(completeness=completeness):
+                model_result = replace(
+                    self._model_result(),
+                    completeness=completeness,
+                )
+                with self.assertRaises(AuditReportError):
+                    self._report(
+                        status=AuditStatus.completed,
+                        model_result=model_result,
+                    )
+
     def test_build_redacts_authoritative_non_model_strings(self) -> None:
         secret = "persisted-secret"
         metadata = replace(
@@ -533,17 +580,117 @@ class AuditReportTests(unittest.TestCase):
             with self.subTest(document=document), self.assertRaises(AuditReportError):
                 parse_audit_report(document, max_bytes=HARD_LIMITS.artifact_bytes)
 
+    def test_source_paths_requiring_redaction_are_rejected_at_every_sink(self) -> None:
+        secret = "path-secret"
+        secret_path = f"src/token={secret}.py"
+        report = self._report()
+        original_evidence = report.findings[0].evidence[0]
+        self.assertIsInstance(original_evidence, SourceEvidence)
+        assert isinstance(original_evidence, SourceEvidence)
+        evidence = replace(original_evidence, path=secret_path)
+        finding = replace(report.findings[0], evidence=(evidence,))
+        untrusted = replace(report, findings=(finding,))
+
+        with self.assertRaises(AuditReportError):
+            serialize_audit_report(untrusted)
+        with self.assertRaises(AuditReportError):
+            render_audit_markdown(untrusted)
+
+        decoded = json.loads(serialize_audit_report(report))
+        decoded["findings"][0]["evidence"][0]["path"] = secret_path
+        with self.assertRaises(AuditReportError):
+            parse_audit_report(
+                json.dumps(decoded).encode(),
+                max_bytes=HARD_LIMITS.artifact_bytes,
+            )
+
+    def test_source_line_invariants_are_enforced_by_json_and_markdown_sinks(self) -> None:
+        report = self._report()
+        invalid_ranges = (
+            (0, None),
+            (-1, None),
+            (2, 0),
+            (3, 2),
+        )
+        for start_line, end_line in invalid_ranges:
+            with self.subTest(start_line=start_line, end_line=end_line):
+                original_evidence = report.findings[0].evidence[0]
+                self.assertIsInstance(original_evidence, SourceEvidence)
+                assert isinstance(original_evidence, SourceEvidence)
+                evidence = replace(
+                    original_evidence,
+                    start_line=start_line,
+                    end_line=end_line,
+                )
+                finding = replace(report.findings[0], evidence=(evidence,))
+                invalid = replace(report, findings=(finding,))
+                with self.assertRaises(AuditReportError):
+                    serialize_audit_report(invalid)
+                with self.assertRaises(AuditReportError):
+                    render_audit_markdown(invalid)
+
+        serialized = serialize_audit_report(report)
+        self.assertEqual(
+            report,
+            parse_audit_report(serialized, max_bytes=len(serialized)),
+        )
+
     def test_parse_rejects_invalid_stored_counts_and_completeness_invariants(self) -> None:
         decoded = json.loads(serialize_audit_report(self._report()))
         decoded["severity_counts"]["high"] = 999
         with self.assertRaises(AuditReportError):
             parse_audit_report(json.dumps(decoded).encode(), max_bytes=HARD_LIMITS.artifact_bytes)
 
-        decoded = json.loads(serialize_audit_report(self._report()))
-        decoded["completeness"]["complete"] = False
-        decoded["status"] = "partial"
+        for status in ("partial", "completed"):
+            with self.subTest(status=status):
+                decoded = json.loads(serialize_audit_report(self._report()))
+                decoded["completeness"]["complete"] = False
+                decoded["status"] = status
+                with self.assertRaises(AuditReportError):
+                    parse_audit_report(
+                        json.dumps(decoded).encode(),
+                        max_bytes=HARD_LIMITS.artifact_bytes,
+                    )
+
+    def test_noncanonical_check_and_skipped_content_order_is_rejected(self) -> None:
+        report = build_audit_report(
+            run_id="run-123",
+            repository_id="repo-456",
+            status=AuditStatus.completed,
+            metadata=_metadata(),
+            checks=_checks(),
+            skipped_content=(
+                SkippedContent("z-last", "excluded"),
+                SkippedContent("a-first", "excluded"),
+            ),
+            model_result=self._model_result(),
+        )
+        self.assertEqual(
+            ["a-first", "z-last"],
+            [item.path for item in report.skipped_content],
+        )
+
+        for field in ("checks", "skipped_content"):
+            with self.subTest(field=field):
+                decoded = json.loads(serialize_audit_report(report))
+                decoded[field].reverse()
+                with self.assertRaises(AuditReportError):
+                    parse_audit_report(
+                        json.dumps(decoded).encode(),
+                        max_bytes=HARD_LIMITS.artifact_bytes,
+                    )
+
         with self.assertRaises(AuditReportError):
-            parse_audit_report(json.dumps(decoded).encode(), max_bytes=HARD_LIMITS.artifact_bytes)
+            serialize_audit_report(
+                replace(report, checks=tuple(reversed(report.checks)))
+            )
+        with self.assertRaises(AuditReportError):
+            serialize_audit_report(
+                replace(
+                    report,
+                    skipped_content=tuple(reversed(report.skipped_content)),
+                )
+            )
 
     def test_serializer_rejects_unverified_check_evidence(self) -> None:
         report = self._report()
@@ -563,12 +710,6 @@ class AuditReportTests(unittest.TestCase):
         with self.assertRaises(AuditReportError):
             serialize_audit_report(report)
 
-        decoded = json.loads(serialize_audit_report(self._report()))
-        decoded["completeness"]["complete"] = False
-        decoded["status"] = "completed"
-        with self.assertRaises(AuditReportError):
-            parse_audit_report(json.dumps(decoded).encode(), max_bytes=HARD_LIMITS.artifact_bytes)
-
     def test_markdown_is_deterministic_and_escapes_controls_and_table_delimiters(self) -> None:
         result = _validate(
             _model_bytes(
@@ -585,7 +726,7 @@ class AuditReportTests(unittest.TestCase):
                     ),
                     _finding(severity="critical", title="Alpha"),
                 ],
-                summary="Summary | value\nnext",
+                summary="Summary | value\nnext\u0085control",
             )
         )
         report = self._report(model_result=result)
@@ -597,6 +738,8 @@ class AuditReportTests(unittest.TestCase):
         self.assertLess(first.index("Alpha"), first.index("Zulu"))
         self.assertIn(r"\|", first)
         self.assertNotIn("\t", first)
+        self.assertNotIn("\u0085", first)
+        self.assertIn(r"\u0085", first)
         self.assertNotIn("Zulu | row", first)
         self.assertIn("run-123", first)
 
