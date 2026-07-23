@@ -35,6 +35,393 @@ class PrivateIOTests(unittest.TestCase):
             with self.subTest(descriptor=descriptor), self.assertRaises(OSError):
                 os.fstat(descriptor)
 
+    def assert_no_atomic_temporary_files(self, directory: Path) -> None:
+        if directory.exists():
+            self.assertEqual(
+                [], [path for path in directory.iterdir() if path.name.startswith(".")]
+            )
+
+    def test_whole_file_read_distinguishes_missing_from_empty(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        missing = private_dir / "missing.bin"
+        empty = private_dir / "empty.bin"
+        empty.write_bytes(b"")
+        empty.chmod(0o600)
+
+        with self.assertRaises(UnsafeFileError):
+            private_io.read_private_bytes(missing, 16)
+
+        self.assertIsNone(private_io.read_private_bytes(missing, 16, missing_ok=True))
+        self.assertEqual(b"", private_io.read_private_bytes(empty, 16))
+        self.assertFalse(missing.exists())
+
+    def test_whole_file_read_accepts_exact_limit_and_rejects_over_limit(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        exact = private_dir / "exact.bin"
+        exact.write_bytes(b"1234")
+        exact.chmod(0o600)
+        oversized = private_dir / "oversized.bin"
+        oversized.write_bytes(b"12345")
+        oversized.chmod(0o600)
+
+        self.assertEqual(b"1234", private_io.read_private_bytes(exact, 4))
+        with self.assertRaises(UnsafeFileError):
+            private_io.read_private_bytes(oversized, 4)
+
+    def test_whole_file_read_rejects_growth_while_reading(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "state.bin"
+        path.write_bytes(b"1234")
+        path.chmod(0o600)
+        real_read = os.read
+        grew = False
+
+        def growing_read(fd: int, size: int) -> bytes:
+            nonlocal grew
+            result = real_read(fd, min(size, 2))
+            if result and not grew and stat.S_ISREG(os.fstat(fd).st_mode):
+                with path.open("ab") as handle:
+                    handle.write(b"5")
+                grew = True
+            return result
+
+        with (
+            patch.object(private_io.os, "read", side_effect=growing_read),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.read_private_bytes(path, 4)
+
+        self.assertTrue(grew)
+
+    def test_whole_file_read_rejects_unsafe_leaf_types_and_links(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        target = private_dir / "target.bin"
+        target.write_bytes(b"target")
+        target.chmod(0o600)
+        symlink = private_dir / "symlink.bin"
+        symlink.symlink_to(target)
+        hardlink = private_dir / "hardlink.bin"
+        os.link(target, hardlink)
+
+        for path in (symlink, hardlink):
+            with self.subTest(path=path), self.assertRaises(UnsafeFileError):
+                private_io.read_private_bytes(path, 16)
+
+        self.assertEqual(b"target", target.read_bytes())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_whole_file_read_rejects_fifo_without_blocking(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "state.fifo"
+        os.mkfifo(path, mode=0o600)
+        script = """
+import sys
+from pathlib import Path
+from zeus.private_io import UnsafeFileError, read_private_bytes
+try:
+    read_private_bytes(Path(sys.argv[1]), 16)
+except UnsafeFileError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(path)],
+            check=False,
+            capture_output=True,
+            timeout=2,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr.decode("utf-8", "replace"))
+
+    def test_whole_file_read_rejects_owner_and_permission_drift(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "state.bin"
+        path.write_bytes(b"state")
+        path.chmod(0o600)
+        real_fstat = os.fstat
+
+        def mismatched_owner(fd: int) -> os.stat_result:
+            result = real_fstat(fd)
+            if stat.S_ISREG(result.st_mode):
+                fields = list(result)
+                fields[4] = result.st_uid + 1
+                return os.stat_result(fields)
+            return result
+
+        with (
+            patch.object(private_io.os, "fstat", side_effect=mismatched_owner),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.read_private_bytes(path, 16)
+
+        file_lstats = 0
+        real_lstat = os.lstat
+
+        def drifting_mode(name: str | bytes, *, dir_fd: int | None = None) -> os.stat_result:
+            nonlocal file_lstats
+            result = real_lstat(name, dir_fd=dir_fd)
+            if name == path.name and dir_fd is not None:
+                file_lstats += 1
+                if file_lstats >= 3:
+                    fields = list(result)
+                    fields[0] = (result.st_mode & ~0o777) | 0o644
+                    return os.stat_result(fields)
+            return result
+
+        with (
+            patch.object(private_io.os, "lstat", side_effect=drifting_mode),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.read_private_bytes(path, 16)
+
+    def test_whole_file_read_rejects_binding_replacement(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "state.bin"
+        path.write_bytes(b"original")
+        path.chmod(0o600)
+        displaced = private_dir / "displaced.bin"
+        replacement = private_dir / "replacement.bin"
+        replacement.write_bytes(b"replacement")
+        replacement.chmod(0o600)
+        real_read = os.read
+        swapped = False
+
+        def racing_read(fd: int, size: int) -> bytes:
+            nonlocal swapped
+            result = real_read(fd, size)
+            if result and not swapped and stat.S_ISREG(os.fstat(fd).st_mode):
+                path.rename(displaced)
+                replacement.rename(path)
+                swapped = True
+            return result
+
+        with (
+            patch.object(private_io.os, "read", side_effect=racing_read),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.read_private_bytes(path, 32)
+
+        self.assertTrue(swapped)
+        self.assertEqual(b"original", displaced.read_bytes())
+        self.assertEqual(b"replacement", path.read_bytes())
+
+    def test_atomic_write_creates_complete_private_regular_file(self) -> None:
+        path = self.root / "state" / "snapshot.bin"
+        data = b"complete\x00snapshot"
+        real_link = os.link
+        installed_contents: list[bytes] = []
+
+        def inspecting_link(
+            source: str | bytes,
+            destination: str | bytes,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> None:
+            self.assertEqual(path.name, destination)
+            self.assertIsNotNone(src_dir_fd)
+            temporary_fd = os.open(source, os.O_RDONLY, dir_fd=src_dir_fd)
+            try:
+                installed_contents.append(os.read(temporary_fd, len(data) + 1))
+            finally:
+                os.close(temporary_fd)
+            real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with patch.object(private_io.os, "link", side_effect=inspecting_link):
+            private_io.write_private_bytes_atomic(path, data, len(data))
+
+        self.assertEqual([data], installed_contents)
+        self.assertEqual(data, path.read_bytes())
+        snapshot = path.stat()
+        self.assertTrue(stat.S_ISREG(snapshot.st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(snapshot.st_mode))
+        self.assertEqual(1, snapshot.st_nlink)
+        self.assert_no_atomic_temporary_files(path.parent)
+
+    def test_atomic_write_refuses_existing_target_by_default(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "snapshot.bin"
+        path.write_bytes(b"original")
+        path.chmod(0o600)
+
+        with self.assertRaises(UnsafeFileError):
+            private_io.write_private_bytes_atomic(path, b"replacement", 32)
+
+        self.assertEqual(b"original", path.read_bytes())
+        self.assert_no_atomic_temporary_files(private_dir)
+
+    def test_atomic_write_replaces_existing_target_when_requested(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "snapshot.bin"
+        path.write_bytes(b"original")
+        path.chmod(0o600)
+        original = path.stat()
+
+        private_io.write_private_bytes_atomic(path, b"replacement", 32, replace=True)
+
+        self.assertEqual(b"replacement", path.read_bytes())
+        self.assertNotEqual(original.st_ino, path.stat().st_ino)
+        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+        self.assert_no_atomic_temporary_files(private_dir)
+
+    def test_atomic_write_rejects_replacement_target_binding_drift(self) -> None:
+        private_dir = self.root / "state"
+        private_dir.mkdir(mode=0o700)
+        path = private_dir / "snapshot.bin"
+        path.write_bytes(b"original")
+        path.chmod(0o600)
+        displaced = private_dir / "displaced.bin"
+        replacement = private_dir / "replacement.bin"
+        replacement.write_bytes(b"racing replacement")
+        replacement.chmod(0o600)
+        real_write = os.write
+        swapped = False
+
+        def racing_write(fd: int, data: bytes) -> int:
+            nonlocal swapped
+            written = real_write(fd, data)
+            if not swapped and stat.S_ISREG(os.fstat(fd).st_mode):
+                path.rename(displaced)
+                replacement.rename(path)
+                swapped = True
+            return written
+
+        with (
+            patch.object(private_io.os, "write", side_effect=racing_write),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.write_private_bytes_atomic(
+                path,
+                b"new snapshot",
+                32,
+                replace=True,
+            )
+
+        self.assertTrue(swapped)
+        self.assertEqual(b"original", displaced.read_bytes())
+        self.assertEqual(b"racing replacement", path.read_bytes())
+        self.assert_no_atomic_temporary_files(private_dir)
+
+    def test_atomic_write_cleans_temporary_after_short_write(self) -> None:
+        path = self.root / "state" / "snapshot.bin"
+
+        with (
+            patch.object(private_io.os, "write", return_value=0),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.write_private_bytes_atomic(path, b"snapshot", 32)
+
+        self.assertFalse(path.exists())
+        self.assert_no_atomic_temporary_files(path.parent)
+
+    def test_atomic_write_cleans_temporary_after_fchmod_failure(self) -> None:
+        path = self.root / "state" / "snapshot.bin"
+        real_fchmod = os.fchmod
+
+        def failing_file_fchmod(fd: int, mode: int) -> None:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("fchmod failed")
+            real_fchmod(fd, mode)
+
+        with (
+            patch.object(private_io.os, "fchmod", side_effect=failing_file_fchmod),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.write_private_bytes_atomic(path, b"snapshot", 32)
+
+        self.assertFalse(path.exists())
+        self.assert_no_atomic_temporary_files(path.parent)
+
+    def test_atomic_write_cleans_temporary_after_file_fsync_failure(self) -> None:
+        path = self.root / "state" / "snapshot.bin"
+
+        with (
+            patch.object(private_io.os, "fsync", side_effect=OSError("fsync failed")),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.write_private_bytes_atomic(path, b"snapshot", 32)
+
+        self.assertFalse(path.exists())
+        self.assert_no_atomic_temporary_files(path.parent)
+
+    def test_atomic_write_cleans_temporary_after_install_failure(self) -> None:
+        path = self.root / "state" / "snapshot.bin"
+
+        with (
+            patch.object(private_io.os, "link", side_effect=OSError("install failed")),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.write_private_bytes_atomic(path, b"snapshot", 32)
+
+        self.assertFalse(path.exists())
+        self.assert_no_atomic_temporary_files(path.parent)
+
+    def test_atomic_write_has_no_temporary_after_parent_fsync_failure(self) -> None:
+        path = self.root / "state" / "snapshot.bin"
+        real_fsync = os.fsync
+
+        def failing_parent_fsync(fd: int) -> None:
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("parent fsync failed")
+            real_fsync(fd)
+
+        with (
+            patch.object(private_io.os, "fsync", side_effect=failing_parent_fsync),
+            self.assertRaises(UnsafeFileError),
+        ):
+            private_io.write_private_bytes_atomic(path, b"snapshot", 32)
+
+        self.assertEqual(b"snapshot", path.read_bytes())
+        self.assert_no_atomic_temporary_files(path.parent)
+
+    def test_whole_file_argument_validation_precedes_filesystem_mutation(self) -> None:
+        path = self.root / "missing" / "snapshot.bin"
+
+        for max_bytes in (True, -1, 1.5, "1", None):
+            with (
+                self.subTest(operation="read", value=max_bytes),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                private_io.read_private_bytes(path, max_bytes)  # type: ignore[arg-type]
+            with (
+                self.subTest(operation="write", value=max_bytes),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                private_io.write_private_bytes_atomic(
+                    path,
+                    b"snapshot",
+                    max_bytes,  # type: ignore[arg-type]
+                )
+
+        invalid_calls = (
+            lambda: private_io.read_private_bytes(path, 8, missing_ok=1),  # type: ignore[arg-type]
+            lambda: private_io.write_private_bytes_atomic(path, "snapshot", 8),  # type: ignore[arg-type]
+            lambda: private_io.write_private_bytes_atomic(path, b"snapshot", 7),
+            lambda: private_io.write_private_bytes_atomic(path, b"snapshot", 8, replace=1),  # type: ignore[arg-type]
+        )
+        for call in invalid_calls:
+            with self.subTest(call=call), self.assertRaises((TypeError, ValueError)):
+                call()
+
+        self.assertFalse(path.parent.exists())
+
     def test_append_and_tail_preserve_exact_bytes(self) -> None:
         path = self.root / "logs" / "events.bin"
         first = b"first\x00line\n"
