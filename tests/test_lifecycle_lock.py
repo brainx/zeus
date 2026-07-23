@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 import tempfile
 import threading
 import time
@@ -50,6 +51,33 @@ class LifecycleLockTests(unittest.TestCase):
                 release.set()
                 thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
+
+    def test_bot_process_lock_rejects_symlink_leaf_and_keeps_private_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            target.touch()
+            lock_path = root / "locks" / "bots" / "coder.lock"
+            lock_path.parent.mkdir(parents=True)
+            lock_path.symlink_to(target)
+
+            with self.assertRaises(OSError), BotProcessLock(lock_path, timeout_seconds=0):
+                pass
+
+            lock_path.unlink()
+            with BotProcessLock(lock_path, timeout_seconds=0):
+                self.assertEqual(0o700, stat.S_IMODE(lock_path.parent.stat().st_mode))
+                self.assertEqual(0o600, stat.S_IMODE(lock_path.stat().st_mode))
+
+    def test_bot_process_lock_is_immediately_contended(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "locks" / "bots" / "coder.lock"
+            with (
+                BotProcessLock(lock_path, timeout_seconds=0.2),
+                self.assertRaises(LockTimeoutError),
+                BotProcessLock(lock_path, timeout_seconds=0),
+            ):
+                pass
 
     def test_supervisor_rejects_invalid_bot_id_before_lock_path_creation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

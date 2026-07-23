@@ -67,6 +67,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="treat warnings as failures",
     )
 
+    audit_description = "Run bounded, report-only audits of committed repository HEAD."
+    audit = sub.add_parser("audit", help=audit_description, description=audit_description)
+    audit_sub = audit.add_subparsers(dest="action", required=True)
+    for action, description in (
+        ("doctor", "Check audit prerequisites without running an audit."),
+        ("run", "Run one isolated audit of committed HEAD."),
+        ("list", "List stored audit reports."),
+    ):
+        command = audit_sub.add_parser(action, help=description, description=description)
+        command.add_argument(
+            "--json", action="store_true", dest="as_json", help="emit machine-readable JSON"
+        )
+    audit_show = audit_sub.add_parser("show", help="Show a stored audit report.")
+    audit_show.add_argument("run_id", help="32-character lowercase hexadecimal audit run ID")
+    audit_show.add_argument(
+        "--json", action="store_true", dest="as_json", help="emit machine-readable JSON"
+    )
+
     template_description = "Inspect available Hermes bot templates."
     template = sub.add_parser(
         "template",
@@ -516,6 +534,8 @@ def _resolve_create_env(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.resource == "audit":
+        return _run_audit(args)
     create_env: dict[str, str] = {}
     if args.resource == "bot" and args.action == "create":
         try:
@@ -791,6 +811,69 @@ def main(argv: list[str] | None = None) -> int:
         return result.returncode
 
     raise AssertionError(f"unhandled command: {args}")
+
+
+def _run_audit(args: argparse.Namespace) -> int:
+    """Keep audit dispatch ahead of normal Zeus settings and service initialization."""
+    from zeus.audit import AuditService, AuditServiceError
+    from zeus.audit_report import serialize_audit_report
+    from zeus.audit_store import AuditStoreError
+
+    try:
+        service = AuditService.from_cwd()
+        if args.action == "doctor":
+            doctor_report = service.doctor()
+            print(
+                (
+                    json.dumps(doctor_report.to_dict(), sort_keys=True)
+                    if args.as_json
+                    else doctor_report.to_text()
+                ),
+                end="",
+            )
+            return 0 if doctor_report.ok else 1
+        if args.action == "run":
+            audit_report = service.run()
+            if args.as_json:
+                print(serialize_audit_report(audit_report).decode("utf-8"))
+            else:
+                counts = audit_report.severity_counts
+                markdown = service.settings.state_dir / "audits" / audit_report.run_id / "report.md"
+                print(f"status: {audit_report.status.value}")
+                print(f"run_id: {audit_report.run_id}")
+                print(f"target_commit: {audit_report.metadata.target_commit or '-'}")
+                print(
+                    "severity_counts: "
+                    f"critical={counts.critical} high={counts.high} medium={counts.medium} "
+                    f"low={counts.low} note={counts.note}"
+                )
+                print(f"markdown: {_display_path(str(markdown))}")
+            return 0 if audit_report.status.value == "completed" else 1
+        if args.action == "list":
+            audit_reports = service.list_reports()
+            if args.as_json:
+                print(
+                    json.dumps(
+                        [json.loads(serialize_audit_report(report)) for report in audit_reports],
+                        sort_keys=True,
+                    )
+                )
+            else:
+                for report in audit_reports:
+                    print(
+                        f"{report.run_id}\t{report.status.value}\t"
+                        f"{report.metadata.target_commit or '-'}"
+                    )
+            return 0
+        if args.action == "show":
+            if args.as_json:
+                print(serialize_audit_report(service.show(args.run_id)).decode("utf-8"))
+            else:
+                print(service.show_markdown(args.run_id), end="")
+            return 0
+    except (AuditServiceError, AuditStoreError, KeyError, ValueError, OSError) as exc:
+        return _print_cli_error("audit_error", str(exc), as_json=args.as_json)
+    raise AssertionError(f"unhandled audit command: {args}")
 
 
 def _run_demo(args: argparse.Namespace, settings: Settings) -> int:
