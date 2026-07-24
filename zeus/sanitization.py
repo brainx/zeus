@@ -6,7 +6,7 @@ import re
 from types import MappingProxyType
 from typing import TypeAlias
 
-JSONScalar: TypeAlias = None | bool | int | float | str
+JSONScalar: TypeAlias = bool | int | float | str | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 
 MAX_SANITIZED_JSON_BYTES = 8192

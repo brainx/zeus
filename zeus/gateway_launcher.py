@@ -697,7 +697,7 @@ def _remove_marker_if_owned_locked(
     desired_revision: int,
     pid: int,
     command_fingerprint: str,
-    expected_proc_start_fingerprint: str | None | _UnspecifiedProcessStart = (
+    expected_proc_start_fingerprint: str | _UnspecifiedProcessStart | None = (
         _UNSPECIFIED_PROCESS_START
     ),
 ) -> bool:
@@ -772,7 +772,7 @@ def remove_marker_if_owned(
     desired_revision: int,
     pid: int,
     command_fingerprint: str,
-    expected_proc_start_fingerprint: str | None | _UnspecifiedProcessStart = (
+    expected_proc_start_fingerprint: str | _UnspecifiedProcessStart | None = (
         _UNSPECIFIED_PROCESS_START
     ),
     lock_timeout_seconds: float = MARKER_PUBLICATION_LOCK_TIMEOUT_SECONDS,

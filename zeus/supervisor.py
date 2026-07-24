@@ -843,7 +843,7 @@ class Supervisor:
         wait: bool = False,
         timeout_seconds: float | None = None,
         context: _LifecycleContext,
-        probe: ReadinessProbe | None | _ReadinessProbeUnset = _READINESS_PROBE_UNSET,
+        probe: ReadinessProbe | _ReadinessProbeUnset | None = _READINESS_PROBE_UNSET,
     ) -> BotStatusResponse:
         bot_id = record.bot_id
         action = record.pending_action
@@ -2732,7 +2732,7 @@ class Supervisor:
         bot_id: str,
         argv: list[str],
         *,
-        readiness_probe: ReadinessProbe | None | _ReadinessProbeUnset = _READINESS_PROBE_UNSET,
+        readiness_probe: ReadinessProbe | _ReadinessProbeUnset | None = _READINESS_PROBE_UNSET,
     ) -> None:
         include_readiness_probe = not isinstance(readiness_probe, _ReadinessProbeUnset)
         runtime_probe = (
