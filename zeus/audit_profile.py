@@ -220,8 +220,13 @@ finding and record an appropriate skipped check.
 
 Return exactly one JSON object; no prose and no Markdown fences may appear
 before or after it. The object must have exactly these keys: summary, findings,
-skipped_checks. Each finding must contain category, severity, confidence,
-title, evidence, impact, recommendation, verification. Each evidence item must
+checks, skipped_checks. Record every material audit-time command or check in
+checks with exactly name, disposition (passed, failed, or skipped), and a
+bounded observation. Every configured suggested command must be represented;
+omitted configured checks are recorded as skipped by Zeus. Each explicit
+skipped check must also appear in skipped_checks. Each finding must contain
+category, severity, confidence, title, evidence, impact, recommendation,
+verification. Each evidence item must
 be one of: {{"type":"source","path":...,"start_line":...,"end_line":...,"observation":...}},
 {{"type":"check","check_name":...,"observation":...}}, or
 {{"type":"repository","observation":...,"inspection_method":...}}.

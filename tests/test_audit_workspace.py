@@ -181,6 +181,78 @@ class AuditWorkspaceDiscoveryTests(TemporaryGitRepository):
         with self.assertRaisesRegex(AuditWorkspaceError, "alternate"):
             self.workspace.revalidate(location, deadline=_deadline())
 
+    def test_committed_ignore_policy_is_loaded_from_exact_head(self) -> None:
+        self.write(".gitignore", b".zeus/\n")
+        self.commit("ignore audit state")
+        location = self.workspace.discover(self.repository, deadline=_deadline())
+        probes = (
+            ".zeus/",
+            ".zeus/audit/config.json",
+            ".zeus/audit/runs/" + "0" * 32 + "/control",
+        )
+
+        self.write(".gitignore", b".zeus/only-this-file\n")
+        matches = self.workspace.committed_ignore_matches(
+            location,
+            state_relative=Path(".zeus"),
+            ignored_paths=probes,
+            deadline=_deadline(),
+        )
+
+        self.assertEqual(set(probes), set(matches))
+        self.assertEqual({".gitignore"}, set(matches.values()))
+
+    def test_committed_ignore_policy_rejects_executable_and_oversized_sources(self) -> None:
+        self.write(".gitignore", b".zeus/\n", mode=0o755)
+        self.commit("executable ignore policy")
+        executable_location = self.workspace.discover(
+            self.repository,
+            deadline=_deadline(),
+        )
+        with self.assertRaisesRegex(AuditWorkspaceError, "non-executable"):
+            self.workspace.committed_ignore_matches(
+                executable_location,
+                state_relative=Path(".zeus"),
+                ignored_paths=(".zeus/",),
+                deadline=_deadline(),
+            )
+
+        self.write(
+            ".gitignore",
+            b"#" + b"x" * (256 * 1024) + b"\n.zeus/\n",
+        )
+        self.commit("oversized ignore policy")
+        oversized_location = self.workspace.discover(
+            self.repository,
+            deadline=_deadline(),
+        )
+        with self.assertRaisesRegex(AuditWorkspaceError, "blob byte count"):
+            self.workspace.committed_ignore_matches(
+                oversized_location,
+                state_relative=Path(".zeus"),
+                ignored_paths=(".zeus/",),
+                deadline=_deadline(),
+            )
+
+    def test_committed_ignore_policy_rejects_matching_negations(self) -> None:
+        self.write(
+            ".gitignore",
+            b".zeus/\n!.zeus/\n!.zeus/**\n",
+        )
+        self.commit("negated ignore policy")
+        location = self.workspace.discover(self.repository, deadline=_deadline())
+
+        with self.assertRaisesRegex(AuditWorkspaceError, "negation"):
+            self.workspace.committed_ignore_matches(
+                location,
+                state_relative=Path(".zeus"),
+                ignored_paths=(
+                    ".zeus/",
+                    ".zeus/audit/config.json",
+                ),
+                deadline=_deadline(),
+            )
+
     def test_inspection_records_only_dirty_staged_and_untracked_state(self) -> None:
         self.write("README.md", b"dirty worktree sentinel\n")
         self.write("staged.txt", b"staged content sentinel\n")
@@ -369,6 +441,12 @@ class AuditWorkspaceMaterializationTests(TemporaryGitRepository):
             )
         self.assertFalse((self.temp_root / "byte-limited").exists())
         self.assertFalse((self.temp_root / "entry-limited").exists())
+
+        snapshot = self.materialize(exclude_paths=("excluded",))
+        self.assertIn(
+            ("excluded", "excluded by audit configuration"),
+            {(item.path, item.reason) for item in snapshot.skipped_content},
+        )
 
     def test_records_gitlinks_and_lfs_pointers_without_hydrating_them(self) -> None:
         lfs_pointer = (

@@ -10,7 +10,6 @@ import os
 import re
 import secrets
 import selectors
-import signal
 import stat
 import subprocess  # nosec B404
 import time
@@ -22,6 +21,7 @@ from typing import BinaryIO, NoReturn, Protocol, TypeGuard, cast
 
 from zeus.audit_container import PreparedAuditContainer
 from zeus.audit_models import HARD_LIMITS, AuditLimits
+from zeus.audit_process import AuditProcessError, stop_process_group, wait_process_exit
 from zeus.private_io import (
     UnsafeFileError,
     pin_private_directory,
@@ -1050,23 +1050,8 @@ def _decide(
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    group_id = process.pid
-    with suppress(OSError):
-        os.killpg(group_id, signal.SIGTERM)
-    term_deadline = time.monotonic() + 0.2
-    while time.monotonic() < term_deadline:
-        try:
-            os.killpg(group_id, 0)
-        except (ProcessLookupError, OSError):
-            break
-        time.sleep(0.01)
-    with suppress(OSError):
-        os.killpg(group_id, signal.SIGKILL)
-    if process.poll() is None:
-        with suppress(OSError):
-            process.kill()
-    with suppress(OSError, subprocess.TimeoutExpired):
-        process.wait(timeout=1)
+    if not stop_process_group(process):
+        raise _DockerExecutionError("Docker execution process group cleanup could not be verified")
 
 
 class _SubprocessDockerExecutionRunner:
@@ -1137,8 +1122,8 @@ class _SubprocessDockerExecutionRunner:
                 _stop_process(process)
                 raise _DockerExecutionError("Docker execution exceeded its deadline")
             try:
-                returncode = process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired as exc:
+                returncode = wait_process_exit(process, deadline=deadline)
+            except (AuditProcessError, subprocess.TimeoutExpired) as exc:
                 _stop_process(process)
                 raise _DockerExecutionError("Docker execution exceeded its deadline") from exc
             return BrokerCommandResult(
@@ -1151,7 +1136,7 @@ class _SubprocessDockerExecutionRunner:
             for close_stream in (process.stdout, process.stderr):
                 with suppress(OSError):
                     close_stream.close()
-            if process.poll() is None:
+            if process.returncode is None:
                 _stop_process(process)
 
 

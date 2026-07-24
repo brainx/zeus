@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import NoReturn, TypeVar
 
 from zeus.audit_models import (
+    AUDIT_RESERVED_CHECK_NAMES,
     AuditCategory,
     AuditCheck,
     AuditCompleteness,
@@ -33,7 +34,8 @@ from zeus.sanitization import sanitize_text
 REPORT_SCHEMA_VERSION = 1
 MAX_REPORT_TEXT_BYTES = 8 * 1024
 
-_MODEL_FIELDS = frozenset({"summary", "findings", "skipped_checks"})
+_MODEL_FIELDS = frozenset({"summary", "findings", "checks", "skipped_checks"})
+_MODEL_CHECK_FIELDS = frozenset({"name", "disposition", "observation"})
 _FINDING_FIELDS = frozenset(
     {
         "category",
@@ -391,6 +393,7 @@ def validate_model_output(
     source_line_counts: Mapping[str, int],
     checks: Sequence[AuditCheck],
     limits: AuditLimits,
+    configured_check_names: Sequence[str] = (),
 ) -> ModelAuditResult:
     value = _load_json(data, max_bytes=limits.model_output_bytes, name="model output")
     model = _exact_object(value, _MODEL_FIELDS, "model output")
@@ -401,9 +404,20 @@ def validate_model_output(
         isinstance(category, AuditCategory) for category in allowed_categories
     ):
         _error("allowed_categories must contain audit categories")
-    check_names = frozenset(check.name for check in checks)
-    if len(check_names) != len(checks):
+    preflight_check_names = frozenset(check.name for check in checks)
+    if len(preflight_check_names) != len(checks):
         _error("recorded check names must be unique")
+    configured_names: list[str] = []
+    for raw_name in configured_check_names:
+        name, truncated = _sanitize_report_text(raw_name, "configured check name")
+        if truncated or name != raw_name or name in configured_names:
+            _error("configured check names must be unique bounded strings")
+        if name in preflight_check_names:
+            _error("configured check names must not conflict with preflight checks")
+        configured_names.append(name)
+    if len(configured_names) > limits.terminal_calls:
+        _error("configured check names exceed the terminal call limit")
+    configured_name_set = frozenset(configured_names)
 
     summary, summary_truncated = _sanitize_report_text(model["summary"], "model summary")
     finding_values = model["findings"]
@@ -412,17 +426,78 @@ def validate_model_output(
     skipped_values = model["skipped_checks"]
     if not isinstance(skipped_values, list):
         _error("model skipped_checks must be a list")
+    model_check_values = model["checks"]
+    if not isinstance(model_check_values, list) or len(model_check_values) > limits.terminal_calls:
+        _error("model checks must be a bounded list")
+
+    explicit_checks: dict[str, AuditCheck] = {}
+    checks_truncated = False
+    for raw_check in model_check_values:
+        check = _exact_object(raw_check, _MODEL_CHECK_FIELDS, "model check")
+        name, name_truncated = _sanitize_report_text(check["name"], "model check name")
+        if name_truncated or name in AUDIT_RESERVED_CHECK_NAMES or name in explicit_checks:
+            _error("model check names must be unique and distinct from Zeus checks")
+        disposition = _enum_value(
+            CheckDisposition,
+            check["disposition"],
+            "model check disposition",
+        )
+        observation, observation_truncated = _sanitize_report_text(
+            check["observation"],
+            "model check observation",
+            allow_empty=True,
+        )
+        explicit_checks[name] = AuditCheck(name, disposition, 0.0, observation)
+        checks_truncated = checks_truncated or name_truncated or observation_truncated
+    if len(configured_name_set | frozenset(explicit_checks)) > limits.terminal_calls:
+        _error("recorded model checks exceed the terminal call limit")
+
     skipped_record_names = frozenset(
         check.name for check in checks if check.disposition is CheckDisposition.skipped
     )
-    skipped_checks: list[str] = []
+    requested_skips: list[str] = []
     for value in skipped_values:
         skipped, truncated = _sanitize_report_text(value, "skipped check")
-        if truncated or skipped not in skipped_record_names:
-            _error("skipped_checks must reference recorded skipped checks")
-        if skipped in skipped_checks:
+        explicit = explicit_checks.get(skipped)
+        if (
+            truncated
+            or (
+                skipped not in skipped_record_names
+                and skipped not in configured_name_set
+                and skipped not in explicit_checks
+            )
+            or (explicit is not None and explicit.disposition is not CheckDisposition.skipped)
+        ):
+            _error("skipped_checks must reference skipped or omitted checks")
+        if skipped in requested_skips:
             _error("skipped_checks must be unique")
-        skipped_checks.append(skipped)
+        requested_skips.append(skipped)
+    for name, recorded_check in explicit_checks.items():
+        if recorded_check.disposition is CheckDisposition.skipped and name not in requested_skips:
+            _error("model skipped checks must also appear in skipped_checks")
+
+    model_checks = list(explicit_checks.values())
+    model_checks.extend(
+        AuditCheck(
+            name,
+            CheckDisposition.skipped,
+            0.0,
+            "configured check was not reported by the audit model",
+        )
+        for name in configured_names
+        if name not in explicit_checks
+    )
+    skipped_checks = sorted(
+        {
+            *skipped_record_names.intersection(requested_skips),
+            *(
+                check.name
+                for check in model_checks
+                if check.disposition is CheckDisposition.skipped
+            ),
+        }
+    )
+    finding_check_names = preflight_check_names | frozenset(explicit_checks)
 
     accepted: list[AuditFinding] = []
     rejected = 0
@@ -435,7 +510,7 @@ def validate_model_output(
                 ordinal=ordinal,
                 allowed_categories=allowed_categories,
                 source_line_counts=source_line_counts,
-                check_names=check_names,
+                check_names=finding_check_names,
             )
         except AuditReportError:
             rejected += 1
@@ -455,10 +530,13 @@ def validate_model_output(
         reasons.append(f"{truncated_findings} valid {noun} truncated")
     if text_truncated:
         reasons.append("stored text was truncated to byte limits")
+    if checks_truncated:
+        reasons.append("stored check text was truncated to byte limits")
     return ModelAuditResult(
         summary=summary,
         findings=tuple(accepted),
         skipped_checks=tuple(skipped_checks),
+        checks=tuple(model_checks),
         completeness=AuditCompleteness(
             complete=not reasons,
             rejected_findings=rejected,
@@ -906,6 +984,7 @@ def _normalize_report_for_sink(report: AuditReport) -> AuditReport:
             summary=report.summary,
             findings=report.findings,
             skipped_checks=(),
+            checks=(),
             completeness=report.completeness,
         ),
     )
@@ -1172,6 +1251,22 @@ def render_audit_markdown(report: AuditReport) -> str:
         )
     else:
         lines.append("| — | — | — | No checks recorded |")
+    lines.extend(
+        [
+            "",
+            "## Skipped content",
+            "",
+            "| Path or scope | Reason |",
+            "| --- | --- |",
+        ]
+    )
+    if report.skipped_content:
+        lines.extend(
+            f"| {_markdown_text(skipped.path)} | {_markdown_text(skipped.reason)} |"
+            for skipped in report.skipped_content
+        )
+    else:
+        lines.append("| — | No committed content was skipped |")
     lines.extend(["", "## Findings", ""])
     if not report.findings:
         lines.extend(["No validated findings.", ""])
@@ -1192,7 +1287,10 @@ def render_audit_markdown(report: AuditReport) -> str:
         lines.extend(f"  - {_evidence_markdown(evidence)}" for evidence in finding.evidence)
         lines.append("")
     lines.extend(["## Completeness", ""])
-    lines.append("Complete." if report.completeness.complete else "Incomplete.")
+    if report.completeness.complete and report.skipped_content:
+        lines.append("Complete within the selected snapshot scope shown above.")
+    else:
+        lines.append("Complete." if report.completeness.complete else "Incomplete.")
     if report.completeness.rejected_findings:
         lines.append(f"- Rejected findings: {report.completeness.rejected_findings}")
     if report.completeness.truncated_findings:

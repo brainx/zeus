@@ -96,7 +96,9 @@ Audit commands resolve the repository root before choosing their state path. An
 explicit `ZEUS_STATE_DIR` is honored; otherwise audit state is rooted at
 `<repository-root>/.zeus` even when the command starts in a subdirectory. Zeus
 blocks the run if an in-repository state path is tracked by Git or fails the
-existing no-follow private-path checks.
+existing no-follow private-path checks. Every concrete audit-state location
+must be ignored by `.gitignore` policy loaded from the exact committed `HEAD`.
+Global excludes and `.git/info/exclude` do not satisfy this boundary.
 
 ### Git boundary
 
@@ -136,7 +138,10 @@ regular files, executable files, and confined relative symlinks, and rejects:
 - trees exceeding 100,000 entries or 1 GiB of materialized blob data.
 
 Gitlinks and unresolved Git LFS pointer content are not fetched. They are
-recorded as skipped external content in the report metadata.
+recorded as skipped external content in the report metadata. Each configured
+exclusion is also recorded by its configured repository-relative path, so a
+complete report means complete within the selected snapshot scope rather than
+complete across omitted content.
 
 The snapshot contains no `.git` directory, remotes, worktree metadata, or Zeus
 state. Zeus copies it into a size-limited container tmpfs at `/workspace` before
@@ -232,8 +237,11 @@ stores variable names, never values. Values are read at invocation and are not
 written into the ephemeral Hermes home, prompt, snapshot, command sandbox,
 usage metadata, or reports.
 
-Provider variable names must match the existing environment-name grammar and
-each value is capped at 16 KiB before process creation.
+Provider variable names must use the selected provider's uppercase prefix and
+one of the fixed suffixes `API_KEY`, `AUTH_TOKEN`, `ACCESS_TOKEN`, `BASE_URL`,
+`ORG_ID`, or `PROJECT_ID`. This positive allowlist prevents interpreter,
+dynamic-loader, shell, and unrelated credential variables from entering the
+host process. Each value is capped at 16 KiB before process creation.
 
 The subprocess receives a synthetic `HOME` in the private control directory and
 an ephemeral `HERMES_HOME`. Beyond the explicitly selected model-provider
@@ -255,24 +263,35 @@ schema. A bounded redacted diagnostic excerpt may be included when parsing
 fails. Markdown is generated deterministically from validated JSON rather than
 accepted from the model.
 
+The model object has exactly `summary`, `findings`, `checks`, and
+`skipped_checks`. Each `checks` entry has exactly `name`, `disposition`, and
+`observation`, records a material audit-time command or inspection, and is
+merged into the final report as structured evidence. Names are unique,
+distinct from Zeus-owned checks, and bounded by the terminal-call ceiling. A
+configured command omitted by the model is recorded by Zeus as skipped. Check
+evidence in a finding must resolve to a recorded preflight or model check.
+
 Hermes stderr is separately capped at 256 KiB, redacted, and used only for a
 bounded failure diagnostic. Output beyond either cap terminates the run-owned
 process group and makes the report incomplete.
 
 ## Configuration
 
-Configuration is optional JSON at:
+Audit-run configuration is private JSON at:
 
 ```text
 $ZEUS_STATE_DIR/audit/config.json
 ```
 
-The directory is mode `0700` and the file is mode `0600`. Unknown fields and
-invalid types fail closed. Schema version 1 supports:
+The directory is mode `0700` and the file is mode `0600`. A missing
+configuration can be inspected by `audit doctor`, but it is not run-ready.
+Unknown fields and invalid types fail closed. Schema version 1 supports:
 
-- `provider` and `model`: optional explicit Hermes selection;
-- `provider_env`: at most four environment-variable names made available only
-  to the host Hermes process;
+- `provider` and `model`: an explicit Hermes selection required together for
+  every run;
+- `provider_env`: one to four provider-prefixed names from the fixed credential
+  and endpoint allowlist, including at least one API key or
+  authentication/access token, made available only to the host Hermes process;
 - `image`: an immutable Docker digest or digest-qualified reference;
 - `categories`: a non-empty subset of the six supported categories;
 - `exclude_paths`: repository-relative paths removed from the snapshot after
@@ -303,10 +322,14 @@ temporary-storage, credential, and isolation limits are not configurable.
 
 Each Zeus release defines a digest-qualified default audit image. An `image`
 override must also be digest-qualified and locally present. Zeus never pulls an
-image. Omitted provider and model values use Hermes defaults; when that provider
-requires a credential, `provider_env` must name the required variable or
-preflight blocks the run. Model stdout and each final report artifact are
-individually capped at 1 MiB.
+image. `provider`, `model`, and at least one permitted `provider_env` name must
+be explicit; `provider_env` must include a provider-prefixed `API_KEY`,
+`AUTH_TOKEN`, or `ACCESS_TOKEN`. `BASE_URL`, `ORG_ID`, and `PROJECT_ID` are
+supplementary and cannot satisfy credential readiness by themselves. Version 1
+does not support an unauthenticated local-provider mode. Omitted or empty
+selections block preflight. Every named variable must have a non-empty value at
+invocation. Model stdout and each final report artifact are individually capped
+at 1 MiB.
 
 The six supported categories are:
 
@@ -434,6 +457,8 @@ The JSON envelope has schema version 1 and contains:
 - bounded summary text;
 - checks run and skipped, with name, disposition, duration, and redacted
   observation but no raw command output;
+- skipped content, including configured snapshot exclusions and unresolved
+  external content;
 - findings;
 - severity counts and report completeness.
 
@@ -441,8 +466,8 @@ Blocked reports retain the discovered target commit and the required or
 configured Hermes, image, provider, and model metadata. Individual doctor
 checks establish whether the corresponding runtime prerequisite was observed.
 These metadata entries are not assertions that an unavailable Hermes binary or
-image was inspected successfully. Provider and model remain `null` only when
-they are omitted from configuration.
+image was inspected successfully. Provider and model remain `null` only in a
+blocked report produced from missing configuration.
 
 Each final finding receives a unique Zeus-generated ID and has:
 

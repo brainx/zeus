@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import errno
 import json
 import os
 import selectors
@@ -123,8 +122,8 @@ import sys
 import time
 from pathlib import Path
 
-capture = Path(os.environ["TEST_PROVIDER_KEY"])
-mode = os.environ["TEST_MODE"]
+capture = Path(os.environ["TEST_PROVIDER_BASE_URL"])
+mode = os.environ["TEST_PROVIDER_PROJECT_ID"]
 if mode in {{"ignore-term", "close-output-sleep"}}:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 capture.write_text(
@@ -150,10 +149,10 @@ elif mode == "stdout-limit":
 elif mode == "stderr-limit":
     os.write(2, b"x" * (256 * 1024 + 1))
 elif mode == "invalid":
-    os.write(2, ("API_KEY=" + os.environ["TEST_SECRET"]).encode())
+    os.write(2, ("API_KEY=" + os.environ["TEST_PROVIDER_API_KEY"]).encode())
     os.write(1, b"not-json")
 elif mode == "failure":
-    os.write(2, ("Bearer " + os.environ["TEST_SECRET"]).encode())
+    os.write(2, ("Bearer " + os.environ["TEST_PROVIDER_API_KEY"]).encode())
     raise SystemExit(7)
 elif mode == "ignore-term":
     while True:
@@ -173,9 +172,9 @@ else:
             "LANG": "C.UTF-8",
             "LC_ALL": "C",
             "SSL_CERT_FILE": "/etc/ssl/cert.pem",
-            "TEST_PROVIDER_KEY": str(self.capture_path),
-            "TEST_MODE": "normal",
-            "TEST_SECRET": SECRET,
+            "TEST_PROVIDER_API_KEY": SECRET,
+            "TEST_PROVIDER_BASE_URL": str(self.capture_path),
+            "TEST_PROVIDER_PROJECT_ID": "normal",
             "HERMES_DOCKER_BINARY": "/untrusted/docker",
             "DOCKER_HOST": "tcp://untrusted.invalid",
             "TERMINAL_BACKEND": "local",
@@ -194,9 +193,9 @@ else:
                 "provider": PROVIDER,
                 "model": MODEL,
                 "provider_env": [
-                    "TEST_PROVIDER_KEY",
-                    "TEST_MODE",
-                    "TEST_SECRET",
+                    "TEST_PROVIDER_API_KEY",
+                    "TEST_PROVIDER_BASE_URL",
+                    "TEST_PROVIDER_PROJECT_ID",
                 ],
             }
         )
@@ -294,9 +293,9 @@ else:
             "LC_ALL": "C",
             "PATH": f"{self.control_dir / 'broker'}:/usr/bin:/bin",
             "SSL_CERT_FILE": "/etc/ssl/cert.pem",
-            "TEST_MODE": "normal",
-            "TEST_PROVIDER_KEY": str(self.capture_path),
-            "TEST_SECRET": SECRET,
+            "TEST_PROVIDER_PROJECT_ID": "normal",
+            "TEST_PROVIDER_BASE_URL": str(self.capture_path),
+            "TEST_PROVIDER_API_KEY": SECRET,
         }
         self.assertEqual(expected_environment, options["env"])
         self.assertEqual(
@@ -323,22 +322,22 @@ else:
             self.assertNotIn(forbidden, captured["env"])
 
     def test_stdout_and_stderr_are_drained_independently_with_exact_hard_caps(self) -> None:
-        self.source_env["TEST_MODE"] = "dual-output"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "dual-output"
         result, _broker = self._run()
         self.assertEqual(AuditRunnerOutcome.completed, result.outcome)
 
-        self.source_env["TEST_MODE"] = "stdout-limit"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "stdout-limit"
         result, _broker = self._run()
         self.assertEqual(AuditRunnerOutcome.model_output_limit, result.outcome)
         self.assertIsNone(result.model_result)
 
-        self.source_env["TEST_MODE"] = "stderr-limit"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "stderr-limit"
         result, _broker = self._run()
         self.assertEqual(AuditRunnerOutcome.stderr_output_limit, result.outcome)
         self.assertIsNone(result.model_result)
 
     def test_timeout_terminates_the_owned_process_group_and_cleans_broker(self) -> None:
-        self.source_env["TEST_MODE"] = "ignore-term"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "ignore-term"
         with mock.patch("zeus.audit_runner.os.killpg", wraps=os.killpg) as kill_group:
             result, broker = self._run(deadline=_deadline(0.5))
 
@@ -351,13 +350,13 @@ else:
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
-        self.source_env["TEST_MODE"] = "close-output-sleep"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "close-output-sleep"
         result, broker = self._run(deadline=_deadline(0.5))
         self.assertEqual(AuditRunnerOutcome.timed_out, result.outcome)
         self.assertEqual([self.broker_state_path], broker.cleanup_paths)
 
     def test_cancellation_and_keyboard_interrupt_are_classified_and_cleaned(self) -> None:
-        self.source_env["TEST_MODE"] = "ignore-term"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "ignore-term"
         cancelled = threading.Event()
         timer = threading.Timer(0.1, cancelled.set)
         timer.start()
@@ -378,7 +377,7 @@ else:
         self.assertEqual([self.broker_state_path], broker.cleanup_paths)
 
     def test_broker_breach_terminates_hermes_and_cleans_only_sealed_state(self) -> None:
-        self.source_env["TEST_MODE"] = "ignore-term"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "ignore-term"
         broker = _BrokerHarness(breach_after=2)
         result, active_broker = self._run(broker=broker)
 
@@ -387,14 +386,14 @@ else:
         self.assertEqual([self.broker_state_path], active_broker.cleanup_paths)
 
     def test_nonzero_and_invalid_output_diagnostics_are_bounded_and_redacted(self) -> None:
-        self.source_env["TEST_MODE"] = "failure"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "failure"
         failed, _broker = self._run()
         self.assertEqual(AuditRunnerOutcome.process_failed, failed.outcome)
         self.assertEqual(7, failed.returncode)
         self.assertNotIn(SECRET, failed.diagnostic or "")
         self.assertIn("[redacted]", failed.diagnostic or "")
 
-        self.source_env["TEST_MODE"] = "invalid"
+        self.source_env["TEST_PROVIDER_PROJECT_ID"] = "invalid"
         invalid, _broker = self._run()
         self.assertEqual(AuditRunnerOutcome.invalid_output, invalid.outcome)
         self.assertIsNone(invalid.model_result)
@@ -496,7 +495,7 @@ else:
 
         with (
             mock.patch("zeus.audit_runner.subprocess.Popen", side_effect=launch) as popen,
-            self.assertRaisesRegex(AuditRunnerError, "provider environment"),
+            self.assertRaisesRegex(AuditRunnerError, "provider selection"),
         ):
             runner.run(
                 profile_name=PROFILE,
@@ -510,6 +509,31 @@ else:
                 validate_output=self._validate,
             )
         popen.assert_not_called()
+
+        for unsafe_name in (
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+        ):
+            with (
+                self.subTest(unsafe_name=unsafe_name),
+                mock.patch("zeus.audit_runner.subprocess.Popen") as popen,
+                self.assertRaisesRegex(AuditRunnerError, "provider selection"),
+            ):
+                runner.run(
+                    profile_name=PROFILE,
+                    prompt=PROMPT,
+                    config=replace(self.config, provider_env=(unsafe_name,)),
+                    control_dir=self.control_dir,
+                    broker_executable=self.broker_executable,
+                    broker_state_path=self.broker_state_path,
+                    deadline=_deadline(),
+                    source_env={unsafe_name: "unsafe"},
+                    validate_output=self._validate,
+                )
+            popen.assert_not_called()
 
     def test_path_separator_control_path_is_rejected_before_fallback_docker_resolution(
         self,
@@ -569,10 +593,21 @@ else:
             AuditRunner(colon_hermes)
 
     def test_teardown_interrupts_are_cancelled_without_skipping_broker_cleanup(self) -> None:
+        from zeus.audit_process import stop_process_group
+
         broker = _BrokerHarness()
+        stop_calls = 0
+
+        def interrupted_then_stop(process) -> bool:
+            nonlocal stop_calls
+            stop_calls += 1
+            if stop_calls == 1:
+                raise KeyboardInterrupt
+            return stop_process_group(process)
+
         with mock.patch(
             "zeus.audit_runner._stop_process_group",
-            side_effect=(KeyboardInterrupt, True),
+            side_effect=interrupted_then_stop,
         ) as stop_group:
             try:
                 result, active_broker = self._run(broker=broker)
@@ -607,33 +642,22 @@ else:
             active_broker.cleanup_paths,
         )
 
-    def test_process_group_status_distinguishes_eperm_and_rechecks_after_kill(self) -> None:
-        process = SimpleNamespace(
-            pid=424242,
-            poll=lambda: 0,
-            wait=mock.Mock(),
-        )
-        permission_denied = PermissionError(errno.EPERM, "not permitted")
-        with mock.patch("zeus.audit_runner.os.killpg", side_effect=permission_denied):
+    def test_process_group_cleanup_rejects_an_already_reaped_leader(self) -> None:
+        process = SimpleNamespace(pid=424242, returncode=0)
+        with mock.patch("zeus.audit_process.os.killpg") as kill_group:
             self.assertFalse(audit_runner._stop_process_group(process))
-
-        signals: list[int] = []
-
-        def surviving_group(_group_id: int, sent_signal: int) -> None:
-            signals.append(sent_signal)
-
-        with (
-            mock.patch("zeus.audit_runner.os.killpg", side_effect=surviving_group),
-            mock.patch("zeus.audit_runner._TERM_GRACE_SECONDS", 0),
-        ):
-            self.assertFalse(audit_runner._stop_process_group(process))
-        kill_index = signals.index(signal.SIGKILL)
-        self.assertIn(0, signals[kill_index + 1 :])
+        kill_group.assert_not_called()
 
     def test_completed_result_requires_verified_process_and_broker_cleanup(self) -> None:
+        from zeus.audit_process import stop_process_group
+
+        def clean_but_report_failure(process) -> bool:
+            self.assertTrue(stop_process_group(process))
+            return False
+
         with mock.patch(
             "zeus.audit_runner._stop_process_group",
-            return_value=False,
+            side_effect=clean_but_report_failure,
         ):
             result, broker = self._run()
 

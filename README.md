@@ -72,7 +72,25 @@ downloads nothing.
 ### Run an audit
 
 Only `audit run` requires those runtime prerequisites. Zeus never pulls the
-image.
+image. Before the first run, create private
+`$ZEUS_STATE_DIR/audit/config.json` with an explicit lowercase Hermes provider,
+model, and at least one provider-prefixed API key or authentication/access
+token. Endpoint and account metadata variables may be added alongside it:
+
+```json
+{
+  "schema_version": 1,
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "provider_env": ["DEEPSEEK_API_KEY"]
+}
+```
+
+The state directory must be outside the worktree or ignored by `.gitignore`
+policy loaded from the exact committed `HEAD`; global excludes and
+`.git/info/exclude` do not qualify. Every named variable must have a non-empty
+value in the invoking
+environment.
 
 ```bash
 zeus audit run
@@ -83,6 +101,8 @@ the prompt, selected committed-source excerpts, and bounded terminal output to
 that provider; it does not claim provider-side retention or network isolation.
 Repository commands run only in a prevalidated Docker container with network
 disabled, while Hermes remains a host process for the selected provider.
+Configured snapshot exclusions and unresolved external content are listed in
+the report; `completed` means complete within that selected scope.
 
 `audit run` prints status, run ID, target commit, severity counts, and the
 relative Markdown-report path; completed is the only successful audit status.

@@ -13,7 +13,7 @@ class AuditProfileTests(unittest.TestCase):
             "schema_version": 1,
             "provider": "test-provider",
             "model": "test-model",
-            "provider_env": ["TEST_PROVIDER_KEY"],
+            "provider_env": ["TEST_PROVIDER_API_KEY"],
             "image": "sha256:" + "a" * 64,
             "categories": ["security", "correctness"],
             "exclude_paths": ["vendor"],

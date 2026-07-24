@@ -8,17 +8,18 @@ import posixpath
 import re
 import selectors
 import shutil
-import signal
 import stat
 import subprocess  # nosec B404
+import tempfile
 import time
 import unicodedata
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, NoReturn, Protocol
 
 from zeus.audit_models import HARD_LIMITS, AuditLimits, SkippedContent
+from zeus.audit_process import AuditProcessError, stop_process_group, wait_process_exit
 
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
@@ -34,6 +35,10 @@ _LFS_VERSION_VALUE = "https://git-lfs.github.com/spec/v1"
 _LFS_KEY_RE = re.compile(r"[a-z0-9.-]+\Z")
 _LFS_OID_VALUE_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _LFS_SIZE_VALUE_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_IGNORE_POLICY_BLOB_BYTES = 256 * 1024
+_IGNORE_POLICY_METADATA_BYTES = 64 * 1024
+_IGNORE_POLICY_OUTPUT_BYTES = 2 * 1024 * 1024
+_IGNORE_POLICY_MAX_DEPTH = 64
 _INDEX_DEBUG_RE = re.compile(
     rb"  ctime: (?P<ctime_seconds>[0-9]{1,20}):(?P<ctime_nanoseconds>[0-9]{1,20})\n"
     rb"  mtime: (?P<mtime_seconds>[0-9]{1,20}):(?P<mtime_nanoseconds>[0-9]{1,20})\n"
@@ -361,7 +366,7 @@ def _validate_repository_metadata(git_dir: Path, common_git_dir: Path) -> None:
         )
 
 
-def _git_environment() -> dict[str, str]:
+def audit_git_environment() -> dict[str, str]:
     return {
         "HOME": os.devnull,
         "XDG_CONFIG_HOME": os.devnull,
@@ -382,17 +387,8 @@ def _git_environment() -> dict[str, str]:
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    with suppress(OSError):
-        os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(timeout=0.2)
-    except subprocess.TimeoutExpired:
-        with suppress(OSError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with suppress(OSError, subprocess.TimeoutExpired):
-            process.wait(timeout=1)
+    if not stop_process_group(process):
+        _error("Git process group cleanup could not be verified")
 
 
 def _collect_bounded_process(
@@ -433,8 +429,8 @@ def _collect_bounded_process(
                 if key.fileobj is process.stdout:
                     output.extend(chunk)
         try:
-            return_code = process.wait(timeout=_remaining(deadline))
-        except subprocess.TimeoutExpired:
+            return_code = wait_process_exit(process, deadline=deadline)
+        except (AuditProcessError, subprocess.TimeoutExpired):
             _stop_process(process)
             _error(f"{description} exceeded its deadline")
         if return_code != 0:
@@ -445,7 +441,7 @@ def _collect_bounded_process(
         for stream in streams:
             with suppress(OSError):
                 stream.close()
-        if process.poll() is None:
+        if process.returncode is None:
             _stop_process(process)
 
 
@@ -1122,10 +1118,20 @@ class AuditWorkspace:
         if current != self._git_identity:
             _error("Git executable binding changed")
 
-    def _argv(self, cwd: Path, arguments: tuple[str, ...]) -> tuple[str, ...]:
+    def _argv(
+        self,
+        cwd: Path,
+        arguments: tuple[str, ...],
+        *,
+        literal_pathspecs: bool = True,
+    ) -> tuple[str, ...]:
         return (
             str(self._git_executable),
-            *GIT_HARDENING_ARGUMENTS,
+            *(
+                argument
+                for argument in GIT_HARDENING_ARGUMENTS
+                if literal_pathspecs or argument != "--literal-pathspecs"
+            ),
             "-C",
             str(cwd),
             *arguments,
@@ -1138,13 +1144,18 @@ class AuditWorkspace:
         *,
         stdin: int,
         stderr: int,
+        literal_pathspecs: bool = True,
     ) -> subprocess.Popen[bytes]:
         self._validate_git_executable()
         try:
             return subprocess.Popen(  # nosec B603
-                self._argv(cwd, arguments),
+                self._argv(
+                    cwd,
+                    arguments,
+                    literal_pathspecs=literal_pathspecs,
+                ),
                 cwd=cwd,
-                env=_git_environment(),
+                env=audit_git_environment(),
                 stdin=stdin,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
@@ -1165,20 +1176,196 @@ class AuditWorkspace:
         command_seconds: int,
         max_output_bytes: int,
         description: str,
+        input_data: bytes | None = None,
+        literal_pathspecs: bool = True,
     ) -> bytes:
         command_deadline = _bounded_deadline(deadline, command_seconds)
         process = self._spawn(
             cwd,
             arguments,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            literal_pathspecs=literal_pathspecs,
         )
+        if input_data is not None:
+            if process.stdin is None:
+                _stop_process(process)
+                _error(f"{description} input pipe is unavailable")
+            try:
+                written = process.stdin.write(input_data)
+                process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                _stop_process(process)
+                raise AuditWorkspaceError(f"{description} input could not be written") from exc
+            if written != len(input_data):
+                _stop_process(process)
+                _error(f"{description} input could not be written completely")
         return _collect_bounded_process(
             process,
             deadline=command_deadline,
             max_output_bytes=max_output_bytes,
             description=description,
         )
+
+    def committed_ignore_matches(
+        self,
+        location: RepositoryLocation,
+        *,
+        state_relative: Path,
+        ignored_paths: tuple[str, ...],
+        deadline: float,
+    ) -> dict[str, str]:
+        """Evaluate only bounded ignore rules loaded from the exact committed tree."""
+        if not isinstance(location, RepositoryLocation):
+            _error("repository location is invalid")
+        if (
+            not isinstance(state_relative, Path)
+            or state_relative.is_absolute()
+            or not state_relative.parts
+            or len(state_relative.parts) > _IGNORE_POLICY_MAX_DEPTH
+        ):
+            _error("audit state ignore policy path is invalid")
+        state_text = _validate_relative_path_text(
+            state_relative.as_posix(),
+            "audit state ignore policy path",
+        )
+        if state_text != state_relative.as_posix():
+            _error("audit state ignore policy path is invalid")
+        if not ignored_paths or len(set(ignored_paths)) != len(ignored_paths):
+            _error("audit state ignore policy probes are invalid")
+        for path in ignored_paths:
+            _validate_relative_path_text(path.rstrip("/"), "audit state ignore policy probe")
+
+        candidates = tuple(
+            Path(*state_relative.parts[:depth], ".gitignore").as_posix()
+            for depth in range(len(state_relative.parts) + 1)
+        )
+        self._validate_location_bindings(location)
+        policy_limits = replace(
+            HARD_LIMITS,
+            snapshot_entries=len(candidates),
+            snapshot_blob_bytes=_IGNORE_POLICY_BLOB_BYTES,
+            git_metadata_bytes=_IGNORE_POLICY_METADATA_BYTES,
+        )
+        tree_output = self._run(
+            location.root,
+            (
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                "--long",
+                location.head,
+                "--",
+                *candidates,
+            ),
+            deadline=deadline,
+            command_seconds=HARD_LIMITS.git_command_seconds,
+            max_output_bytes=_IGNORE_POLICY_METADATA_BYTES,
+            description="committed audit ignore metadata",
+        )
+        entries, _blob_bytes = _parse_tree(tree_output, policy_limits)
+        if any(entry.path not in candidates for entry in entries):
+            _error("committed audit ignore metadata returned an unexpected path")
+
+        committed: dict[str, bytes] = {}
+        for entry in entries:
+            if entry.mode != "100644" or entry.size is None:
+                _error("committed audit ignore policy must use regular non-executable files")
+            data = self._run(
+                location.root,
+                ("cat-file", "blob", entry.object_id),
+                deadline=deadline,
+                command_seconds=HARD_LIMITS.git_command_seconds,
+                max_output_bytes=max(1, entry.size),
+                description="committed audit ignore policy",
+            )
+            if len(data) != entry.size or b"\0" in data:
+                _error("committed audit ignore policy content is invalid")
+            try:
+                data.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise AuditWorkspaceError(
+                    "committed audit ignore policy is not valid UTF-8"
+                ) from exc
+            committed[entry.path] = data
+
+        temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        for boundary in (location.root, location.git_dir, location.common_git_dir):
+            if _path_is_within(temporary_root, boundary):
+                _error("audit ignore policy staging root overlaps repository boundaries")
+        with tempfile.TemporaryDirectory(
+            prefix="zeus-audit-ignore-",
+            dir=temporary_root,
+        ) as temporary:
+            policy_root = Path(temporary)
+            for path, data in committed.items():
+                destination = policy_root / path
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                current = destination.parent
+                while current != policy_root:
+                    current.chmod(0o700)
+                    current = current.parent
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+                try:
+                    with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                        stream.write(data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                finally:
+                    os.close(descriptor)
+            output = self._run(
+                policy_root,
+                (
+                    "-c",
+                    f"core.excludesFile={os.devnull}",
+                    f"--git-dir={location.git_dir}",
+                    f"--work-tree={policy_root}",
+                    "check-ignore",
+                    "-v",
+                    "-z",
+                    "--no-index",
+                    "--stdin",
+                ),
+                deadline=deadline,
+                command_seconds=HARD_LIMITS.git_command_seconds,
+                max_output_bytes=_IGNORE_POLICY_OUTPUT_BYTES,
+                description="committed audit ignore evaluation",
+                input_data=b"".join(
+                    path.encode("utf-8", errors="strict") + b"\0" for path in ignored_paths
+                ),
+                literal_pathspecs=False,
+            )
+
+        fields = output.split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        if len(fields) % 4 != 0:
+            _error("committed audit ignore evaluation returned ambiguous output")
+        matched: dict[str, str] = {}
+        try:
+            for offset in range(0, len(fields), 4):
+                source, _line, _pattern, pathname = (
+                    field.decode("utf-8", errors="strict") for field in fields[offset : offset + 4]
+                )
+                if _pattern.startswith("!"):
+                    _error("committed audit ignore policy contains a matching negation")
+                if pathname in matched:
+                    _error("committed audit ignore evaluation returned duplicate output")
+                matched[pathname] = source
+        except UnicodeDecodeError as exc:
+            raise AuditWorkspaceError(
+                "committed audit ignore evaluation returned invalid output"
+            ) from exc
+        if set(matched) != set(ignored_paths) or any(
+            source not in committed for source in matched.values()
+        ):
+            _error("audit state path is not ignored by committed repository policy")
+        self._validate_location_bindings(location)
+        return matched
 
     def _resolve_path(
         self,
@@ -1998,6 +2185,10 @@ class AuditWorkspace:
             for entry in entries
             if entry.mode == "160000"
         ]
+        skipped.extend(
+            SkippedContent(path=path, reason="excluded by audit configuration")
+            for path in exclusions
+        )
         process = self._spawn(
             location.root,
             ("cat-file", "--batch"),
@@ -2056,8 +2247,8 @@ class AuditWorkspace:
             try:
                 process.stdin.close()
                 reader.ensure_eof()
-                return_code = process.wait(timeout=_remaining(command_deadline))
-            except subprocess.TimeoutExpired:
+                return_code = wait_process_exit(process, deadline=command_deadline)
+            except (AuditProcessError, subprocess.TimeoutExpired):
                 _stop_process(process)
                 _error("Git blob stream exceeded its deadline")
             if return_code != 0:
@@ -2069,7 +2260,7 @@ class AuditWorkspace:
                 process.stdin.close()
             with suppress(OSError):
                 process.stdout.close()
-            if process.poll() is None:
+            if process.returncode is None:
                 _stop_process(process)
 
     def _cleanup_opened_snapshot(

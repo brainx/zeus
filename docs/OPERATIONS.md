@@ -511,7 +511,13 @@ Every audit command discovers the containing Git repository and state context.
 `audit doctor` is the non-mutating readiness preflight: it reports the selected
 provider and model and whether Docker, the exact Hermes Agent 0.19.0 executable,
 configured credentials, and the preloaded digest-qualified image are ready. It
-does not create a run or download dependencies.
+does not create a run or download dependencies. A run requires an explicit
+lowercase provider, model, and one or more provider-prefixed names from the
+credential and endpoint allowlist in private
+`$ZEUS_STATE_DIR/audit/config.json`; every named variable must be non-empty in
+the invoking environment. At least one name must end in `API_KEY`, `AUTH_TOKEN`,
+or `ACCESS_TOKEN`; endpoint and account metadata names are supplementary.
+Schema version 1 does not provide an unauthenticated local-provider mode.
 
 Only `audit run` requires those runtime prerequisites:
 
@@ -532,7 +538,8 @@ relative report path. Only `completed` exits successfully; `partial`,
 per repository. Cleanup attempts to stop run-owned processes, remove the exact
 labelled container, and remove disposable snapshot, control, and Hermes-home
 state. Any cleanup failure is recorded and makes an otherwise complete report
-partial.
+partial. Reports list configured snapshot exclusions and unresolved external
+content; `completed` means complete within that selected snapshot scope.
 
 Read stored reports with:
 

@@ -16,9 +16,14 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from zeus.audit_config import AuditConfigError, load_audit_config
+from zeus.audit_config import AuditConfigError, load_audit_config, validate_provider_selection
 from zeus.audit_docker_broker import HERMES_VERSION
 from zeus.audit_models import AuditConfig
+from zeus.audit_process import (
+    AuditProcessError,
+    stop_process_group,
+    wait_process_exit,
+)
 from zeus.audit_workspace import AuditWorkspace, RepositoryLocation
 from zeus.config import Settings
 from zeus.private_io import UnsafeFileError, inspect_private_directory
@@ -92,10 +97,13 @@ def _command(argv: Sequence[str], *, deadline: float) -> tuple[bool, str]:
             error = "command exceeded its deadline"
         else:
             try:
-                returncode = process.wait(timeout=min(remaining, 30))
+                returncode = wait_process_exit(
+                    process,
+                    deadline=time.monotonic() + min(remaining, 30),
+                )
             except subprocess.TimeoutExpired:
                 error = "command exceeded its deadline"
-    except (OSError, TypeError, ValueError):
+    except (AuditProcessError, OSError, TypeError, ValueError):
         error = "command could not complete"
     finally:
         if process is not None and not _stop_process_group(process):
@@ -105,61 +113,12 @@ def _command(argv: Sequence[str], *, deadline: float) -> tuple[bool, str]:
     return returncode == 0, "available" if returncode == 0 else "unavailable"
 
 
-def _process_group_absent(process: subprocess.Popen[bytes]) -> bool:
-    process.poll()
-    try:
-        os.killpg(process.pid, 0)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    return False
-
-
-def _wait_for_process_group_absence(
-    process: subprocess.Popen[bytes],
-    *,
-    deadline: float,
-) -> bool:
-    while True:
-        if _process_group_absent(process):
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(0.01, remaining))
-
-
-def _signal_process_group(process: subprocess.Popen[bytes], sent_signal: signal.Signals) -> bool:
-    try:
-        os.killpg(process.pid, sent_signal)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
 def _stop_process_group(process: subprocess.Popen[bytes]) -> bool:
-    group_absent = _process_group_absent(process)
-    if not group_absent:
-        _signal_process_group(process, signal.SIGTERM)
-        group_absent = _wait_for_process_group_absence(
-            process,
-            deadline=time.monotonic() + _PROCESS_TERM_SECONDS,
-        )
-    if not group_absent:
-        _signal_process_group(process, signal.SIGKILL)
-        group_absent = _wait_for_process_group_absence(
-            process,
-            deadline=time.monotonic() + _PROCESS_KILL_SECONDS,
-        )
-    if process.poll() is None:
-        try:
-            process.wait(timeout=_PROCESS_KILL_SECONDS)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-    return group_absent and _process_group_absent(process)
+    return stop_process_group(
+        process,
+        term_seconds=_PROCESS_TERM_SECONDS,
+        kill_seconds=_PROCESS_KILL_SECONDS,
+    )
 
 
 def _bounded_version_process(
@@ -220,10 +179,10 @@ def _bounded_version_process(
                     error = "version command exceeded its deadline"
                 else:
                     try:
-                        returncode = process.wait(timeout=remaining)
+                        returncode = wait_process_exit(process, deadline=deadline)
                     except subprocess.TimeoutExpired:
                         error = "version command exceeded its deadline"
-    except (OSError, TypeError, ValueError):
+    except (AuditProcessError, OSError, TypeError, ValueError):
         error = "version command could not complete"
     finally:
         selector.close()
@@ -273,6 +232,10 @@ def _broker_isolation_supported() -> bool:
         ("O_NOFOLLOW", False),
         ("O_CLOEXEC", False),
         ("O_NONBLOCK", False),
+        ("P_PID", False),
+        ("WEXITED", False),
+        ("WNOHANG", False),
+        ("WNOWAIT", False),
     )
     required_functions = (
         "close",
@@ -290,6 +253,7 @@ def _broker_isolation_supported() -> bool:
         "replace",
         "stat",
         "unlink",
+        "waitid",
         "write",
     )
     dir_fd_probes = (os.open, os.stat, os.mkdir, os.rename, os.unlink, os.link)
@@ -356,10 +320,10 @@ def run_audit_doctor(
         checks.append(
             AuditDoctorCheck(
                 "state",
-                state_private,
+                True,
                 "private state path is available"
                 if state_private
-                else "private state path is absent",
+                else "private state path is absent and will be created by audit run",
             )
         )
 
@@ -370,21 +334,33 @@ def run_audit_doctor(
         except (AuditConfigError, OSError, TypeError, ValueError, UnsafeFileError) as exc:
             checks.append(AuditDoctorCheck("configuration", False, str(exc)))
     if active_config is not None:
+        try:
+            validate_provider_selection(active_config)
+        except AuditConfigError as exc:
+            provider_ready = False
+            provider_observation = str(exc)
+        else:
+            provider_ready = True
+            provider_observation = f"provider={active_config.provider} model={active_config.model}"
         checks.append(
             AuditDoctorCheck(
                 "provider",
-                True,
-                f"provider={active_config.provider or '-'} model={active_config.model or '-'}",
+                provider_ready,
+                provider_observation,
             )
         )
         missing = tuple(name for name in active_config.provider_env if not env.get(name))
         checks.append(
             AuditDoctorCheck(
                 "credentials",
-                not missing,
+                provider_ready and not missing,
                 "named credentials are present"
-                if not missing
-                else "missing: " + ", ".join(missing),
+                if provider_ready and not missing
+                else (
+                    "missing: " + ", ".join(missing)
+                    if missing
+                    else "provider credentials are not configured"
+                ),
             )
         )
         docker = _executable("docker")

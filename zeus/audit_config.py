@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from zeus.audit_models import (
+    AUDIT_RESERVED_CHECK_NAMES,
     HARD_LIMITS,
     AuditCategory,
     AuditConfig,
@@ -23,6 +24,24 @@ DEFAULT_AUDIT_IMAGE = (
 )
 
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
+_PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_PROVIDER_ENV_SUFFIXES = frozenset(
+    {
+        "API_KEY",
+        "AUTH_TOKEN",
+        "ACCESS_TOKEN",
+        "BASE_URL",
+        "ORG_ID",
+        "PROJECT_ID",
+    }
+)
+_PROVIDER_CREDENTIAL_SUFFIXES = frozenset(
+    {
+        "API_KEY",
+        "AUTH_TOKEN",
+        "ACCESS_TOKEN",
+    }
+)
 _SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REGISTRY_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _REGISTRY_AUTHORITY_RE = re.compile(
@@ -99,6 +118,32 @@ def _provider_env(value: object) -> tuple[str, ...]:
             _error("provider_env names must be unique")
         result.append(item)
     return tuple(result)
+
+
+def _provider_environment_allowlist(provider: str) -> frozenset[str]:
+    prefix = provider.upper().replace("-", "_")
+    return frozenset(f"{prefix}_{suffix}" for suffix in _PROVIDER_ENV_SUFFIXES)
+
+
+def _provider_credential_allowlist(provider: str) -> frozenset[str]:
+    prefix = provider.upper().replace("-", "_")
+    return frozenset(f"{prefix}_{suffix}" for suffix in _PROVIDER_CREDENTIAL_SUFFIXES)
+
+
+def validate_provider_selection(config: AuditConfig) -> None:
+    """Require one explicit, provider-scoped model and credential selection."""
+    if config.provider is None or config.model is None:
+        _error("provider and model must be explicitly configured for audit runs")
+    if _PROVIDER_RE.fullmatch(config.provider) is None:
+        _error("provider must be a lowercase Hermes provider identifier")
+    if not config.provider_env:
+        _error("provider_env must name at least one provider API key or token")
+    allowed = _provider_environment_allowlist(config.provider)
+    if any(name not in allowed for name in config.provider_env):
+        _error("provider_env contains a name outside the selected provider allowlist")
+    credentials = _provider_credential_allowlist(config.provider)
+    if not any(name in credentials for name in config.provider_env):
+        _error("provider_env must include a selected-provider API key or token")
 
 
 def _image(value: object) -> str:
@@ -196,6 +241,8 @@ def _suggested_commands(value: object) -> tuple[SuggestedCommand, ...]:
             or any(ord(character) < 0x20 or ord(character) == 0x7F for character in name)
         ):
             _error("suggested command names must be non-empty text strings")
+        if name in AUDIT_RESERVED_CHECK_NAMES:
+            _error("suggested command name is reserved by Zeus")
         argv = value[name]
         if not isinstance(argv, list) or not argv:
             _error(f"suggested command {name} must be a non-empty argv list")
@@ -237,7 +284,7 @@ def parse_audit_config(value: object) -> AuditConfig:
     ):
         _error("schema_version must be exactly 1")
 
-    return AuditConfig(
+    config = AuditConfig(
         schema_version=AUDIT_CONFIG_SCHEMA_VERSION,
         provider=_optional_text(value, "provider"),
         model=_optional_text(value, "model"),
@@ -250,6 +297,9 @@ def parse_audit_config(value: object) -> AuditConfig:
         suggested_commands=_suggested_commands(value.get("suggested_commands", {})),
         limits=_limits(value.get("limits", {})),
     )
+    if config.provider is not None or config.model is not None or config.provider_env:
+        validate_provider_selection(config)
+    return config
 
 
 def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:

@@ -55,6 +55,7 @@ from zeus.audit_workspace import (
     AuditWorkspaceError,
     MaterializedSnapshot,
     RepositoryLocation,
+    audit_git_environment,
 )
 from zeus.config import Settings
 from zeus.private_io import (
@@ -1047,6 +1048,7 @@ class AuditService:
             summary=summary,
             findings=(),
             skipped_checks=(),
+            checks=(),
             completeness=AuditCompleteness(
                 complete=complete,
                 reasons=() if reason is None else (reason,),
@@ -1062,20 +1064,19 @@ class AuditService:
         if relative == Path("."):
             raise AuditServiceError("audit state directory cannot be the repository root")
         pathspec = relative.as_posix()
-        ignored_pathspec = pathspec.rstrip("/") + "/.zeus-audit-ignore-probe"
+        if any(component.startswith(":") for component in relative.parts):
+            raise AuditServiceError("audit state path contains unsupported Git pathspec syntax")
+        probe_run_id = "0" * 32
+        ignored_paths = (
+            pathspec.rstrip("/") + "/",
+            f"{pathspec}/audit/config.json",
+            f"{pathspec}/audit/runs/{probe_run_id}/control",
+            f"{pathspec}/locks/audits/{self.location.repository_id}.lock",
+            f"{pathspec}/audits/{probe_run_id}/report.json",
+        )
         git = str(self.workspace._git_executable)
         base = (git, *GIT_HARDENING_ARGUMENTS, "-C", str(self.location.root))
-        ignore_base = (
-            git,
-            *(
-                argument
-                for argument in GIT_HARDENING_ARGUMENTS
-                if argument != "--literal-pathspecs"
-            ),
-            "-C",
-            str(self.location.root),
-        )
-        environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+        environment = audit_git_environment()
         active_deadline = self.deadline if deadline is None else deadline
 
         def remaining_timeout() -> float:
@@ -1095,22 +1096,23 @@ class AuditService:
                 check=False,
                 timeout=remaining_timeout(),
             )
-            ignored = subprocess.run(  # nosec B603
-                (*ignore_base, "check-ignore", "-q", "--no-index", "--", ignored_pathspec),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=environment,
-                shell=False,
-                check=False,
-                timeout=remaining_timeout(),
-            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AuditServiceError("audit state path could not be checked safely") from exc
         if tracked.returncode == 0:
             raise AuditServiceError("in-repository audit state path is tracked")
-        if tracked.returncode not in {0, 1} or ignored.returncode != 0:
+        if tracked.returncode not in {0, 1}:
             raise AuditServiceError("in-repository audit state path must be ignored and untracked")
+        try:
+            self.workspace.committed_ignore_matches(
+                self.location,
+                state_relative=relative,
+                ignored_paths=ignored_paths,
+                deadline=active_deadline,
+            )
+        except AuditWorkspaceError as exc:
+            raise AuditServiceError(
+                "in-repository audit state path must be ignored and untracked"
+            ) from exc
 
     def run(self) -> AuditReport:
         started_at = _now()
@@ -1263,12 +1265,16 @@ class AuditService:
                     allowed_categories=config.categories,
                     source_line_counts=source_line_counts,
                     checks=tuple(checks),
+                    configured_check_names=tuple(
+                        command.name for command in config.suggested_commands
+                    ),
                     limits=config.limits,
                 ),
             )
             control_removal_safe = result.cleanup_complete
             if isinstance(result.model_result, ModelAuditResult):
                 model_result = result.model_result
+                checks.extend(model_result.checks)
             else:
                 model_result = self._empty_result(
                     result.diagnostic or "Audit did not produce a valid result.",

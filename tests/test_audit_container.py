@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -909,7 +910,7 @@ class AuditContainerTests(unittest.TestCase):
                 self.fail("archive accepted bytes that did not match the manifest digest")
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
-    def test_stop_process_signals_lingering_group_after_leader_exit(self) -> None:
+    def test_stop_process_kills_lingering_group_after_leader_exit(self) -> None:
         marker = self.root / "descendant-signalled"
         ready = self.root / "descendant-ready"
         child_script = (
@@ -936,16 +937,16 @@ class AuditContainerTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        leader.wait(timeout=5)
+        from zeus.audit_process import wait_process_exit
+
+        wait_process_exit(leader, deadline=time.monotonic() + 5)
         try:
             audit_container._stop_process(leader)
-            deadline = time.monotonic() + 2
-            while not marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertTrue(marker.exists())
+            with self.assertRaises((PermissionError, ProcessLookupError)):
+                os.killpg(leader.pid, 0)
         finally:
-            with suppress(ProcessLookupError):
-                os.killpg(leader.pid, audit_container.signal.SIGKILL)
+            with suppress(PermissionError, ProcessLookupError):
+                os.killpg(leader.pid, signal.SIGKILL)
 
     def test_subprocess_runner_uses_argv_minimal_env_new_group_and_separate_pipes(self) -> None:
         runner = audit_container._SubprocessDockerRunner()

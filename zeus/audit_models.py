@@ -4,6 +4,24 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
 
+AUDIT_RESERVED_CHECK_NAMES = frozenset(
+    {
+        "audit_runner",
+        "broker_isolation",
+        "configuration",
+        "control_cleanup",
+        "credentials",
+        "docker",
+        "execution",
+        "hermes",
+        "image",
+        "provider",
+        "repository",
+        "state",
+        "state_repository",
+    }
+)
+
 
 class AuditStatus(StrEnum):
     completed = "completed"
@@ -205,6 +223,7 @@ class ModelAuditResult:
     summary: str
     findings: tuple[AuditFinding, ...]
     skipped_checks: tuple[str, ...]
+    checks: tuple[AuditCheck, ...]
     completeness: AuditCompleteness
 
 

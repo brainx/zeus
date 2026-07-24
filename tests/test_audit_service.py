@@ -12,6 +12,20 @@ from unittest import mock
 
 
 class AuditServiceContractTests(unittest.TestCase):
+    def _configured_service(self, service):
+        from zeus.audit_config import parse_audit_config
+
+        service.env["TEST_PROVIDER_API_KEY"] = "test-provider-value"
+        config = parse_audit_config(
+            {
+                "schema_version": 1,
+                "provider": "test-provider",
+                "model": "test-model",
+                "provider_env": ["TEST_PROVIDER_API_KEY"],
+            }
+        )
+        return mock.patch("zeus.audit.load_audit_config", return_value=config)
+
     def _repository(self, root: Path, *, ignored_state: bool = True) -> None:
         run(("git", "init", "-q", str(root)), check=True, stdin=DEVNULL)
         run(
@@ -48,7 +62,7 @@ class AuditServiceContractTests(unittest.TestCase):
 
         return AuditRunnerResult(
             AuditRunnerOutcome.completed,
-            ModelAuditResult("ok", (), (), AuditCompleteness(True)),
+            ModelAuditResult("ok", (), (), (), AuditCompleteness(True)),
             None,
             0,
             True,
@@ -64,6 +78,7 @@ class AuditServiceContractTests(unittest.TestCase):
         cleanup_side_effect=None,
     ):
         patches = [
+            self._configured_service(service),
             mock.patch("zeus.audit._executable", return_value=tool),
             mock.patch("zeus.audit_doctor._executable", return_value=tool),
             mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -150,6 +165,56 @@ class AuditServiceContractTests(unittest.TestCase):
             with self.assertRaisesRegex(AuditServiceError, "ignored and untracked"):
                 AuditService.from_cwd(cwd=root, env={}).run()
 
+    def test_state_policy_rejects_narrow_probe_only_and_dirty_ignore_rules(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root, ignored_state=False)
+            gitignore = root / ".gitignore"
+
+            gitignore.write_text(".zeus/.zeus-audit-ignore-probe\n", encoding="utf-8")
+            run(("git", "-C", str(root), "add", ".gitignore"), check=True, stdin=DEVNULL)
+            run(
+                ("git", "-C", str(root), "commit", "-qm", "narrow ignore"),
+                check=True,
+                stdin=DEVNULL,
+            )
+            with self.assertRaisesRegex(AuditServiceError, "ignored and untracked"):
+                AuditService.from_cwd(cwd=root, env={})._validate_state_path()
+
+            gitignore.write_text(".zeus/\n", encoding="utf-8")
+            with self.assertRaisesRegex(AuditServiceError, "ignored and untracked"):
+                AuditService.from_cwd(cwd=root, env={})._validate_state_path()
+
+            run(("git", "-C", str(root), "add", ".gitignore"), check=True, stdin=DEVNULL)
+            run(
+                ("git", "-C", str(root), "commit", "-qm", "broad ignore"),
+                check=True,
+                stdin=DEVNULL,
+            )
+            gitignore.write_text(
+                ".zeus/.zeus-audit-ignore-probe\n",
+                encoding="utf-8",
+            )
+            AuditService.from_cwd(cwd=root, env={})._validate_state_path()
+
+    def test_state_policy_ignores_ambient_excludes_and_rejects_magic_state_paths(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root, ignored_state=False)
+            (root / ".git" / "info" / "exclude").write_text(".zeus/\n", encoding="utf-8")
+            with self.assertRaisesRegex(AuditServiceError, "ignored and untracked"):
+                AuditService.from_cwd(cwd=root, env={})._validate_state_path()
+
+            with self.assertRaisesRegex(AuditServiceError, "pathspec syntax"):
+                AuditService.from_cwd(
+                    cwd=root,
+                    env={"ZEUS_STATE_DIR": str(root / ":(glob).zeus")},
+                )._validate_state_path()
+
     def test_doctor_reports_repository_state_policy_without_creating_a_run(self) -> None:
         from zeus.audit import AuditService
         from zeus.audit_doctor import AuditDoctorReport
@@ -195,17 +260,31 @@ class AuditServiceContractTests(unittest.TestCase):
             self._repository(root)
             service = AuditService.from_cwd(cwd=root, env={})
             timeouts: list[float] = []
+            policy_deadlines: list[float] = []
 
             def command(*_args, **kwargs):
                 timeouts.append(kwargs["timeout"])
-                return SimpleNamespace(returncode=1 if len(timeouts) == 1 else 0)
+                return SimpleNamespace(returncode=1, stdout=b"")
+
+            def committed_policy(*_args, **kwargs):
+                policy_deadlines.append(kwargs["deadline"])
+                return {}
 
             with (
-                mock.patch("zeus.audit.time.monotonic", side_effect=(100.0, 101.5)),
+                mock.patch(
+                    "zeus.audit.time.monotonic",
+                    side_effect=(100.0,),
+                ),
                 mock.patch("zeus.audit.subprocess.run", side_effect=command),
+                mock.patch.object(
+                    service.workspace,
+                    "committed_ignore_matches",
+                    side_effect=committed_policy,
+                ),
             ):
                 service._validate_state_path(deadline=105.0)
-            self.assertEqual([5.0, 3.5], timeouts)
+            self.assertEqual([5.0], timeouts)
+            self.assertEqual([105.0], policy_deadlines)
 
     def test_run_revalidates_head_after_acquiring_repository_lock(self) -> None:
         from zeus.audit import AuditService, AuditServiceError
@@ -520,7 +599,7 @@ class AuditServiceContractTests(unittest.TestCase):
             b'{"summary":"ok","findings":[{"category":"security","severity":"low",'
             b'"confidence":"high","title":"source","evidence":[{"type":"source",'
             b'"path":"src/ok.py","start_line":2,"observation":"line"}],"impact":"i",'
-            b'"recommendation":"r","verification":"v"}],"skipped_checks":[]}'
+            b'"recommendation":"r","verification":"v"}],"checks":[],"skipped_checks":[]}'
         )
         result = validate_model_output(
             payload,
@@ -558,7 +637,7 @@ class AuditServiceContractTests(unittest.TestCase):
         from zeus.audit import _with_cleanup_completeness
         from zeus.audit_models import AuditCompleteness, ModelAuditResult
 
-        result = ModelAuditResult("ok", (), (), AuditCompleteness(True))
+        result = ModelAuditResult("ok", (), (), (), AuditCompleteness(True))
         self.assertIs(result, _with_cleanup_completeness(result, cleanup_complete=True))
         incomplete = _with_cleanup_completeness(result, cleanup_complete=False)
         self.assertFalse(incomplete.completeness.complete)
@@ -571,6 +650,7 @@ class AuditServiceContractTests(unittest.TestCase):
         from zeus.audit import (
             snapshot_source_line_counts as real_line_counts,
         )
+        from zeus.audit_config import parse_audit_config
         from zeus.audit_container import PreparedAuditContainer
         from zeus.audit_models import AuditStatus
         from zeus.audit_runner import AuditRunnerOutcome, AuditRunnerResult
@@ -597,6 +677,7 @@ class AuditServiceContractTests(unittest.TestCase):
                         "verification": "verification",
                     }
                 ],
+                "checks": [],
                 "skipped_checks": [],
             },
             separators=(",", ":"),
@@ -608,7 +689,18 @@ class AuditServiceContractTests(unittest.TestCase):
             tool = root / "audit-tool"
             tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             tool.chmod(0o700)
-            service = AuditService.from_cwd(cwd=root, env={})
+            config = parse_audit_config(
+                {
+                    "schema_version": 1,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "provider_env": ["TEST_PROVIDER_API_KEY"],
+                }
+            )
+            service = AuditService.from_cwd(
+                cwd=root,
+                env={"TEST_PROVIDER_API_KEY": "test-value"},
+            )
             prepared_snapshot = None
             line_count_calls = 0
             profile_paths: list[Path] = []
@@ -664,6 +756,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 )
 
             with (
+                mock.patch("zeus.audit.load_audit_config", return_value=config),
                 mock.patch("zeus.audit._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -1034,6 +1127,7 @@ class AuditServiceContractTests(unittest.TestCase):
             service = AuditService.from_cwd(cwd=root, env={})
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit._executable", side_effect=KeyboardInterrupt("stop")),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -1086,6 +1180,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 return real_lstat(path, *args, **kwargs)
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit.os.lstat", side_effect=interrupt_first_control_lstat),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -1144,6 +1239,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 return result
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit.os.mkdir", side_effect=mkdir_then_interrupt),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -1194,6 +1290,7 @@ class AuditServiceContractTests(unittest.TestCase):
 
             try:
                 with (
+                    self._configured_service(service),
                     mock.patch(
                         "zeus.audit._create_audit_run_control",
                         side_effect=create_then_interrupt,
@@ -1265,6 +1362,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 raise KeyboardInterrupt("stop after control cleanup return")
 
             with (
+                self._configured_service(service),
                 mock.patch(
                     "zeus.audit._create_audit_run_control",
                     side_effect=track_creation,
@@ -1345,6 +1443,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 return real_rmdir(path, *args, **kwargs)
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit.os.open", side_effect=interrupt_control_open),
                 mock.patch("zeus.audit.os.rmdir", side_effect=replace_creation_during_rmdir),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
@@ -1407,6 +1506,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 return real_fsync(descriptor)
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit.os.open", side_effect=interrupt_control_open),
                 mock.patch("zeus.audit.os.fsync", side_effect=interrupt_cleanup_fsync),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
@@ -1459,6 +1559,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 return CleanupResult(True, False, "removed")
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -1510,6 +1611,7 @@ class AuditServiceContractTests(unittest.TestCase):
             service = AuditService.from_cwd(cwd=root, env={})
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -1560,6 +1662,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 return self._prepared_container(runtime, **kwargs)
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
@@ -1616,6 +1719,7 @@ class AuditServiceContractTests(unittest.TestCase):
             service = AuditService.from_cwd(cwd=root, env={})
 
             with (
+                self._configured_service(service),
                 mock.patch("zeus.audit._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._executable", return_value=tool),
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),

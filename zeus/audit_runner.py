@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-import errno
 import math
 import os
 import re
 import selectors
-import signal
 import stat
 import subprocess  # nosec B404
 import time
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from threading import Event
 from typing import BinaryIO, NoReturn, Protocol, cast
 
+from zeus.audit_config import AuditConfigError, validate_provider_selection
 from zeus.audit_docker_broker import (
     AuditDockerBrokerState,
     BrokerCommandResult,
@@ -26,6 +25,11 @@ from zeus.audit_docker_broker import (
     read_audit_docker_broker_state,
 )
 from zeus.audit_models import HARD_LIMITS, AuditConfig
+from zeus.audit_process import (
+    AuditProcessError,
+    observe_process_exit,
+    stop_process_group,
+)
 from zeus.private_io import (
     UnsafeFileError,
     inspect_private_directory,
@@ -106,12 +110,6 @@ class _CapturedProcess:
     stderr: bytes
     returncode: int | None
     detail: str | None = None
-
-
-class _ProcessGroupState(StrEnum):
-    absent = "absent"
-    present = "present"
-    unknown = "unknown"
 
 
 def _error(message: str) -> NoReturn:
@@ -202,6 +200,10 @@ def _validated_environment(
 ) -> tuple[dict[str, str], tuple[str, ...]]:
     if not isinstance(source_env, Mapping):
         _error("audit runner source environment is invalid")
+    try:
+        validate_provider_selection(config)
+    except AuditConfigError as exc:
+        raise AuditRunnerError("audit runner provider selection is invalid") from exc
     environment = {
         "PATH": f"{broker_dir}{os.pathsep}{_SYSTEM_PATH}",
         "HOME": str(control_dir / "home"),
@@ -331,7 +333,7 @@ def _capture_process(
                     AuditRunnerOutcome.cancelled,
                     bytes(stdout),
                     bytes(stderr),
-                    process.poll(),
+                    _observed_returncode(process),
                 )
             now = time.monotonic()
             if now >= deadline:
@@ -339,7 +341,7 @@ def _capture_process(
                     AuditRunnerOutcome.timed_out,
                     bytes(stdout),
                     bytes(stderr),
-                    process.poll(),
+                    _observed_returncode(process),
                 )
             breach = _broker_breach(state_path, state_reader, final=False)
             if breach is not None:
@@ -347,7 +349,7 @@ def _capture_process(
                     AuditRunnerOutcome.broker_breach,
                     bytes(stdout),
                     bytes(stderr),
-                    process.poll(),
+                    _observed_returncode(process),
                     breach,
                 )
             events = selector.select(min(_POLL_SECONDS, deadline - now))
@@ -364,7 +366,7 @@ def _capture_process(
                             AuditRunnerOutcome.model_output_limit,
                             b"",
                             bytes(stderr),
-                            process.poll(),
+                            _observed_returncode(process),
                         )
                 else:
                     eof, exceeded = _read_process_stream(
@@ -377,11 +379,12 @@ def _capture_process(
                             AuditRunnerOutcome.stderr_output_limit,
                             b"",
                             bytes(stderr),
-                            process.poll(),
+                            _observed_returncode(process),
                         )
                 if eof:
                     selector.unregister(stream)
-        while process.poll() is None:
+        returncode = _observed_returncode(process)
+        while returncode is None:
             if cancel_event is not None and cancel_event.is_set():
                 return _CapturedProcess(
                     AuditRunnerOutcome.cancelled,
@@ -407,7 +410,7 @@ def _capture_process(
                     breach,
                 )
             time.sleep(min(_POLL_SECONDS, deadline - now))
-        returncode = process.returncode
+            returncode = _observed_returncode(process)
         breach = _broker_breach(state_path, state_reader, final=True)
         if breach is not None:
             return _CapturedProcess(
@@ -434,84 +437,19 @@ def _capture_process(
         selector.close()
 
 
-def _process_group_state(group_id: int) -> _ProcessGroupState:
+def _observed_returncode(process: subprocess.Popen[bytes]) -> int | None:
     try:
-        os.killpg(group_id, 0)
-    except OSError as exc:
-        if exc.errno == errno.ESRCH:
-            return _ProcessGroupState.absent
-        return _ProcessGroupState.unknown
-    return _ProcessGroupState.present
-
-
-def _signal_process_group(group_id: int, sent_signal: signal.Signals) -> _ProcessGroupState:
-    try:
-        os.killpg(group_id, sent_signal)
-    except OSError as exc:
-        if exc.errno == errno.ESRCH:
-            return _ProcessGroupState.absent
-        return _ProcessGroupState.unknown
-    return _ProcessGroupState.present
-
-
-def _wait_for_process_group_absence(
-    group_id: int,
-    grace_seconds: float,
-    process: subprocess.Popen[bytes],
-) -> _ProcessGroupState:
-    deadline = time.monotonic() + grace_seconds
-    while True:
-        process.poll()
-        state = _process_group_state(group_id)
-        if state is not _ProcessGroupState.present or time.monotonic() >= deadline:
-            return state
-        time.sleep(0.01)
-
-
-def _reap_process(process: subprocess.Popen[bytes], timeout: float) -> None:
-    with suppress(OSError, subprocess.TimeoutExpired):
-        process.wait(timeout=timeout)
+        return observe_process_exit(process)
+    except AuditProcessError as exc:
+        raise AuditRunnerError("audit process group ownership became unavailable") from exc
 
 
 def _stop_process_group(process: subprocess.Popen[bytes]) -> bool:
-    group_id = process.pid
-    initial = _process_group_state(group_id)
-    if initial is _ProcessGroupState.absent:
-        _reap_process(process, 0.1)
-        return True
-    if initial is _ProcessGroupState.unknown:
-        process.poll()
-        return False
-    term = _signal_process_group(group_id, signal.SIGTERM)
-    if term is _ProcessGroupState.absent:
-        _reap_process(process, 0.1)
-        return True
-    if term is _ProcessGroupState.unknown:
-        process.poll()
-        return False
-    after_term = _wait_for_process_group_absence(
-        group_id,
-        _TERM_GRACE_SECONDS,
+    return stop_process_group(
         process,
+        term_seconds=_TERM_GRACE_SECONDS,
+        kill_seconds=_KILL_GRACE_SECONDS,
     )
-    if after_term is _ProcessGroupState.absent:
-        _reap_process(process, 0.1)
-        return True
-    if after_term is _ProcessGroupState.unknown:
-        return False
-    killed = _signal_process_group(group_id, signal.SIGKILL)
-    if killed is _ProcessGroupState.absent:
-        _reap_process(process, 0.1)
-        return True
-    if killed is _ProcessGroupState.unknown:
-        return False
-    _reap_process(process, 1)
-    after_kill = _wait_for_process_group_absence(
-        group_id,
-        _KILL_GRACE_SECONDS,
-        process,
-    )
-    return after_kill is _ProcessGroupState.absent
 
 
 def _bounded_diagnostic(
@@ -692,11 +630,15 @@ class AuditRunner:
                                 state_reader=self._broker_state_reader,
                             )
                         except KeyboardInterrupt:
+                            try:
+                                interrupted_returncode = _observed_returncode(process)
+                            except AuditRunnerError:
+                                interrupted_returncode = None
                             captured = _CapturedProcess(
                                 AuditRunnerOutcome.cancelled,
                                 b"",
                                 b"",
-                                process.poll(),
+                                interrupted_returncode,
                                 "audit query was interrupted",
                             )
             except (OSError, TypeError, ValueError, UnsafeFileError) as exc:

@@ -9,7 +9,6 @@ import math
 import os
 import re
 import selectors
-import signal
 import stat
 import subprocess  # nosec B404
 import tarfile
@@ -23,6 +22,7 @@ from typing import BinaryIO, NoReturn, Protocol, cast
 
 from zeus.audit_config import AuditConfigError, parse_audit_config
 from zeus.audit_models import HARD_LIMITS, AuditLimits
+from zeus.audit_process import AuditProcessError, stop_process_group, wait_process_exit
 from zeus.audit_workspace import MaterializedSnapshot, SnapshotManifestEntry
 from zeus.private_io import ensure_private_directory, inspect_private_directory
 
@@ -325,23 +325,8 @@ def _validated_image_reference(image_ref: str) -> tuple[str, str]:
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    group_id = process.pid
-    with suppress(OSError):
-        os.killpg(group_id, signal.SIGTERM)
-    term_deadline = time.monotonic() + 0.2
-    while time.monotonic() < term_deadline:
-        try:
-            os.killpg(group_id, 0)
-        except ProcessLookupError:
-            break
-        except OSError:
-            break
-        time.sleep(0.01)
-    with suppress(OSError):
-        os.killpg(group_id, signal.SIGKILL)
-    if process.poll() is None:
-        with suppress(OSError, subprocess.TimeoutExpired):
-            process.wait(timeout=1)
+    if not stop_process_group(process):
+        _error("Docker control process group cleanup could not be verified")
 
 
 class _SubprocessDockerRunner:
@@ -420,8 +405,8 @@ class _SubprocessDockerRunner:
                         _stop_process(process)
                         _error("Docker control output exceeded its byte limit")
             try:
-                return_code = process.wait(timeout=_remaining(deadline))
-            except subprocess.TimeoutExpired:
+                return_code = wait_process_exit(process, deadline=deadline)
+            except (AuditProcessError, subprocess.TimeoutExpired):
                 _stop_process(process)
                 _error("Docker control process exceeded its deadline")
             if input_stream is not None:
@@ -443,7 +428,7 @@ class _SubprocessDockerRunner:
                 if close_stream is not None:
                     with suppress(OSError):
                         close_stream.close()
-            if process.poll() is None:
+            if process.returncode is None:
                 _stop_process(process)
 
 

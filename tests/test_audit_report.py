@@ -95,12 +95,14 @@ def _model_bytes(
     findings: Sequence[object],
     *,
     summary: str = "Audit complete",
+    checks: Sequence[object] | None = None,
     skipped_checks: Sequence[object] | None = None,
 ) -> bytes:
     return json.dumps(
         {
             "summary": summary,
             "findings": findings,
+            "checks": [] if checks is None else checks,
             "skipped_checks": [] if skipped_checks is None else skipped_checks,
         },
         ensure_ascii=False,
@@ -347,6 +349,83 @@ class ModelOutputValidationTests(unittest.TestCase):
             with self.subTest(skipped=skipped), self.assertRaises(AuditReportError):
                 _validate(_model_bytes([], skipped_checks=skipped))
 
+    def test_configured_checks_are_structured_and_omissions_become_skipped(self) -> None:
+        result = _validate(
+            _model_bytes(
+                [
+                    _finding(
+                        evidence=[
+                            {
+                                "type": "check",
+                                "check_name": "unit",
+                                "observation": "the configured check passed",
+                            }
+                        ]
+                    )
+                ],
+                checks=[
+                    {
+                        "name": "unit",
+                        "disposition": "passed",
+                        "observation": "42 tests passed",
+                    }
+                ],
+            ),
+            configured_check_names=("unit", "typecheck"),
+        )
+
+        self.assertEqual(
+            [
+                ("unit", CheckDisposition.passed),
+                ("typecheck", CheckDisposition.skipped),
+            ],
+            [(check.name, check.disposition) for check in result.checks],
+        )
+        self.assertEqual(("typecheck",), result.skipped_checks)
+
+        ad_hoc = _validate(
+            _model_bytes(
+                [],
+                checks=[
+                    {
+                        "name": "dependency inspection",
+                        "disposition": "passed",
+                        "observation": "lock file inspected",
+                    },
+                    {
+                        "name": "dynamic scan",
+                        "disposition": "skipped",
+                        "observation": "runtime was unavailable",
+                    },
+                ],
+                skipped_checks=["dynamic scan"],
+            ),
+            configured_check_names=("unit",),
+        )
+        self.assertEqual(
+            [
+                ("dependency inspection", CheckDisposition.passed),
+                ("dynamic scan", CheckDisposition.skipped),
+                ("unit", CheckDisposition.skipped),
+            ],
+            [(check.name, check.disposition) for check in ad_hoc.checks],
+        )
+        self.assertEqual(("dynamic scan", "unit"), ad_hoc.skipped_checks)
+
+        with self.assertRaisesRegex(AuditReportError, "Zeus checks"):
+            _validate(
+                _model_bytes(
+                    [],
+                    checks=[
+                        {
+                            "name": "audit_runner",
+                            "disposition": "passed",
+                            "observation": "claim",
+                        }
+                    ],
+                )
+            )
+
     def test_every_stored_model_string_is_redacted_before_return(self) -> None:
         secret = "secret-value"
         result = _validate(
@@ -452,6 +531,7 @@ class AuditReportTests(unittest.TestCase):
             summary="partial",
             findings=(),
             skipped_checks=(),
+            checks=(),
             completeness=AuditCompleteness(
                 complete=False,
                 rejected_findings=1,
@@ -740,6 +820,9 @@ class AuditReportTests(unittest.TestCase):
         self.assertIn(r"\u0085", first)
         self.assertNotIn("Zulu | row", first)
         self.assertIn("run-123", first)
+        self.assertIn("## Skipped content", first)
+        self.assertIn("vendor", first)
+        self.assertIn("Complete within the selected snapshot scope", first)
 
     def test_serializer_rejects_nonfinite_duration(self) -> None:
         report = replace(

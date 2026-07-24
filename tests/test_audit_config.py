@@ -150,11 +150,23 @@ class AuditConfigTests(unittest.TestCase):
 
     def test_provider_environment_names_are_unique_valid_and_bounded(self) -> None:
         self.assertEqual(
-            ("A1", "B_2", "CREDENTIAL_3", "Z9"),
+            (
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "OPENAI_ORG_ID",
+                "OPENAI_PROJECT_ID",
+            ),
             parse_audit_config(
                 {
                     "schema_version": 1,
-                    "provider_env": ["A1", "B_2", "CREDENTIAL_3", "Z9"],
+                    "provider": "openai",
+                    "model": "gpt-audit",
+                    "provider_env": [
+                        "OPENAI_API_KEY",
+                        "OPENAI_BASE_URL",
+                        "OPENAI_ORG_ID",
+                        "OPENAI_PROJECT_ID",
+                    ],
                 }
             ).provider_env,
         )
@@ -170,7 +182,67 @@ class AuditConfigTests(unittest.TestCase):
         )
         for values in invalid_lists:
             with self.subTest(values=values), self.assertRaises(AuditConfigError):
-                parse_audit_config({"schema_version": 1, "provider_env": values})
+                parse_audit_config(
+                    {
+                        "schema_version": 1,
+                        "provider": "openai",
+                        "model": "gpt-audit",
+                        "provider_env": values,
+                    }
+                )
+
+        for unsafe in (
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "OPENAI_PYTHONPATH",
+            "OTHER_API_KEY",
+        ):
+            with (
+                self.subTest(unsafe=unsafe),
+                self.assertRaisesRegex(
+                    AuditConfigError,
+                    "allowlist",
+                ),
+            ):
+                parse_audit_config(
+                    {
+                        "schema_version": 1,
+                        "provider": "openai",
+                        "model": "gpt-audit",
+                        "provider_env": [unsafe],
+                    }
+                )
+
+    def test_explicit_provider_model_and_provider_environment_are_an_execution_unit(
+        self,
+    ) -> None:
+        invalid = (
+            {"provider": "openai"},
+            {"model": "gpt-audit"},
+            {"provider_env": ["OPENAI_API_KEY"]},
+            {"provider": "openai", "model": "gpt-audit"},
+            {
+                "provider": "OpenAI",
+                "model": "gpt-audit",
+                "provider_env": ["OPENAI_API_KEY"],
+            },
+            {
+                "provider": "openai",
+                "model": "gpt-audit",
+                "provider_env": ["OPENAI_BASE_URL"],
+            },
+            {
+                "provider": "openai",
+                "model": "gpt-audit",
+                "provider_env": ["OPENAI_ORG_ID", "OPENAI_PROJECT_ID"],
+            },
+        )
+        for fields in invalid:
+            with self.subTest(fields=fields), self.assertRaises(AuditConfigError):
+                parse_audit_config({"schema_version": 1, **fields})
 
     def test_image_must_be_a_sha256_digest_or_digest_qualified_reference(self) -> None:
         valid_images = (
@@ -276,6 +348,7 @@ class AuditConfigTests(unittest.TestCase):
             {"test": [1]},
             {"test": [""]},
             {"test": ["tool", "bad\x00arg"]},
+            {"audit_runner": ["tool"]},
             {f"command-{index}": ["tool"] for index in range(65)},
         )
         for commands_value in invalid_commands:

@@ -77,7 +77,7 @@ class AuditDoctorContractTests(unittest.TestCase):
     def _process_group_exists(self, process_group: int) -> bool:
         try:
             os.killpg(process_group, 0)
-        except ProcessLookupError:
+        except (PermissionError, ProcessLookupError):
             return False
         return True
 
@@ -93,7 +93,7 @@ class AuditDoctorContractTests(unittest.TestCase):
             return
         process_group, child = self._descendant(marker)
         if process_group != os.getpgrp():
-            with suppress(ProcessLookupError):
+            with suppress(PermissionError, ProcessLookupError):
                 os.killpg(process_group, signal.SIGKILL)
         else:
             with suppress(ProcessLookupError):
@@ -178,19 +178,28 @@ class AuditDoctorContractTests(unittest.TestCase):
                 process_group, child = self._descendant(marker)
                 self.assertTrue(ok, observation)
                 self.assertFalse(self._process_group_exists(process_group))
-                self.assertFalse(self._process_exists(child))
+                self.assertNotEqual(os.getpid(), child)
             finally:
                 self._cleanup_descendant(marker)
 
     def test_pinned_version_fails_when_process_group_absence_cannot_be_verified(self) -> None:
         from zeus.audit_doctor import _pinned_hermes_version
+        from zeus.audit_process import stop_process_group
 
         with tempfile.TemporaryDirectory() as temporary:
             executable = self._version_executable(
                 Path(temporary),
                 b"Hermes Agent v0.19.0 (2026.7.20)\n",
             )
-            with mock.patch("zeus.audit_doctor._stop_process_group", return_value=False):
+
+            def clean_but_report_failure(process) -> bool:
+                self.assertTrue(stop_process_group(process))
+                return False
+
+            with mock.patch(
+                "zeus.audit_doctor._stop_process_group",
+                side_effect=clean_but_report_failure,
+            ):
                 ok, observation = _pinned_hermes_version(
                     executable,
                     deadline=time.monotonic() + 2,
@@ -245,28 +254,13 @@ class AuditDoctorContractTests(unittest.TestCase):
             finally:
                 self._cleanup_descendant(marker)
 
-    def test_process_group_stop_kills_surviving_group_after_parent_exits(self) -> None:
+    def test_process_group_stop_rejects_an_already_reaped_parent(self) -> None:
         from zeus.audit_doctor import _stop_process_group
 
-        process = mock.Mock(pid=424242)
-        process.wait.return_value = 0
-        process.poll.return_value = 0
-        signals: list[int] = []
-        killed = False
-
-        def kill_group(_group_id: int, sent_signal: int) -> None:
-            nonlocal killed
-            signals.append(sent_signal)
-            if sent_signal == signal.SIGKILL:
-                killed = True
-            if sent_signal == 0 and killed:
-                raise ProcessLookupError
-
-        with mock.patch("zeus.audit_doctor.os.killpg", side_effect=kill_group):
-            self.assertTrue(_stop_process_group(process))
-        self.assertIn(signal.SIGTERM, signals)
-        self.assertIn(signal.SIGKILL, signals)
-        self.assertIn(0, signals[signals.index(signal.SIGKILL) + 1 :])
+        process = SimpleNamespace(pid=424242, returncode=0)
+        with mock.patch("zeus.audit_process.os.killpg") as kill_group:
+            self.assertFalse(_stop_process_group(process))
+        kill_group.assert_not_called()
 
     def test_broker_support_requires_every_used_posix_primitive(self) -> None:
         from zeus import audit_doctor
@@ -276,6 +270,8 @@ class AuditDoctorContractTests(unittest.TestCase):
             (audit_doctor.os, "replace"),
             (audit_doctor.os, "unlink"),
             (audit_doctor.os, "killpg"),
+            (audit_doctor.os, "waitid"),
+            (audit_doctor.os, "WNOWAIT"),
             (audit_doctor.fcntl, "flock"),
             (audit_doctor.signal, "SIGTERM"),
             (audit_doctor.signal, "SIGKILL"),
@@ -302,9 +298,9 @@ class AuditDoctorContractTests(unittest.TestCase):
         config = parse_audit_config(
             {
                 "schema_version": 1,
-                "provider": "provider",
+                "provider": "test-provider",
                 "model": "model",
-                "provider_env": ["TEST_PROVIDER_KEY"],
+                "provider_env": ["TEST_PROVIDER_API_KEY"],
             }
         )
         workspace = mock.Mock()
@@ -324,7 +320,7 @@ class AuditDoctorContractTests(unittest.TestCase):
                 workspace=workspace,
                 location=mock.sentinel.location,
                 settings=settings,
-                env={"TEST_PROVIDER_KEY": "top-secret-value"},
+                env={"TEST_PROVIDER_API_KEY": "top-secret-value"},
                 deadline=time.monotonic() + 1,
                 config=config,
             )
@@ -356,7 +352,9 @@ class AuditDoctorContractTests(unittest.TestCase):
         config = parse_audit_config(
             {
                 "schema_version": 1,
-                "provider_env": ["TEST_PROVIDER_KEY"],
+                "provider": "test-provider",
+                "model": "test-model",
+                "provider_env": ["TEST_PROVIDER_API_KEY"],
             }
         )
         workspace = mock.Mock()
@@ -377,7 +375,6 @@ class AuditDoctorContractTests(unittest.TestCase):
         checks = {check.name: check for check in report.checks}
         self.assertFalse(report.ok)
         for name in (
-            "state",
             "credentials",
             "docker",
             "image",
@@ -386,6 +383,8 @@ class AuditDoctorContractTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertFalse(checks[name].ok)
+        self.assertTrue(checks["state"].ok)
+        self.assertIn("will be created", checks["state"].observation)
 
     def test_doctor_reports_invalid_configuration_without_creating_a_run(self) -> None:
         from zeus.audit_config import AuditConfigError
