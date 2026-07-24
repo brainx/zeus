@@ -164,6 +164,9 @@ class AuditDockerBrokerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name).resolve()
+        self.trusted_executable = self.root / "trusted-executable"
+        self.trusted_executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        self.trusted_executable.chmod(0o700)
         self.broker_dir = self.root / "broker"
         self.broker_dir.mkdir(mode=0o700)
         self.prepared = PreparedAuditContainer(
@@ -190,10 +193,10 @@ class AuditDockerBrokerTests(unittest.TestCase):
     ) -> Path:
         return install_audit_docker_broker(
             self.prepared,
-            docker_executable=Path(sys.executable).resolve(),
+            docker_executable=self.trusted_executable,
             limits=limits,
             deadline=self.deadline if deadline is None else deadline,
-            python_executable=Path(sys.executable).resolve(),
+            python_executable=self.trusted_executable,
         )
 
     def _invoke(
@@ -989,10 +992,10 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 sealed_deadline = time.monotonic() + 1
                 install_audit_docker_broker(
                     prepared,
-                    docker_executable=Path(sys.executable).resolve(),
+                    docker_executable=self.trusted_executable,
                     limits=HARD_LIMITS,
                     deadline=sealed_deadline,
-                    python_executable=Path(sys.executable).resolve(),
+                    python_executable=self.trusted_executable,
                 )
                 with audit_docker_broker._locked_state(prepared.state_path) as locked:
                     state = audit_docker_broker._read_state_unlocked(locked)
@@ -1028,10 +1031,10 @@ class AuditDockerBrokerTests(unittest.TestCase):
         with self.assertRaises(AuditDockerBrokerError):
             install_audit_docker_broker(
                 unsafe,
-                docker_executable=Path(sys.executable).resolve(),
+                docker_executable=self.trusted_executable,
                 limits=HARD_LIMITS,
                 deadline=self.deadline,
-                python_executable=Path(sys.executable).resolve(),
+                python_executable=self.trusted_executable,
             )
 
         self.broker_dir.chmod(0o755)
@@ -1052,7 +1055,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
             docker_executable=system_executable,
             limits=HARD_LIMITS,
             deadline=self.deadline,
-            python_executable=Path(sys.executable).resolve(),
+            python_executable=self.trusted_executable,
         )
         self.assertEqual(self.broker_dir / "docker", executable)
 
@@ -1066,7 +1069,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 docker_executable=unsafe_executable,
                 limits=HARD_LIMITS,
                 deadline=self.deadline,
-                python_executable=Path(sys.executable).resolve(),
+                python_executable=self.trusted_executable,
             )
 
     def test_installation_rejects_executables_owned_by_an_unrelated_user(self) -> None:
@@ -1104,7 +1107,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 docker_executable=unsafe_executable,
                 limits=HARD_LIMITS,
                 deadline=self.deadline,
-                python_executable=Path(sys.executable).resolve(),
+                python_executable=self.trusted_executable,
             )
 
     def test_deadline_is_resampled_after_waiting_for_the_state_lock(self) -> None:
