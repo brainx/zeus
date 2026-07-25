@@ -2,8 +2,10 @@
 
 ## Current status
 
-Zeus v0.3.0 is alpha software with a local-first, host-local scope. It owns
-profiles, processes, lifecycle safety, and reconciliation evidence on one host.
+The latest stable release is Zeus v0.3.0. The `main` branch is the
+v0.4.0.dev0 development line and remains alpha software with a local-first,
+host-local scope. It owns profiles, processes, lifecycle safety, and
+reconciliation evidence on one host.
 
 ## Shipped
 

@@ -1046,13 +1046,16 @@ class RepoContractTests(unittest.TestCase):
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
         changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
         openapi = Path("docs/openapi.json").read_text(encoding="utf-8")
+        roadmap = Path("docs/ROADMAP.md").read_text(encoding="utf-8")
 
-        self.assertIn('__version__ = "0.3.0"', init_text)
+        self.assertIn('__version__ = "0.4.0.dev0"', init_text)
         self.assertIn('dynamic = ["version"]', pyproject)
         self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
         self.assertNotIn('version = "0.1.3"', pyproject)
         self.assertIn("## 0.3.0", changelog)
-        self.assertIn('"version": "0.3.0"', openapi)
+        self.assertIn('"version": "0.4.0.dev0"', openapi)
+        self.assertIn("The latest stable release is Zeus v0.3.0.", roadmap)
+        self.assertIn("v0.4.0.dev0 development line", roadmap)
 
     def test_inspect_api_is_documented_and_secured(self) -> None:
         api = Path("zeus/api.py").read_text(encoding="utf-8")

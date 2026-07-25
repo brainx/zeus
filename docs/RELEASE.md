@@ -7,7 +7,17 @@ its referenced commit to carry signatures that GitHub marks verified. The
 historical v0.3.0 release predates this policy and remains unchanged.
 
 1. Ensure CI is green on the commit to release.
-2. Run the full local release gate:
+2. Prepare the stable release:
+
+   - Replace `0.4.0.dev0` with the intended stable version in
+     `zeus/__init__.py` and `docs/openapi.json`.
+   - Move `CHANGELOG.md`'s `Unreleased` entries into a matching `## X.Y.Z`
+     section.
+   - Run `python scripts/check_version_tag.py vX.Y.Z --require-changelog`.
+   - After the release, advance `main` to the next `.dev0` version in a
+     separate commit.
+
+3. Run the full local release gate:
 
    ```bash
    make release-check
@@ -37,16 +47,7 @@ historical v0.3.0 release predates this policy and remains unchanged.
    sh scripts/generate_checksums.sh dist
    ```
 
-3. Update `CHANGELOG.md`.
-4. Bump `zeus/__init__.py` version. Package metadata reads the version from
-   `zeus.__version__`.
-5. Verify the tag that will be pushed matches the package version and changelog:
-
-   ```bash
-   python scripts/check_version_tag.py vX.Y.Z --require-changelog
-   ```
-
-6. Confirm the release commit is signed and GitHub-verified, then create and push
+4. Confirm the release commit is signed and GitHub-verified, then create and push
    a signed annotated tag:
 
    ```bash
@@ -59,7 +60,7 @@ historical v0.3.0 release predates this policy and remains unchanged.
    report both the tag and commit verification objects as `verified` with reason
    `valid`. Configure the signing identity with GitHub before pushing the tag.
 
-7. Confirm the GitHub release workflow completed and attached the generated
+5. Confirm the GitHub release workflow completed and attached the generated
    `dist/*` artifacts plus `dist/SHA256SUMS.txt` to the GitHub Release.
 
 ## GitHub Release Workflow
