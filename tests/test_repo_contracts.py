@@ -11,6 +11,7 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from scripts.check_version_tag import _has_exact_changelog_heading
 from zeus.state import SCHEMA_VERSION
 
 
@@ -104,6 +105,42 @@ def _markdown_table_rows(markdown: str) -> dict[str, tuple[str, ...]]:
             raise ValueError(f"duplicate Markdown table row: {cells[0]}")
         rows[cells[0]] = cells[1:]
     return rows
+
+
+def _release_state_contract_violations(
+    *,
+    version: str,
+    openapi_version: object,
+    changelog: str,
+    roadmap: str,
+) -> tuple[str, ...]:
+    violations: list[str] = []
+    if openapi_version != version:
+        violations.append(
+            f"OpenAPI version {openapi_version!r} does not match package version {version!r}"
+        )
+
+    development = re.fullmatch(r"(?P<base>\d+\.\d+\.\d+)\.dev\d+", version)
+    if development is not None:
+        if f"v{version} development line" not in roadmap:
+            violations.append(f"roadmap is missing the v{version} development line")
+        base_version = development.group("base")
+        if _has_exact_changelog_heading(changelog, base_version):
+            violations.append(
+                f"development version {version!r} already has a stable "
+                f"## {base_version} changelog heading"
+            )
+        return tuple(violations)
+
+    if re.fullmatch(r"\d+\.\d+\.\d+", version) is not None:
+        if f"The latest stable release is Zeus v{version}." not in roadmap:
+            violations.append(f"roadmap does not identify Zeus v{version} as latest stable")
+        if not _has_exact_changelog_heading(changelog, version):
+            violations.append(f"changelog is missing an exact ## {version} heading")
+        return tuple(violations)
+
+    violations.append(f"unsupported release-state version {version!r}")
+    return tuple(violations)
 
 
 class RepoContractTests(unittest.TestCase):
@@ -1089,22 +1126,32 @@ class RepoContractTests(unittest.TestCase):
         init_text = Path("zeus/__init__.py").read_text(encoding="utf-8")
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
         changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
-        openapi = Path("docs/openapi.json").read_text(encoding="utf-8")
+        openapi = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
         roadmap = Path("docs/ROADMAP.md").read_text(encoding="utf-8")
 
-        self.assertIn('__version__ = "0.4.0.dev0"', init_text)
-        self.assertIn('dynamic = ["version"]', pyproject)
-        self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
-        self.assertNotIn('version = "0.1.3"', pyproject)
-        self.assertIn("## 0.3.0", changelog)
-        stable_0_4_heading = re.compile(r"(?m)^[ \t]*##[ \t]+0\.4\.0[ \t]*$")
-        self.assertIsNotNone(stable_0_4_heading.search("## 0.4.0\n"))
-        self.assertIsNone(stable_0_4_heading.search("## 0.4.0.dev0\n"))
-        self.assertIsNone(stable_0_4_heading.search("## 0.4.0-rc1\n"))
-        self.assertIsNone(stable_0_4_heading.search(changelog))
-        self.assertIn('"version": "0.4.0.dev0"', openapi)
-        self.assertIn("The latest stable release is Zeus v0.3.0.", roadmap)
-        self.assertIn("v0.4.0.dev0 development line", roadmap)
+        version_match = re.search(
+            r'(?m)^__version__ = "(?P<version>[^"]+)"$',
+            init_text,
+        )
+        self.assertIsNotNone(version_match)
+        version = version_match.group("version")
+
+        pyproject_data = tomllib.loads(pyproject)
+        self.assertIn("version", pyproject_data["project"]["dynamic"])
+        self.assertNotIn("version", pyproject_data["project"])
+        self.assertEqual(
+            {"attr": "zeus.__version__"},
+            pyproject_data["tool"]["setuptools"]["dynamic"]["version"],
+        )
+        self.assertEqual(
+            (),
+            _release_state_contract_violations(
+                version=version,
+                openapi_version=openapi["info"]["version"],
+                changelog=changelog,
+                roadmap=roadmap,
+            ),
+        )
 
     def test_inspect_api_is_documented_and_secured(self) -> None:
         api = Path("zeus/api.py").read_text(encoding="utf-8")
@@ -1568,6 +1615,33 @@ class RepoContractTests(unittest.TestCase):
                 self.assertIn("Zeus Hermes Orchestrator", text)
                 self.assertIn("BrainX", text)
                 self.assertIn("https://github.com/brainx", text)
+
+
+class ReleaseStateTransitionTests(unittest.TestCase):
+    def test_development_release_state_contract(self) -> None:
+        self.assertEqual(
+            (),
+            _release_state_contract_violations(
+                version="0.5.0.dev0",
+                openapi_version="0.5.0.dev0",
+                changelog="# Changelog\n\n## 0.4.0\n\n- Stable release.\n",
+                roadmap=(
+                    "# Roadmap\n\nThe latest stable release is Zeus v0.4.0. "
+                    "The `main` branch is the v0.5.0.dev0 development line.\n"
+                ),
+            ),
+        )
+
+    def test_stable_release_state_contract(self) -> None:
+        self.assertEqual(
+            (),
+            _release_state_contract_violations(
+                version="0.4.0",
+                openapi_version="0.4.0",
+                changelog="# Changelog\n\n## 0.4.0\n\n- Stable release.\n",
+                roadmap="# Roadmap\n\nThe latest stable release is Zeus v0.4.0.\n",
+            ),
+        )
 
 
 if __name__ == "__main__":

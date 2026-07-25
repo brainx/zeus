@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -29,10 +30,15 @@ def main() -> int:
 
     if args.require_changelog:
         changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
-        if f"## {version}" not in changelog:
+        if not _has_exact_changelog_heading(changelog, version):
             print(f"CHANGELOG.md is missing a section for {version}", file=sys.stderr)
             return 1
     return 0
+
+
+def _has_exact_changelog_heading(changelog: str, version: str) -> bool:
+    heading = re.compile(rf"(?m)^##[ \t]+{re.escape(version)}[ \t]*$")
+    return heading.search(changelog) is not None
 
 
 def _read_version(path: Path) -> str:

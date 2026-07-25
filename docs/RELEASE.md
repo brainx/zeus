@@ -9,13 +9,18 @@ historical v0.3.0 release predates this policy and remains unchanged.
 1. Ensure CI is green on the commit to release.
 2. Prepare the stable release:
 
-   - Replace `0.4.0.dev0` with the intended stable version in
-     `zeus/__init__.py` and `docs/openapi.json`.
+   - Replace the current `.dev0` version with the intended stable `X.Y.Z`
+     version in `zeus/__init__.py` and `docs/openapi.json`.
+   - Update `docs/ROADMAP.md` so its latest-stable statement identifies
+     `vX.Y.Z` and it no longer describes that version as the current
+     development line.
    - Move `CHANGELOG.md`'s `Unreleased` entries into a matching `## X.Y.Z`
      section.
    - Run `python scripts/check_version_tag.py vX.Y.Z --require-changelog`.
-   - After the release, advance `main` to the next `.dev0` version in a
-     separate commit.
+   - After the release, advance `main` in a separate commit: set the next
+     `X.Y.Z.dev0` version in `zeus/__init__.py` and `docs/openapi.json`, and
+     update `docs/ROADMAP.md` to name that version as the current development
+     line while retaining the release as latest stable.
 
 3. Install the pinned CI and release toolchain, then run the full local release gate:
 
