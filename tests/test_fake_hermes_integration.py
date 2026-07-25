@@ -19,9 +19,7 @@ from zeus.templates import TemplateStore
 class FakeHermesIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         if not child_process_identity_available():
-            self.skipTest(
-                "host does not expose child process command lines and start fingerprints"
-            )
+            self.skipTest("host does not expose child process command lines and start fingerprints")
 
     def test_start_status_stop_with_fake_hermes_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3376,9 +3376,7 @@ password = "plain-password"
 
     def test_cli_demo_up_status_down_uses_fake_hermes_executable(self) -> None:
         if not child_process_identity_available():
-            self.skipTest(
-                "host does not expose child process command lines and start fingerprints"
-            )
+            self.skipTest("host does not expose child process command lines and start fingerprints")
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

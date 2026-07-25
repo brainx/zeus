@@ -18,9 +18,7 @@ FAKE_HERMES = ROOT / "tests" / "fixtures" / "fake_slow_hermes.py"
 class SubprocessLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         if not child_process_identity_available():
-            self.skipTest(
-                "host does not expose child process command lines and start fingerprints"
-            )
+            self.skipTest("host does not expose child process command lines and start fingerprints")
 
     def _env(self, root: Path, **overrides: str) -> dict[str, str]:
         env = {
