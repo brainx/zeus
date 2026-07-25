@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-from zeus.supervisor import _read_process_cmdline
+from tests.host_capabilities import child_process_identity_available
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE_HERMES = ROOT / "tests" / "fixtures" / "fake_slow_hermes.py"
@@ -17,22 +17,10 @@ FAKE_HERMES = ROOT / "tests" / "fixtures" / "fake_slow_hermes.py"
 
 class SubprocessLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
-        process = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(2)"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            time.sleep(0.05)
-            if _read_process_cmdline(process.pid) is None:
-                self.skipTest("host does not expose child process command lines")
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+        if not child_process_identity_available():
+            self.skipTest(
+                "host does not expose child process command lines and start fingerprints"
+            )
 
     def _env(self, root: Path, **overrides: str) -> dict[str, str]:
         env = {

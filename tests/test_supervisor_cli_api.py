@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import call, patch
 
+from tests.host_capabilities import child_process_identity_available
 from zeus import __version__
 from zeus.api import main as api_main
 from zeus.api import make_handler
@@ -3374,6 +3375,11 @@ password = "plain-password"
                 os.chdir(old_cwd)
 
     def test_cli_demo_up_status_down_uses_fake_hermes_executable(self) -> None:
+        if not child_process_identity_available():
+            self.skipTest(
+                "host does not expose child process command lines and start fingerprints"
+            )
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             env = {"ZEUS_STATE_DIR": str(root / ".zeus")}

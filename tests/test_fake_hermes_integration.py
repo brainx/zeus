@@ -8,6 +8,7 @@ import time
 import unittest
 from pathlib import Path
 
+from tests.host_capabilities import child_process_identity_available
 from zeus.models import BotCreateRequest, BotStatus
 from zeus.renderer import ProfileRenderer
 from zeus.state import StateStore
@@ -16,6 +17,12 @@ from zeus.templates import TemplateStore
 
 
 class FakeHermesIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if not child_process_identity_available():
+            self.skipTest(
+                "host does not expose child process command lines and start fingerprints"
+            )
+
     def test_start_status_stop_with_fake_hermes_gateway(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
