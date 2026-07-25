@@ -15,13 +15,13 @@ import unittest
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, redirect_stderr
 from datetime import UTC, datetime
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 from zeus import api as api_module
 from zeus.api import make_handler, serve
+from zeus.api_server import ThreadingHTTPServer
 from zeus.config import Settings, SQLiteSynchronous
 from zeus.errors import ZeusConflictError
 from zeus.models import BotRecord, BotStatus, BotStatusResponse, TemplateError
@@ -36,6 +36,17 @@ from zeus.reconciliation import (
 from zeus.state import SCHEMA_VERSION, StateReadinessError, StateStore
 
 JsonPayload = dict[str, Any] | list[Any]
+
+
+def stop_api_fixture(server: ThreadingHTTPServer, thread: threading.Thread) -> None:
+    server.begin_draining()
+    server.shutdown()
+    thread.join(timeout=5)
+    if thread.is_alive():
+        raise RuntimeError("API fixture serve_forever thread did not stop")
+    if not server.wait_for_drain(5):
+        raise RuntimeError("API fixture request workers did not drain")
+    server.server_close()
 
 
 @contextmanager
@@ -59,9 +70,7 @@ def api_server_with_state(env: dict[str, str] | None = None) -> Iterator[tuple[i
         try:
             yield server.server_port, settings.state_dir
         finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=1)
+            stop_api_fixture(server, thread)
 
 
 @contextmanager
@@ -259,6 +268,85 @@ def raw_post_without_content_length(port: int, body: bytes) -> tuple[int, dict[s
 
 
 class ApiBehaviorTests(unittest.TestCase):
+    def test_fixture_drains_active_request_before_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings.from_env(
+                {
+                    "ZEUS_STATE_DIR": str(Path(tmp) / ".zeus"),
+                    "ZEUS_HOST": "127.0.0.1",
+                    "ZEUS_PORT": "0",
+                    "ZEUS_API_KEY": "",
+                    "ZEUS_ALLOW_UNAUTH_READS": "",
+                }
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            base_handler = make_handler(settings)
+
+            class BlockingHandler(base_handler):  # type: ignore[misc, valid-type]
+                def do_GET(self) -> None:
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test did not release blocked API request")
+                    super().do_GET()
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), BlockingHandler)
+            serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            request_statuses: list[int] = []
+            request_errors: list[Exception] = []
+            cleanup_errors: list[Exception] = []
+
+            def request_health() -> None:
+                try:
+                    status, _body = request_json(server.server_port, "GET", "/health")
+                    request_statuses.append(status)
+                except Exception as exc:
+                    request_errors.append(exc)
+
+            def cleanup() -> None:
+                try:
+                    stop_api_fixture(server, serve_thread)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+
+            request_thread = threading.Thread(target=request_health)
+            cleanup_thread = threading.Thread(target=cleanup)
+            serve_thread.start()
+            request_thread.start()
+            try:
+                self.assertTrue(entered.wait(1), "API request did not enter the handler")
+                cleanup_thread.start()
+                self.assertTrue(server.wait_until_draining(1), "API fixture did not begin draining")
+                serve_thread.join(timeout=5)
+                self.assertFalse(
+                    serve_thread.is_alive(),
+                    "API fixture serve_forever thread did not stop during cleanup",
+                )
+                self.assertTrue(
+                    cleanup_thread.is_alive(),
+                    "API fixture cleanup did not wait for the active request",
+                )
+            finally:
+                release.set()
+                if cleanup_thread.ident is not None:
+                    cleanup_thread.join(timeout=5)
+                request_thread.join(timeout=5)
+                serve_thread.join(timeout=5)
+                if serve_thread.is_alive():
+                    server.shutdown()
+                    serve_thread.join(timeout=5)
+                server.server_close()
+
+            self.assertFalse(cleanup_thread.is_alive(), "API fixture cleanup thread did not stop")
+            self.assertFalse(request_thread.is_alive(), "API fixture request thread did not stop")
+            self.assertFalse(
+                serve_thread.is_alive(),
+                "API fixture serve_forever thread did not stop",
+            )
+            self.assertEqual([], cleanup_errors)
+            self.assertEqual([], request_errors)
+            self.assertEqual([200], request_statuses)
+
     def test_health_exact_bytes_are_public_and_never_probe_readiness(self) -> None:
         with (
             patch.object(
