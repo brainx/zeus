@@ -38,15 +38,48 @@ from zeus.state import SCHEMA_VERSION, StateReadinessError, StateStore
 JsonPayload = dict[str, Any] | list[Any]
 
 
-def stop_api_fixture(server: ThreadingHTTPServer, thread: threading.Thread) -> None:
-    server.begin_draining()
-    server.shutdown()
-    thread.join(timeout=5)
-    if thread.is_alive():
-        raise RuntimeError("API fixture serve_forever thread did not stop")
-    if not server.wait_for_drain(5):
-        raise RuntimeError("API fixture request workers did not drain")
-    server.server_close()
+def stop_api_fixture(
+    server: ThreadingHTTPServer,
+    thread: threading.Thread,
+    *,
+    timeout_seconds: float = 5,
+) -> None:
+    shutdown_errors: list[BaseException] = []
+
+    def shutdown() -> None:
+        try:
+            server.shutdown()
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+
+    failure: BaseException | None = None
+    try:
+        server.begin_draining()
+        deadline = time.monotonic() + timeout_seconds
+        shutdown_thread = threading.Thread(target=shutdown, daemon=True)
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if shutdown_thread.is_alive():
+            raise RuntimeError("API fixture serve_forever thread did not stop")
+        if shutdown_errors:
+            raise shutdown_errors[0]
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            raise RuntimeError("API fixture serve_forever thread did not stop")
+        if not server.wait_for_drain(timeout_seconds):
+            raise RuntimeError("API fixture request workers did not drain")
+    except BaseException as exc:
+        failure = exc
+
+    try:
+        server.server_close()
+    except BaseException as close_exc:
+        if failure is None:
+            raise
+        failure.add_note(f"API fixture server close also failed: {close_exc!r}")
+
+    if failure is not None:
+        raise failure
 
 
 @contextmanager
@@ -267,6 +300,99 @@ def raw_post_without_content_length(port: int, body: bytes) -> tuple[int, dict[s
     return raw_request_json(port, request)
 
 
+class ApiFixtureCleanupTests(unittest.TestCase):
+    def test_stop_api_fixture_bounds_shutdown_and_closes_server(self) -> None:
+        shutdown_entered = threading.Event()
+        release_shutdown = threading.Event()
+        shutdown_finished = threading.Event()
+        server_closed = threading.Event()
+
+        class BlockingShutdownServer:
+            def begin_draining(self) -> None:
+                return
+
+            def shutdown(self) -> None:
+                shutdown_entered.set()
+                release_shutdown.wait(5)
+                shutdown_finished.set()
+
+            def wait_for_drain(self, _timeout_seconds: float) -> bool:
+                raise AssertionError("drain wait must not run after shutdown timeout")
+
+            def server_close(self) -> None:
+                server_closed.set()
+
+        server = BlockingShutdownServer()
+        serve_thread = threading.Thread(target=lambda: None)
+        serve_thread.start()
+        serve_thread.join(timeout=1)
+        cleanup_errors: list[Exception] = []
+        cleanup_finished = threading.Event()
+
+        def cleanup() -> None:
+            try:
+                stop_api_fixture(
+                    server,  # type: ignore[arg-type]
+                    serve_thread,
+                    timeout_seconds=0.05,
+                )
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            finally:
+                cleanup_finished.set()
+
+        cleanup_thread = threading.Thread(target=cleanup)
+        cleanup_thread.start()
+        try:
+            self.assertTrue(shutdown_entered.wait(1), "fixture shutdown did not start")
+            self.assertTrue(
+                cleanup_finished.wait(1),
+                "fixture cleanup did not enforce its shutdown deadline",
+            )
+        finally:
+            release_shutdown.set()
+            cleanup_thread.join(timeout=5)
+
+        self.assertTrue(shutdown_finished.wait(1), "fixture shutdown coordinator did not stop")
+        self.assertFalse(cleanup_thread.is_alive(), "fixture cleanup caller did not stop")
+        self.assertEqual(1, len(cleanup_errors))
+        self.assertRegex(str(cleanup_errors[0]), "serve_forever thread did not stop")
+        self.assertTrue(server_closed.is_set(), "fixture timeout did not close the server")
+
+    def test_stop_api_fixture_closes_server_after_drain_timeout(self) -> None:
+        server_closed = threading.Event()
+        drain_wait_entered = threading.Event()
+
+        class DrainTimeoutServer:
+            def begin_draining(self) -> None:
+                return
+
+            def shutdown(self) -> None:
+                return
+
+            def wait_for_drain(self, _timeout_seconds: float) -> bool:
+                drain_wait_entered.set()
+                return False
+
+            def server_close(self) -> None:
+                server_closed.set()
+
+        server = DrainTimeoutServer()
+        serve_thread = threading.Thread(target=lambda: None)
+        serve_thread.start()
+        serve_thread.join(timeout=1)
+
+        with self.assertRaisesRegex(RuntimeError, "request workers did not drain"):
+            stop_api_fixture(
+                server,  # type: ignore[arg-type]
+                serve_thread,
+                timeout_seconds=0.05,
+            )
+
+        self.assertTrue(drain_wait_entered.is_set(), "fixture did not enter the drain wait")
+        self.assertTrue(server_closed.is_set(), "fixture timeout did not close the server")
+
+
 class ApiBehaviorTests(unittest.TestCase):
     def test_fixture_drains_active_request_before_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,10 +417,24 @@ class ApiBehaviorTests(unittest.TestCase):
                     super().do_GET()
 
             server = ThreadingHTTPServer(("127.0.0.1", 0), BlockingHandler)
-            serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            drain_wait_entered = threading.Event()
+            original_wait_for_drain = server.wait_for_drain
             request_statuses: list[int] = []
             request_errors: list[Exception] = []
             cleanup_errors: list[Exception] = []
+            serve_errors: list[Exception] = []
+
+            def wait_for_drain(timeout_seconds: float) -> bool:
+                drain_wait_entered.set()
+                return original_wait_for_drain(timeout_seconds)
+
+            server.wait_for_drain = wait_for_drain  # type: ignore[method-assign]
+
+            def serve_forever() -> None:
+                try:
+                    server.serve_forever()
+                except Exception as exc:
+                    serve_errors.append(exc)
 
             def request_health() -> None:
                 try:
@@ -309,6 +449,7 @@ class ApiBehaviorTests(unittest.TestCase):
                 except Exception as exc:
                     cleanup_errors.append(exc)
 
+            serve_thread = threading.Thread(target=serve_forever, daemon=True)
             request_thread = threading.Thread(target=request_health)
             cleanup_thread = threading.Thread(target=cleanup)
             serve_thread.start()
@@ -317,10 +458,9 @@ class ApiBehaviorTests(unittest.TestCase):
                 self.assertTrue(entered.wait(1), "API request did not enter the handler")
                 cleanup_thread.start()
                 self.assertTrue(server.wait_until_draining(1), "API fixture did not begin draining")
-                serve_thread.join(timeout=5)
-                self.assertFalse(
-                    serve_thread.is_alive(),
-                    "API fixture serve_forever thread did not stop during cleanup",
+                self.assertTrue(
+                    drain_wait_entered.wait(1),
+                    "API fixture cleanup did not enter the request drain wait",
                 )
                 self.assertTrue(
                     cleanup_thread.is_alive(),
@@ -345,6 +485,7 @@ class ApiBehaviorTests(unittest.TestCase):
             )
             self.assertEqual([], cleanup_errors)
             self.assertEqual([], request_errors)
+            self.assertEqual([], serve_errors)
             self.assertEqual([200], request_statuses)
 
     def test_health_exact_bytes_are_public_and_never_probe_readiness(self) -> None:
