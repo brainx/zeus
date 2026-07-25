@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 
 from scripts.check_version_tag import _has_exact_changelog_heading
+from zeus import __version__
 from zeus.state import SCHEMA_VERSION
 
 
@@ -821,7 +822,7 @@ class RepoContractTests(unittest.TestCase):
         ):
             self.assertIn(heading, roadmap)
         for statement in (
-            "v0.3.0",
+            f"v{__version__}",
             "alpha",
             "host-local",
             "cross-host placement",

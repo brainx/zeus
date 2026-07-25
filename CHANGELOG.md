@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0
+
 - Added the host-local, report-only repository audit: exact committed `HEAD`
   snapshots, a private packaged audit skill, strict Hermes Agent 0.19.0 and
   preloaded digest-image prerequisites, bounded private reports, and

@@ -2234,15 +2234,15 @@ password = "plain-password"
     def test_bug_report_version_command_and_changelog_are_current(self) -> None:
         bug_template = Path(".github/ISSUE_TEMPLATE/bug_report.yml").read_text(encoding="utf-8")
         changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = changelog.split("## 0.3.0", 1)[0]
+        release_notes = changelog.split("## 0.4.0", 1)[1].split("\n## ", 1)[0]
 
         self.assertIn(
             "description: Run `zeus --version` and paste the complete output.",
             bug_template,
         )
         self.assertNotIn("or the installed package version", bug_template)
-        self.assertIn("descriptive CLI help", unreleased)
-        self.assertIn("`zeus --version`", unreleased)
+        self.assertIn("descriptive CLI help", release_notes)
+        self.assertIn("`zeus --version`", release_notes)
 
     def test_cli_create_help_recommends_env_from_and_warns_legacy_env_is_unsafe(self) -> None:
         stdout = io.StringIO()
