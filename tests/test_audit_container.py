@@ -819,12 +819,16 @@ class AuditContainerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             workspace, manifest = self._validation_fixture(base)
-            unwritable = base / "unwritable"
-            unwritable.mkdir(mode=0o500)
-            self.assertNotEqual(
-                0,
-                self._run_validation(workspace, manifest, probe_root=unwritable).returncode,
+            invalid_probe_root = base / "not-a-directory"
+            invalid_probe_root.write_bytes(b"not a directory\n")
+
+            completed = self._run_validation(
+                workspace,
+                manifest,
+                probe_root=invalid_probe_root,
             )
+
+            self.assertNotEqual(0, completed.returncode)
 
     def test_archive_enforces_limits_deadline_and_private_spool(self) -> None:
         private_spool = self.root / "spool"
