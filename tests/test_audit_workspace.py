@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import zeus.audit_workspace as audit_workspace
+from tests.host_capabilities import copy_single_link_git, path_with_tool
 from zeus.audit_models import HARD_LIMITS, AuditLimits
 from zeus.audit_workspace import (
     AuditWorkspace,
@@ -36,7 +37,15 @@ def _limits(**overrides: int) -> AuditLimits:
 class TemporaryGitRepository(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
         self.temp_root = Path(self.temporary_directory.name).resolve()
+        self.git_executable = copy_single_link_git(self.temp_root)
+        self.path_patch = patch.dict(
+            os.environ,
+            {"PATH": path_with_tool(self.git_executable)},
+        )
+        self.path_patch.start()
+        self.addCleanup(self.path_patch.stop)
         self.repository = self.temp_root / "repository"
         self.repository.mkdir(mode=0o700)
         self.git("init", "--quiet", "--object-format=sha1")
@@ -46,9 +55,6 @@ class TemporaryGitRepository(unittest.TestCase):
         self.git("add", "README.md")
         self.git("commit", "--quiet", "-m", "initial")
         self.workspace = AuditWorkspace()
-
-    def tearDown(self) -> None:
-        self.temporary_directory.cleanup()
 
     def git(
         self,

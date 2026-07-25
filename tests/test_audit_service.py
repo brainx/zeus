@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from contextlib import ExitStack, suppress
@@ -10,8 +11,18 @@ from subprocess import DEVNULL, run
 from types import SimpleNamespace
 from unittest import mock
 
+from tests.host_capabilities import copy_single_link_git, path_with_tool
+
 
 class AuditServiceContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.host_tools = tempfile.TemporaryDirectory()
+        self.addCleanup(self.host_tools.cleanup)
+        git = copy_single_link_git(Path(self.host_tools.name))
+        self.path_patch = mock.patch.dict(os.environ, {"PATH": path_with_tool(git)})
+        self.path_patch.start()
+        self.addCleanup(self.path_patch.stop)
+
     def _configured_service(self, service):
         from zeus.audit_config import parse_audit_config
 

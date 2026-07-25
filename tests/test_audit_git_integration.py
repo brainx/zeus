@@ -13,6 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.host_capabilities import copy_single_link_git, path_with_tool
 from zeus.audit_models import HARD_LIMITS
 from zeus.audit_workspace import (
     GIT_HARDENING_ARGUMENTS,
@@ -29,7 +30,15 @@ def _deadline() -> float:
 class GitIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
         self.temp_root = Path(self.temporary_directory.name).resolve()
+        self.git_executable = copy_single_link_git(self.temp_root)
+        self.path_patch = patch.dict(
+            os.environ,
+            {"PATH": path_with_tool(self.git_executable)},
+        )
+        self.path_patch.start()
+        self.addCleanup(self.path_patch.stop)
         self.repository = self.temp_root / "repository"
         self.repository.mkdir(mode=0o700)
         self.git("init", "--quiet", "--object-format=sha1")
@@ -38,9 +47,6 @@ class GitIntegrationTests(unittest.TestCase):
         (self.repository / "tracked.txt").write_bytes(b"committed source\n")
         self.git("add", "tracked.txt")
         self.git("commit", "--quiet", "-m", "initial")
-
-    def tearDown(self) -> None:
-        self.temporary_directory.cleanup()
 
     def git(
         self,
