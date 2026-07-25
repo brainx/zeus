@@ -160,7 +160,9 @@ class RepoContractTests(unittest.TestCase):
             "docs/assets/demo.cast",
             "docs/assets/zeus-hero.png",
             ".coveragerc",
+            "requirements-dev-ci.txt",
             "requirements-hermes-ci.txt",
+            ".github/dependabot.yml",
             ".github/workflows/release.yml",
             ".github/ISSUE_TEMPLATE/bug_report.yml",
             ".github/ISSUE_TEMPLATE/feature_request.yml",
@@ -229,7 +231,7 @@ class RepoContractTests(unittest.TestCase):
         expected_commands = {
             "test": (
                 "sudo apt-get update\nsudo apt-get install -y shellcheck",
-                'python -m pip install -e ".[dev]"',
+                "python -m pip install -e . -r requirements-dev-ci.txt",
                 "ruff format --check .",
                 "ruff check .",
                 "mypy zeus",
@@ -240,15 +242,15 @@ class RepoContractTests(unittest.TestCase):
                 "coverage erase\ncoverage run -m unittest discover -s tests\ncoverage report",
             ),
             "python-3-14": (
-                'python -m pip install -e ".[dev]"',
+                "python -m pip install -e . -r requirements-dev-ci.txt",
                 "sh scripts/test.sh",
             ),
             "lifecycle-subprocess": (
-                'python -m pip install -e ".[dev]"',
+                "python -m pip install -e . -r requirements-dev-ci.txt",
                 "python -m unittest tests.test_subprocess_lifecycle",
             ),
             "macos-process-lifecycle": (
-                'python -m pip install -e ".[dev]"',
+                "python -m pip install -e . -r requirements-dev-ci.txt",
                 "python -m unittest -v \\\n"
                 "  tests.test_subprocess_lifecycle \\\n"
                 "  tests.test_fake_hermes_integration \\\n"
@@ -268,7 +270,7 @@ class RepoContractTests(unittest.TestCase):
                 "sh scripts/verify_real_hermes.sh",
             ),
             "package": (
-                'python -m pip install -e ".[dev]"',
+                "python -m pip install -e . -r requirements-dev-ci.txt",
                 "python -m pip check",
                 "rm -rf dist\npython -m build",
                 "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
@@ -329,6 +331,48 @@ class RepoContractTests(unittest.TestCase):
             "twine check dist/*",
         ):
             self.assertLess(pip_check_index, package_commands.index(later_command))
+
+    def test_ci_toolchain_is_exactly_pinned_and_updated_weekly(self) -> None:
+        expected = {
+            "bandit==1.9.4",
+            "build==1.5.0",
+            "coverage==7.15.2",
+            "mypy==2.3.0",
+            "ruff==0.16.0",
+            "twine==6.2.0",
+        }
+        requirements = {
+            line.strip()
+            for line in Path("requirements-dev-ci.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        self.assertEqual(expected, requirements)
+
+        install_command = "python -m pip install -e . -r requirements-dev-ci.txt"
+        for workflow_path in (
+            Path(".github/workflows/ci.yml"),
+            Path(".github/workflows/release.yml"),
+        ):
+            with self.subTest(workflow=workflow_path):
+                self.assertIn(install_command, workflow_path.read_text(encoding="utf-8"))
+
+        makefile = Path("Makefile").read_text(encoding="utf-8")
+        self.assertRegex(
+            makefile,
+            rf"(?m)^install-ci:\n\t{re.escape(install_command)}$",
+        )
+
+        dependabot = Path(".github/dependabot.yml").read_text(encoding="utf-8")
+        for ecosystem in ("pip", "github-actions"):
+            with self.subTest(ecosystem=ecosystem):
+                self.assertRegex(
+                    dependabot,
+                    rf"(?ms)^  - package-ecosystem: {re.escape(ecosystem)}\n"
+                    r"    directory: /\n"
+                    r"    schedule:\n"
+                    r"      interval: weekly\n"
+                    r"    open-pull-requests-limit: 5$",
+                )
 
     def test_test_script_preserves_failures_and_gates_resource_warnings(self) -> None:
         script_source = Path("scripts/test.sh").read_text(encoding="utf-8")

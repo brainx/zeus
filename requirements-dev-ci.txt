@@ -1,0 +1,7 @@
+# Direct quality and packaging tools verified by CI on 2026-07-25.
+bandit==1.9.4
+build==1.5.0
+coverage==7.15.2
+mypy==2.3.0
+ruff==0.16.0
+twine==6.2.0

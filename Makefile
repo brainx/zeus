@@ -1,11 +1,14 @@
 # Zeus Hermes Orchestrator
 # Maintained by BrainX: https://github.com/brainx
 
-.PHONY: install-dev test coverage check build wheel-smoke release-check doctor run-api strict-doctor repo-check verify-real-hermes fresh-vps-verify clean clean-vps
+.PHONY: install-dev install-ci test coverage check build wheel-smoke release-check doctor run-api strict-doctor repo-check verify-real-hermes fresh-vps-verify clean clean-vps
 
 install-dev:
 	python3 -m venv .venv
 	. .venv/bin/activate && python -m pip install -e ".[dev]"
+
+install-ci:
+	python -m pip install -e . -r requirements-dev-ci.txt
 
 test:
 	sh scripts/test.sh

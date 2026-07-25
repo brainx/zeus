@@ -17,11 +17,18 @@ historical v0.3.0 release predates this policy and remains unchanged.
    - After the release, advance `main` to the next `.dev0` version in a
      separate commit.
 
-3. Run the full local release gate:
+3. Install the pinned CI and release toolchain, then run the full local release gate:
 
    ```bash
+   python -m pip install -e . -r requirements-dev-ci.txt
    make release-check
    ```
+
+   The `requirements-dev-ci.txt` pins define the reproducible CI and release
+   toolchain; the lower bounds in the `dev` extra remain for developer environments.
+
+   The release gates must run after this install. It provides the exact tool
+   versions that CI verifies.
 
    This runs tests, repository checks, formatting/lint/type/security checks,
    ShellCheck, package build, wheel smoke verification, package metadata checks,
