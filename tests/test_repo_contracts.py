@@ -523,7 +523,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("branch = True", config)
         self.assertRegex(config, r"(?m)^source =\s*$")
         self.assertRegex(config, r"(?m)^[ \t]+zeus[ \t]*$")
-        self.assertIn("fail_under = 79", config)
+        self.assertIn("fail_under = 81", config)
+        self.assertNotIn("fail_under = 79", config)
         self.assertNotIn("fail_under = 70", config)
         self.assertIn("precision = 2", config)
 
