@@ -1053,6 +1053,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn('version = {attr = "zeus.__version__"}', pyproject)
         self.assertNotIn('version = "0.1.3"', pyproject)
         self.assertIn("## 0.3.0", changelog)
+        self.assertNotIn("## 0.4.0", changelog)
         self.assertIn('"version": "0.4.0.dev0"', openapi)
         self.assertIn("The latest stable release is Zeus v0.3.0.", roadmap)
         self.assertIn("v0.4.0.dev0 development line", roadmap)
