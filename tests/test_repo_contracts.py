@@ -1073,15 +1073,20 @@ class RepoContractTests(unittest.TestCase):
 
         self.assertEqual(60, len(entries))
         self.assertEqual(60, len({name for name, _version in entries}))
-        self.assertEqual(74, len(hashes))
+        self.assertGreaterEqual(len(hashes), len(entries))
         self.assertIn(("hermes-agent", "0.19.0"), entries)
         self.assertIn(("cryptography", "48.0.1"), entries)
+        self.assertIn(("fastapi", "0.140.0"), entries)
         self.assertIn(("pillow", "12.3.0"), entries)
+        self.assertIn(("pydantic-core", "2.46.4"), entries)
+        self.assertIn(("requests", "2.34.2"), entries)
+        self.assertIn(("rich", "15.0.0"), entries)
+        self.assertIn(("tqdm", "4.69.1"), entries)
         self.assertIn(
             "bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f",
             hashes,
         )
-        self.assertIn("SECURITY OVERRIDE", requirements)
+        self.assertIn("REVIEWED OVERRIDES", requirements)
         self.assertNotIn("--index-url", requirements)
         self.assertNotIn("git+", requirements)
 

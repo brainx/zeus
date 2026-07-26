@@ -5,11 +5,13 @@ tested without external credentials or a Hermes install. CI separately installs
 the fully hash-locked Hermes Agent 0.19.0 environment from
 `requirements-hermes-ci.txt` on Ubuntu/Python 3.11. The lock contains Linux
 x86_64 and arm64 wheel hashes and overrides Hermes' vulnerable cryptography and
-Pillow metadata pins with their first patched releases. CI installs the complete
-lock with dependency resolution disabled, then permits only those two exact
-metadata conflicts. The gateway compatibility test must pass in that patched
-environment. The gate does not run the remote installer or make a model-provider
-request.
+Pillow metadata pins with their first patched releases. It also carries reviewed
+FastAPI, Requests, Rich, and tqdm updates while retaining Pydantic's exact
+pydantic-core pin. CI installs the complete lock with dependency resolution
+disabled, then permits only the four exact Hermes metadata conflicts introduced
+by the security and maintenance overrides. The gateway compatibility test must
+pass in that environment. The gate does not run the remote installer or make a
+model-provider request.
 
 Before a release, verify against a real Hermes install:
 

@@ -23,7 +23,7 @@ class DependencyConflict:
         )
 
 
-EXPECTED_SECURITY_OVERRIDES = frozenset(
+EXPECTED_DEPENDENCY_OVERRIDES = frozenset(
     {
         DependencyConflict(
             dependent="hermes-agent",
@@ -36,6 +36,18 @@ EXPECTED_SECURITY_OVERRIDES = frozenset(
             dependent_version="0.19.0",
             requirement="pillow==12.2.0",
             installed_version="12.3.0",
+        ),
+        DependencyConflict(
+            dependent="hermes-agent",
+            dependent_version="0.19.0",
+            requirement="requests==2.33.0",
+            installed_version="2.34.2",
+        ),
+        DependencyConflict(
+            dependent="hermes-agent",
+            dependent_version="0.19.0",
+            requirement="rich==14.3.3",
+            installed_version="15.0.0",
         ),
     }
 )
@@ -84,8 +96,8 @@ def collect_conflicts(
 
 
 def validate_conflicts(conflicts: frozenset[DependencyConflict]) -> None:
-    unexpected = conflicts - EXPECTED_SECURITY_OVERRIDES
-    missing = EXPECTED_SECURITY_OVERRIDES - conflicts
+    unexpected = conflicts - EXPECTED_DEPENDENCY_OVERRIDES
+    missing = EXPECTED_DEPENDENCY_OVERRIDES - conflicts
     if not unexpected and not missing:
         return
 
@@ -97,7 +109,7 @@ def validate_conflicts(conflicts: frozenset[DependencyConflict]) -> None:
         )
     if missing:
         details.append(
-            "missing expected security overrides: "
+            "missing expected dependency overrides: "
             + "; ".join(conflict.describe() for conflict in sorted(missing))
         )
     raise DependencyValidationError(" | ".join(details))
@@ -110,8 +122,9 @@ def main() -> int:
         print(f"Hermes dependency validation failed: {exc}")
         return 1
     print(
-        "Hermes dependency overrides verified: cryptography 48.0.1 and "
-        "pillow 12.3.0; no other installed dependency conflicts"
+        "Hermes dependency overrides verified: cryptography 48.0.1, "
+        "pillow 12.3.0, requests 2.34.2, and rich 15.0.0; "
+        "no other installed dependency conflicts"
     )
     return 0
 

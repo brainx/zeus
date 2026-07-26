@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from scripts.check_hermes_dependency_overrides import (
-    EXPECTED_SECURITY_OVERRIDES,
+    EXPECTED_DEPENDENCY_OVERRIDES,
     DependencyConflict,
     DependencyValidationError,
     validate_conflicts,
@@ -11,13 +11,13 @@ from scripts.check_hermes_dependency_overrides import (
 
 
 class HermesDependencyOverrideTests(unittest.TestCase):
-    def test_exact_security_overrides_are_accepted(self) -> None:
-        validate_conflicts(EXPECTED_SECURITY_OVERRIDES)
+    def test_exact_dependency_overrides_are_accepted(self) -> None:
+        validate_conflicts(EXPECTED_DEPENDENCY_OVERRIDES)
 
-    def test_missing_security_override_fails_closed(self) -> None:
+    def test_missing_dependency_override_fails_closed(self) -> None:
         with self.assertRaisesRegex(
             DependencyValidationError,
-            "missing expected security overrides",
+            "missing expected dependency overrides",
         ):
             validate_conflicts(frozenset())
 
@@ -30,7 +30,7 @@ class HermesDependencyOverrideTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(DependencyValidationError, "unexpected conflicts"):
-            validate_conflicts(EXPECTED_SECURITY_OVERRIDES | {unexpected})
+            validate_conflicts(EXPECTED_DEPENDENCY_OVERRIDES | {unexpected})
 
 
 if __name__ == "__main__":

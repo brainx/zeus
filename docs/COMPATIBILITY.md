@@ -66,11 +66,14 @@ that complete closure with dependency resolution disabled, pip hash checking,
 and binary-only artifacts; it never runs the remote Hermes installer. This is
 intentional because Hermes Agent 0.19.0 metadata pins vulnerable
 `cryptography==46.0.7` and `Pillow==12.2.0` releases. The lock substitutes the
-first patched versions, `cryptography==48.0.1` and `Pillow==12.3.0`.
-`scripts/check_hermes_dependency_overrides.py` fails unless those are the only
-two metadata conflicts and every other installed requirement is satisfied.
-Remove the override when a compatible Hermes release carries safe dependency
-metadata.
+first patched versions, `cryptography==48.0.1` and `Pillow==12.3.0`, and carries
+reviewed maintenance updates for FastAPI, Requests, Rich, and tqdm. Hermes also
+pins the older Requests and Rich releases. Pydantic's exact pydantic-core pin is
+retained because mismatching those releases causes Pydantic to reject the
+environment at import time. `scripts/check_hermes_dependency_overrides.py`
+permits exactly the four Hermes metadata conflicts and fails for every other
+unsatisfied requirement. Remove each override when compatible upstream metadata
+lands.
 
 The lock carries Ubuntu-compatible Linux x86_64 and arm64 hashes for native
 local container verification without changing package versions. Pillow's

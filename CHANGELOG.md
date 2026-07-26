@@ -5,6 +5,9 @@
 - Replaced the vulnerable cryptography and Pillow pins in the hash-locked Hermes
   Agent 0.19.0 CI environment with their first patched releases while retaining
   an exact, verified compatibility override for upstream metadata.
+- Integrated the current FastAPI, Requests, Rich, and tqdm updates into the
+  real-Hermes compatibility lock with fail-closed validation for the exact
+  upstream metadata conflicts.
 - Expanded project acknowledgements with official Hermes Agent and Nous
   Research attribution and links.
 
