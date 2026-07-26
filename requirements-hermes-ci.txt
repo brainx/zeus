@@ -1,7 +1,14 @@
 # Hermes Agent 0.19.0 compatibility lock for CPython 3.11 on Ubuntu x86_64
 # and arm64.
-# Resolved from PyPI on 2026-07-22. CI installs this file with --require-hashes
-# and --only-binary=:all:. Re-resolve the complete closure when updating Hermes.
+# Resolved from PyPI on 2026-07-26. CI installs this complete closure with
+# --no-deps, --require-hashes, and --only-binary=:all:.
+#
+# SECURITY OVERRIDE: Hermes Agent 0.19.0 metadata pins cryptography==46.0.7 and
+# Pillow==12.2.0. Those releases have reviewed security advisories. The patched
+# versions below intentionally override only those two upstream pins. CI checks
+# that no other dependency mismatch exists and exercises the real Hermes
+# gateway. Remove the override when a compatible Hermes release carries safe
+# dependency metadata.
 annotated-doc==0.0.4 \
     --hash=sha256:571ac1dc6991c450b25a9c2d84a3705e2ae7a53467b5d111c24fa8baabbed320
 annotated-types==0.7.0 \
@@ -20,9 +27,9 @@ click==8.4.2 \
     --hash=sha256:e6f9f66136c816745b9d65817da91d61d957fb16e02e4dcd0552553c5a197b76
 croniter==6.0.0 \
     --hash=sha256:2f878c3856f17896979b2a4379ba1f09c83e374931ea15cc835c5dd2eee9b368
-cryptography==46.0.7 \
-    --hash=sha256:5ad9ef796328c5e3c4ceed237a183f5d41d21150f972455a9d926593a1dcb308 \
-    --hash=sha256:b36a4695e29fe69215d75960b22577197aca3f7a25b9cf9d165dcfe9d80bc325
+cryptography==48.0.1 \
+    --hash=sha256:32143b24adb918f078134e1e230f1eb8cc04886b92c28b5f0041aaf3e5699225 \
+    --hash=sha256:f0d27a5696721ef7a672b8c810f6aded391058e0b9486e63e6d93baf765da691
 distro==1.9.0 \
     --hash=sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2
 fastapi==0.139.2 \
@@ -62,9 +69,9 @@ packaging==26.0 \
     --hash=sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529
 pathspec==1.1.1 \
     --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
-pillow==12.2.0 \
-    --hash=sha256:8bd7903a5f2a4545f6fd5935c90058b89d30045568985a71c79f5fd6edf9b91e \
-    --hash=sha256:f490f9368b6fc026f021db16d7ec2fbf7d89e2edb42e8ec09d2c60505f5729c7
+pillow==12.3.0 \
+    --hash=sha256:23d27a3e0307ec2244cc51e7287b919aa68d097504ebe19df4e76a98a3eea5bd \
+    --hash=sha256:bcb46e2f9feff8d06323983bd83ed00c201fdcab3d74973e7072a889b3979fcd
 prompt-toolkit==3.0.52 \
     --hash=sha256:9aac639a3bbd33284347de5ad8d68ecc044b91a762dc39b7c21095fcd6a19955
 psutil==7.2.2 \

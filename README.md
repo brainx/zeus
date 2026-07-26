@@ -13,7 +13,12 @@ Many Hermes bots, one local supervisor.
 [![Package Build](https://img.shields.io/badge/package-build%20checked-brightgreen)](.github/workflows/ci.yml)
 [![Security Policy](https://img.shields.io/badge/security-policy-informational)](SECURITY.md)
 
-Zeus is an orchestration layer for running many Hermes Agent bots from reusable templates. It renders each bot as an isolated Hermes profile under `.zeus/`, starts and stops gateway processes, tracks PID ownership, and exposes a small loopback CLI/API for operators.
+Zeus is an independent orchestration layer for running many
+[Hermes Agent](https://hermes-agent.nousresearch.com/) bots from reusable
+templates. Hermes Agent is developed by
+[Nous Research](https://nousresearch.com/). Zeus renders each bot as an
+isolated Hermes profile under `.zeus/`, starts and stops gateway processes,
+tracks PID ownership, and exposes a small loopback CLI/API for operators.
 
 ## Why Zeus
 
@@ -223,7 +228,9 @@ zeus bot stop coder
 - [Credits](CREDITS.md)
 - [Security policy](SECURITY.md)
 
-Zeus is maintained by [BrainX](https://github.com/brainx). See [Credits](CREDITS.md) for project ownership.
+Zeus is maintained by [BrainX](https://github.com/brainx). See
+[Credits and Acknowledgements](CREDITS.md) for project ownership, upstream
+attribution, and official Hermes Agent and Nous Research links.
 
 ## Requirements
 

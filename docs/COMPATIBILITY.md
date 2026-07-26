@@ -61,16 +61,27 @@ the automated matrix.
 
 The deterministic CI baseline is Hermes Agent 0.19.0 on Ubuntu 24.04 with Python
 3.11. [`requirements-hermes-ci.txt`](../requirements-hermes-ci.txt) pins the
-complete 60-package wheel closure and its selected SHA-256 hashes. CI installs it
-with pip hash checking and binary-only resolution; it never runs the remote
-Hermes installer. The lock also carries Linux arm64 hashes for native local
-container verification without changing the CI package versions.
+complete 60-package wheel closure and its selected SHA-256 hashes. CI installs
+that complete closure with dependency resolution disabled, pip hash checking,
+and binary-only artifacts; it never runs the remote Hermes installer. This is
+intentional because Hermes Agent 0.19.0 metadata pins vulnerable
+`cryptography==46.0.7` and `Pillow==12.2.0` releases. The lock substitutes the
+first patched versions, `cryptography==48.0.1` and `Pillow==12.3.0`.
+`scripts/check_hermes_dependency_overrides.py` fails unless those are the only
+two metadata conflicts and every other installed requirement is satisfied.
+Remove the override when a compatible Hermes release carries safe dependency
+metadata.
 
-The gate uses no model-provider credential or paid request. It renders a profile,
-runs strict Zeus and Hermes diagnostics, starts the loopback gateway with
-`--wait`, checks Zeus process ownership and Hermes `/health`, then stops the bot
-and removes runtime state. On failure it uploads only a two-line sanitized stage
-summary, never the rendered profile, environment, logs, or process arguments.
+The lock carries Ubuntu-compatible Linux x86_64 and arm64 hashes for native
+local container verification without changing package versions. Pillow's
+patched wheels require glibc 2.27 or newer.
+
+The gate uses no model-provider credential or paid request. It renders a
+profile, runs strict Zeus and Hermes diagnostics in the patched dependency
+environment, starts the loopback gateway with `--wait`, checks Zeus process
+ownership and Hermes `/health`, then stops the bot and removes runtime state.
+On failure it uploads only a two-line sanitized stage summary, never the
+rendered profile, environment, logs, or process arguments.
 
 The manual [`scripts/verify_real_hermes.sh`](../scripts/verify_real_hermes.sh)
 check still uses whichever `hermes` executable is installed on `PATH` unless

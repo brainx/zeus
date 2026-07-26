@@ -35,6 +35,8 @@ Documentation = "https://github.com/brainx/zeus/tree/main/docs"
 Issues = "https://github.com/brainx/zeus/issues"
 Changelog = "https://github.com/brainx/zeus/blob/main/CHANGELOG.md"
 Maintainer = "https://github.com/brainx"
+"Hermes Agent" = "https://hermes-agent.nousresearch.com/"
+"Nous Research" = "https://nousresearch.com/"
 
 [project.optional-dependencies]
 dev = [

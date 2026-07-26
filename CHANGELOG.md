@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Replaced the vulnerable cryptography and Pillow pins in the hash-locked Hermes
+  Agent 0.19.0 CI environment with their first patched releases while retaining
+  an exact, verified compatibility override for upstream metadata.
+- Expanded project acknowledgements with official Hermes Agent and Nous
+  Research attribution and links.
+
 ## 0.4.0
 
 - Added the host-local, report-only repository audit: exact committed `HEAD`

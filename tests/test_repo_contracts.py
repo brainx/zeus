@@ -210,6 +210,7 @@ class RepoContractTests(unittest.TestCase):
             "systemd/zeus-reconcile.service",
             "systemd/zeus-reconcile.timer",
             "scripts/repo_check.sh",
+            "scripts/check_hermes_dependency_overrides.py",
             "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
@@ -298,10 +299,10 @@ class RepoContractTests(unittest.TestCase):
                 "mkdir -p .tmp/real-hermes-evidence\n"
                 "printf '%s\\n' 'result=failed' 'failure_stage=ci_setup' > "
                 ".tmp/real-hermes-evidence/summary.txt",
-                "python -m pip install --require-hashes --only-binary=:all: "
+                "python -m pip install --no-deps --require-hashes --only-binary=:all: "
                 "-r requirements-hermes-ci.txt",
                 "python -m pip install -e .",
-                "python -m pip check",
+                "python scripts/check_hermes_dependency_overrides.py",
                 "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
                 "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \\\n"
                 "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
@@ -1074,10 +1075,13 @@ class RepoContractTests(unittest.TestCase):
         self.assertEqual(60, len({name for name, _version in entries}))
         self.assertEqual(74, len(hashes))
         self.assertIn(("hermes-agent", "0.19.0"), entries)
+        self.assertIn(("cryptography", "48.0.1"), entries)
+        self.assertIn(("pillow", "12.3.0"), entries)
         self.assertIn(
             "bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f",
             hashes,
         )
+        self.assertIn("SECURITY OVERRIDE", requirements)
         self.assertNotIn("--index-url", requirements)
         self.assertNotIn("git+", requirements)
 
@@ -1553,26 +1557,36 @@ class RepoContractTests(unittest.TestCase):
                 self.assertIn(path, openapi["paths"])
                 self.assertIn(path.replace("{bot_id}", "<bot-id>"), api_docs)
 
-    def test_brainx_maintainer_is_credited(self) -> None:
+    def test_project_ownership_and_upstream_credits_are_explicit(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
         credits = Path("CREDITS.md").read_text(encoding="utf-8")
         architecture = Path("docs/ARCHITECTURE.md").read_text(encoding="utf-8")
         pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
 
         self.assertIn("[Credits](CREDITS.md)", readme)
-        opener = (
-            "Zeus is an orchestration layer for running many Hermes Agent bots "
-            "from reusable templates."
-        )
-        self.assertIn(opener, readme)
+        self.assertIn("Zeus is an independent orchestration layer", readme)
         self.assertNotIn(
             "[BrainX](https://github.com/brainx)-maintained orchestration layer", readme
         )
         self.assertIn("Zeus is maintained by [BrainX](https://github.com/brainx).", readme)
         self.assertIn("https://github.com/brainx", readme)
         self.assertIn("https://github.com/brainx", credits)
+        for upstream_url in (
+            "https://hermes-agent.nousresearch.com/",
+            "https://hermes-agent.nousresearch.com/docs/",
+            "https://github.com/NousResearch/hermes-agent",
+            "https://nousresearch.com/",
+        ):
+            with self.subTest(upstream_url=upstream_url):
+                self.assertIn(upstream_url, credits)
+        self.assertIn(
+            "No sponsorship or endorsement by Nous Research is implied.",
+            credits.replace("\n", " "),
+        )
         self.assertIn("https://github.com/brainx", architecture)
         self.assertIn('Maintainer = "https://github.com/brainx"', pyproject)
+        self.assertIn('"Hermes Agent" = "https://hermes-agent.nousresearch.com/"', pyproject)
+        self.assertIn('"Nous Research" = "https://nousresearch.com/"', pyproject)
 
     def test_sqlite_durability_policy_is_consistent_across_runtime_and_docs(self) -> None:
         env_example = Path(".env.example").read_text(encoding="utf-8")
