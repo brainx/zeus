@@ -20,13 +20,14 @@ reconciliation evidence on one host.
   Hermes Agent 0.19.0 compatibility gate, preloaded Docker image, bounded
   private reports, cleanup, and fail-closed isolation controls. Audits are
   report-only: they do not remediate or schedule work.
+- Focused internal lifecycle, gateway-runtime, private-I/O, and audit modules
+  behind compatibility facades, with a 1,200-line production-module size
+  ratchet.
 
 ## Near term
 
 - Keep local and CI quality gates aligned with the measured coverage baseline.
 - Strengthen installed-package behavior and compatibility evidence.
-- Decompose large internal modules without changing the public CLI, API, or
-  persisted schemas.
 - Improve local operational readiness, backup guidance, and health evidence.
 
 ## Under evaluation

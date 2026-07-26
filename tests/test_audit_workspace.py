@@ -295,7 +295,7 @@ class AuditWorkspaceDiscoveryTests(TemporaryGitRepository):
         started = time.monotonic()
         with (
             patch(
-                "zeus.audit_workspace._lstat_tracked_path",
+                "zeus.audit_workspace_core._lstat_tracked_path",
                 side_effect=slow_lstat,
             ) as tracked_lstat,
             self.assertRaisesRegex(AuditWorkspaceError, "deadline"),

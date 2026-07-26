@@ -50,15 +50,23 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.hermes_adapter`: Subprocess command construction for Hermes.
 - `zeus.gateway_launcher`: Descriptor-only marker-before-exec helper.
 - `zeus.profile_manager`: Atomic profile installation, delete, archive, and rollback transactions.
-- `zeus.gateway_runtime`: Process, marker, readiness, signal, and cleanup effects.
+- `zeus.private_io`: Public descriptor-safe private-I/O facade; focused core and
+  atomic-write modules own path binding and replacement mechanics.
+- `zeus.gateway_runtime`: Public process-effects facade; launch, marker,
+  ownership, stop, and low-level process helpers are isolated behind it.
 - `zeus.intent_recovery`: Store-free pending-intent recovery decisions through a structural host.
-- `zeus.supervisor`: Public lifecycle facade, locks, durable intent transitions, and audit ordering.
+- `zeus.supervisor`: Public lifecycle compatibility facade. Focused internal
+  modules own core coordination, runtime compatibility, start, stop/restart,
+  reconciliation/recovery, status/inspection, and registry/profile operations.
 - `zeus.api`: Local HTTP routes and compatibility facade.
 - `zeus.cli`: Operator CLI.
 - `zeus.audit_*`: Native, report-only audit components for committed `HEAD`
   snapshots, bounded report storage, an ephemeral Hermes profile, and the
-  prevalidated Docker broker. They do not use `StateStore`, lifecycle APIs,
-  SQLite migrations, scheduling, remediation, or cross-host coordination.
+  prevalidated Docker broker. Workspace discovery/materialization/validation,
+  broker protocol/control/execution, report parsing/rendering, and run-control
+  cleanup are separate internal modules. They do not use `StateStore`,
+  lifecycle APIs, SQLite migrations, scheduling, remediation, or cross-host
+  coordination.
 
 ## Repository Audit Boundary
 

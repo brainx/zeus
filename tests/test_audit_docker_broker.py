@@ -1134,7 +1134,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
         started = time.monotonic()
         try:
             with (
-                mock.patch.object(audit_docker_broker, "_LOCK_WAIT_SECONDS", 0.05),
+                mock.patch("zeus.audit_docker_broker_core._LOCK_WAIT_SECONDS", 0.05),
                 self.assertRaises(AuditDockerBrokerError),
             ):
                 self._invoke("version")

@@ -1178,15 +1178,16 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("test_bot_logs_requires_key", tests)
 
     def test_cli_exposes_restart_lifecycle_command(self) -> None:
+        from zeus.supervisor import Supervisor
+
         cli = Path("zeus/cli.py").read_text(encoding="utf-8")
-        supervisor = Path("zeus/supervisor.py").read_text(encoding="utf-8")
         api = Path("zeus/api.py").read_text(encoding="utf-8")
         readme = Path("README.md").read_text(encoding="utf-8")
 
         self.assertIn('"restart"', cli)
         self.assertIn('"reconcile"', cli)
-        self.assertIn("def restart", supervisor)
-        self.assertIn("def reconcile", supervisor)
+        self.assertTrue(callable(getattr(Supervisor, "restart", None)))
+        self.assertTrue(callable(getattr(Supervisor, "reconcile", None)))
         self.assertIn(".restart(", api)
         self.assertIn(".reconcile(", api)
         self.assertIn("zeus bot restart coder", readme)
