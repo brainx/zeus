@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Decomposed oversized lifecycle, gateway-runtime, private-I/O, and audit
+  modules behind their existing compatibility facades, enforced by a
+  1,200-line production-module size ratchet.
 - Replaced the vulnerable cryptography and Pillow pins in the hash-locked Hermes
   Agent 0.19.0 CI environment with their first patched releases while retaining
   an exact, verified compatibility override for upstream metadata.
