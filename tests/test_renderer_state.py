@@ -494,6 +494,97 @@ class RendererStateTests(unittest.TestCase):
                 (profile / ".env").read_text(encoding="utf-8"),
             )
 
+    def test_renderer_uses_native_kimi_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            self.assertIn(
+                "kimi-k3-coding-bot",
+                {candidate.id for candidate in TemplateStore().list()},
+            )
+            template = TemplateStore().get("kimi-k3-coding-bot")
+            ProfileRenderer(hermes_root).render(
+                BotCreateRequest(
+                    bot_id="kimi-coder",
+                    template_id="kimi-k3-coding-bot",
+                    env={"KIMI_API_KEY": "test-key"},
+                ),
+                template,
+            )
+
+            profile = hermes_root / "profiles" / "kimi-coder"
+            config = (profile / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn('provider: "kimi-coding"', config)
+            self.assertIn('default: "kimi-k3"', config)
+            self.assertNotIn("base_url:", config)
+            self.assertNotIn("api_mode:", config)
+            self.assertEqual(
+                "KIMI_API_KEY=test-key\n# KIMI_BASE_URL=\n",
+                (profile / ".env").read_text(encoding="utf-8"),
+            )
+
+    def test_renderer_writes_kimi_base_url_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            self.assertIn(
+                "kimi-k3-coding-bot",
+                {candidate.id for candidate in TemplateStore().list()},
+            )
+            template = TemplateStore().get("kimi-k3-coding-bot")
+            ProfileRenderer(hermes_root).render(
+                BotCreateRequest(
+                    bot_id="kimi-coder",
+                    template_id="kimi-k3-coding-bot",
+                    env={
+                        "KIMI_API_KEY": "test-key",
+                        "KIMI_BASE_URL": "https://vendor.example/v1",
+                    },
+                ),
+                template,
+            )
+
+            profile = hermes_root / "profiles" / "kimi-coder"
+            config = (profile / "config.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("base_url:", config)
+            self.assertNotIn("api_mode:", config)
+            _, env = HermesAdapter("hermes", hermes_root).command(
+                "kimi-coder", "gateway", "run"
+            )
+            self.assertEqual("test-key", env["KIMI_API_KEY"])
+            self.assertEqual("https://vendor.example/v1", env["KIMI_BASE_URL"])
+
+    def test_renderer_rejects_undeclared_kimi_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            self.assertIn(
+                "kimi-k3-coding-bot",
+                {candidate.id for candidate in TemplateStore().list()},
+            )
+            template = TemplateStore().get("kimi-k3-coding-bot")
+
+            with self.assertRaisesRegex(
+                TemplateError,
+                (
+                    "env contains unknown key\\(s\\) for template "
+                    "kimi-k3-coding-bot: UNRELATED_API_KEY"
+                ),
+            ):
+                ProfileRenderer(hermes_root).render(
+                    BotCreateRequest(
+                        bot_id="kimi-coder",
+                        template_id="kimi-k3-coding-bot",
+                        env={
+                            "KIMI_API_KEY": "test-key",
+                            "UNRELATED_API_KEY": "not-allowed",
+                        },
+                    ),
+                    template,
+                )
+
+            self.assertFalse((hermes_root / "profiles" / "kimi-coder").exists())
+
     def test_renderer_quotes_env_values_without_line_injection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

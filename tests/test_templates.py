@@ -10,6 +10,19 @@ from zeus.templates import TemplateStore
 
 
 class TemplateTests(unittest.TestCase):
+    def test_kimi_k3_template_selects_native_hermes_provider(self) -> None:
+        self.assertIn(
+            "kimi-k3-coding-bot",
+            {template.id for template in TemplateStore().list()},
+        )
+        template = TemplateStore().get("kimi-k3-coding-bot")
+
+        self.assertEqual(["KIMI_API_KEY", "KIMI_BASE_URL"], template.hermes.required_env)
+        self.assertEqual("kimi-coding", template.hermes.model.provider)
+        self.assertEqual("kimi-k3", template.hermes.model.default)
+        self.assertIsNone(template.hermes.model.base_url)
+        self.assertIsNone(template.hermes.model.api_mode)
+
     def test_builtin_templates_include_async_delegation_caps(self) -> None:
         templates = TemplateStore().list()
         self.assertGreaterEqual(len(templates), 7)
