@@ -548,9 +548,7 @@ class RendererStateTests(unittest.TestCase):
             config = (profile / "config.yaml").read_text(encoding="utf-8")
             self.assertNotIn("base_url:", config)
             self.assertNotIn("api_mode:", config)
-            _, env = HermesAdapter("hermes", hermes_root).command(
-                "kimi-coder", "gateway", "run"
-            )
+            _, env = HermesAdapter("hermes", hermes_root).command("kimi-coder", "gateway", "run")
             self.assertEqual("test-key", env["KIMI_API_KEY"])
             self.assertEqual("https://vendor.example/v1", env["KIMI_BASE_URL"])
 
