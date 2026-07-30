@@ -10,6 +10,13 @@ from zeus.cli import build_parser, main
 
 
 class AuditCliContractTests(unittest.TestCase):
+    def test_audit_init_parses_without_normal_service_settings(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["audit", "init", "--json"])
+        self.assertEqual("audit", args.resource)
+        self.assertEqual("init", args.action)
+        self.assertTrue(args.as_json)
+
     def test_audit_commands_parse_without_normal_service_settings(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["audit", "show", "a" * 32, "--json"])
@@ -86,6 +93,55 @@ class AuditCliContractTests(unittest.TestCase):
                             f"{'ok' if ok else 'blocked'}\trepository\tchecked\n",
                             stdout.getvalue(),
                         )
+
+    def test_audit_init_human_and_json_output_are_secret_free(self) -> None:
+        from zeus.audit_config import parse_audit_config
+
+        config = parse_audit_config(
+            {
+                "schema_version": 1,
+                "provider": "kimi-coding",
+                "model": "kimi-k3",
+                "provider_env": ["KIMI_API_KEY"],
+            }
+        )
+        expected_json = {
+            "model": "kimi-k3",
+            "next_command": "zeus audit doctor",
+            "provider": "kimi-coding",
+            "provider_env": ["KIMI_API_KEY"],
+        }
+        expected_human = (
+            "provider: kimi-coding\n"
+            "model: kimi-k3\n"
+            "provider_env: KIMI_API_KEY\n"
+            "next: zeus audit doctor\n"
+        )
+        forbidden = (
+            "credential-value-for-test",
+            "/private/audit-state-for-test",
+            "config.json",
+            "run_id",
+        )
+
+        for as_json in (False, True):
+            with self.subTest(as_json=as_json):
+                service = mock.Mock()
+                service.initialize.return_value = config
+                argv = ["audit", "init", *(["--json"] if as_json else [])]
+                with (
+                    mock.patch("zeus.audit.AuditService.from_cwd", return_value=service),
+                    mock.patch("sys.stdout", new_callable=StringIO) as stdout,
+                ):
+                    exit_code = main(argv)
+                self.assertEqual(0, exit_code)
+                output = stdout.getvalue()
+                if as_json:
+                    self.assertEqual(expected_json, json.loads(output))
+                else:
+                    self.assertEqual(expected_human, output)
+                for value in forbidden:
+                    self.assertNotIn(value, output)
 
     def test_audit_run_human_json_and_status_exit_matrix(self) -> None:
         from zeus.audit_models import AuditStatus

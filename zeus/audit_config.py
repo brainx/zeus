@@ -14,10 +14,17 @@ from zeus.audit_models import (
     AuditLimits,
     SuggestedCommand,
 )
-from zeus.private_io import read_private_bytes
+from zeus.private_io import (
+    ensure_private_directory,
+    read_private_bytes,
+    write_private_bytes_atomic,
+)
 
 AUDIT_CONFIG_SCHEMA_VERSION = 1
 AUDIT_CONFIG_MAX_BYTES = 1024 * 1024
+DEFAULT_AUDIT_PROVIDER = "kimi-coding"
+DEFAULT_AUDIT_MODEL = "kimi-k3"
+DEFAULT_AUDIT_PROVIDER_ENV = ("KIMI_API_KEY",)
 DEFAULT_AUDIT_IMAGE = (
     "nikolaik/python-nodejs:python3.11-nodejs20@sha256:"
     "8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
@@ -42,6 +49,12 @@ _PROVIDER_CREDENTIAL_SUFFIXES = frozenset(
         "ACCESS_TOKEN",
     }
 )
+_PROVIDER_ENV_ALIASES = {
+    "kimi-coding": frozenset({"KIMI_API_KEY", "KIMI_BASE_URL"}),
+}
+_PROVIDER_CREDENTIAL_ALIASES = {
+    "kimi-coding": frozenset({"KIMI_API_KEY"}),
+}
 _SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REGISTRY_HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _REGISTRY_AUTHORITY_RE = re.compile(
@@ -122,12 +135,14 @@ def _provider_env(value: object) -> tuple[str, ...]:
 
 def _provider_environment_allowlist(provider: str) -> frozenset[str]:
     prefix = provider.upper().replace("-", "_")
-    return frozenset(f"{prefix}_{suffix}" for suffix in _PROVIDER_ENV_SUFFIXES)
+    derived = frozenset(f"{prefix}_{suffix}" for suffix in _PROVIDER_ENV_SUFFIXES)
+    return derived | _PROVIDER_ENV_ALIASES.get(provider, frozenset())
 
 
 def _provider_credential_allowlist(provider: str) -> frozenset[str]:
     prefix = provider.upper().replace("-", "_")
-    return frozenset(f"{prefix}_{suffix}" for suffix in _PROVIDER_CREDENTIAL_SUFFIXES)
+    derived = frozenset(f"{prefix}_{suffix}" for suffix in _PROVIDER_CREDENTIAL_SUFFIXES)
+    return derived | _PROVIDER_CREDENTIAL_ALIASES.get(provider, frozenset())
 
 
 def validate_provider_selection(config: AuditConfig) -> None:
@@ -335,3 +350,27 @@ def load_audit_config(state_dir: Path) -> AuditConfig:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AuditConfigError("audit configuration is not valid UTF-8 JSON") from exc
     return parse_audit_config(value)
+
+
+def default_audit_config_bytes() -> bytes:
+    value = {
+        "schema_version": AUDIT_CONFIG_SCHEMA_VERSION,
+        "provider": DEFAULT_AUDIT_PROVIDER,
+        "model": DEFAULT_AUDIT_MODEL,
+        "provider_env": list(DEFAULT_AUDIT_PROVIDER_ENV),
+    }
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def initialize_audit_config(state_dir: Path) -> AuditConfig:
+    ensure_private_directory(state_dir)
+    audit_dir = state_dir / "audit"
+    ensure_private_directory(audit_dir)
+    data = default_audit_config_bytes()
+    write_private_bytes_atomic(
+        audit_dir / "config.json",
+        data,
+        AUDIT_CONFIG_MAX_BYTES,
+        replace=False,
+    )
+    return load_audit_config(state_dir)

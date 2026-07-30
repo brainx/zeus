@@ -15,7 +15,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from zeus import __version__
-from zeus.audit_config import AuditConfigError, load_audit_config
+from zeus.audit_config import (
+    AuditConfigError,
+    initialize_audit_config,
+    load_audit_config,
+)
 from zeus.audit_container import AuditContainerError, AuditContainerRuntime, PreparedAuditContainer
 from zeus.audit_docker_broker import (
     HERMES_VERSION,
@@ -256,6 +260,23 @@ class AuditService:
                 "state path is outside the repository or ignored and untracked",
             )
         return AuditDoctorReport((*report.checks, state_check))
+
+    def initialize(self) -> AuditConfig:
+        try:
+            self.workspace.revalidate(self.location, deadline=self.deadline)
+            self._validate_state_path(deadline=self.deadline)
+            return initialize_audit_config(self.settings.state_dir)
+        except AuditServiceError:
+            raise
+        except (
+            AuditWorkspaceError,
+            AuditConfigError,
+            OSError,
+            TypeError,
+            ValueError,
+            UnsafeFileError,
+        ) as exc:
+            raise AuditServiceError("audit initialization failed") from exc
 
     def _report(
         self,
