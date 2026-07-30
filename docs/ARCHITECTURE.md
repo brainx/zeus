@@ -70,12 +70,14 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 
 ## Repository Audit Boundary
 
-Repository audit is a host-local command path with four actions: doctor, run,
-list, and show. It materializes the exact committed `HEAD`, never a dirty or
-untracked worktree. `AuditService` starts before normal service construction,
-loads settings without repository `.env`, and stores only private report
-artifacts. The packaged `zeus.bundled_skills.audit` instruction is the sole
-audit skill; general skill loading remains unavailable.
+Repository audit is a host-local command path with five actions: init, doctor,
+run, list, and show. `init` explicitly selects Kimi K3 by atomically creating a
+private configuration; it does not contact a provider or create a run. The run
+path materializes the exact committed `HEAD`, never a dirty or untracked
+worktree. `AuditService` starts before normal service construction, loads
+settings without repository `.env`, and stores only private configuration and
+report artifacts. The packaged `zeus.bundled_skills.audit` instruction is the
+sole audit skill; general skill loading remains unavailable.
 
 The audit path accepts only Hermes Agent 0.19.0 and an already preloaded,
 digest-qualified Docker image. A broker seals one Docker container with network

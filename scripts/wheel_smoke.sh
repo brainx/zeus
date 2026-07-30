@@ -89,6 +89,7 @@ esac
 for template_id in \
   coding-bot \
   deepseek-coding-bot \
+  kimi-k3-coding-bot \
   docs-writer-bot \
   gateway-operator \
   log-triage-bot \

@@ -23,7 +23,8 @@ tracks PID ownership, and exposes a small loopback CLI/API for operators.
 ## Why Zeus
 
 - Run multiple Hermes bots from one workspace without hand-copying profile directories.
-- Stamp out repeatable bot shapes from TOML templates: coding, research, support, DeepSeek, and custom profiles.
+- Stamp out repeatable bot shapes from TOML templates: coding, research,
+  support, DeepSeek, Kimi K3, and custom profiles.
 - Keep secrets out of templates by rendering per-profile `.env` files that stay ignored by git.
 - Supervise gateway processes with ownership markers before stop/status actions trust a PID.
 - Account for Hermes async delegation with explicit `max_async_children` caps in every built-in template.
@@ -58,8 +59,22 @@ It never reads dirty or untracked worktree content, and it does not edit,
 remediate, commit, push, schedule, deploy, notify, or coordinate across hosts.
 Cross-host policy remains outside Zeus.
 
-All four audit commands first discover the containing Git repository and its
+All five audit commands first discover the containing Git repository and its
 Zeus state context.
+
+### Initialize Kimi K3
+
+Select Kimi K3 for repository audits with an explicit initialization step:
+
+```bash
+zeus audit init
+```
+
+Initialization writes a private schema-v1 configuration containing provider
+`kimi-coding`, model `kimi-k3`, and the environment name `KIMI_API_KEY`. It
+stores no credential value, makes no provider request, creates no audit run,
+and refuses to replace an existing configuration. A missing configuration
+remains unconfigured until this command is run.
 
 ### Check readiness
 
@@ -77,19 +92,11 @@ downloads nothing.
 ### Run an audit
 
 Only `audit run` requires those runtime prerequisites. Zeus never pulls the
-image. Before the first run, create private
-`$ZEUS_STATE_DIR/audit/config.json` with an explicit lowercase Hermes provider,
-model, and at least one provider-prefixed API key or authentication/access
-token. Endpoint and account metadata variables may be added alongside it:
-
-```json
-{
-  "schema_version": 1,
-  "provider": "deepseek",
-  "model": "deepseek-chat",
-  "provider_env": ["DEEPSEEK_API_KEY"]
-}
-```
+image. The `audit init` command creates the standard Kimi K3 selection at
+`$ZEUS_STATE_DIR/audit/config.json`. Operators can edit that private file to
+select another explicit lowercase Hermes provider and model or add permitted
+endpoint and account metadata environment names. For a compatible Kimi K3
+endpoint, add `KIMI_BASE_URL` alongside `KIMI_API_KEY` in `provider_env`.
 
 The state directory must be outside the worktree or ignored by `.gitignore`
 policy loaded from the exact committed `HEAD`; global excludes and
@@ -425,7 +432,31 @@ values fail bot creation without printing the value. Keep `./.env` mode `0600`;
 Zeus also writes the imported values only to the selected profile's mode-`0600`
 `.env` file.
 
-Built-in templates include OpenRouter-backed bots and `deepseek-coding-bot`, which uses Hermes' native DeepSeek provider with `DEEPSEEK_API_KEY`. Example templates also cover gateway operations, log triage, and documentation writing.
+Built-in templates include OpenRouter-backed bots, `deepseek-coding-bot`, and
+`kimi-k3-coding-bot`. The Kimi template uses Hermes provider `kimi-coding` and
+model `kimi-k3`:
+
+```bash
+zeus bot create kimi-coder \
+  --template kimi-k3-coding-bot \
+  --env-from KIMI_API_KEY
+```
+
+Without `KIMI_BASE_URL`, Hermes uses Moonshot's international Open Platform
+default at `https://api.moonshot.ai/v1`. A vendor exposing an
+OpenAI-compatible Kimi K3 endpoint with model ID `kimi-k3` can be selected
+explicitly:
+
+```bash
+zeus bot create kimi-coder \
+  --template kimi-k3-coding-bot \
+  --env-from KIMI_API_KEY \
+  --env-from KIMI_BASE_URL
+```
+
+The template does not use Kimi Code subscription credentials or its `k3`
+subscription alias. Example templates also cover gateway operations, log
+triage, and documentation writing.
 
 Each template should set a bounded async delegation cap:
 

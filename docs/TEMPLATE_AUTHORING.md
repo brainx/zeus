@@ -95,3 +95,41 @@ zeus bot create deepseek-coder --template deepseek-coding-bot --env DEEPSEEK_API
 ```
 
 Do not commit rendered profile `.env` files.
+
+## Kimi K3
+
+The built-in `kimi-k3-coding-bot` uses Hermes provider `kimi-coding` and model
+`kimi-k3`:
+
+```toml
+[hermes]
+required_env = ["KIMI_API_KEY", "KIMI_BASE_URL"]
+
+[hermes.model]
+provider = "kimi-coding"
+default = "kimi-k3"
+```
+
+Pass the Moonshot Open Platform key by environment name:
+
+```bash
+zeus bot create kimi-coder \
+  --template kimi-k3-coding-bot \
+  --env-from KIMI_API_KEY
+```
+
+The model configuration deliberately omits `base_url` and `api_mode`; Hermes
+uses Moonshot's international endpoint at `https://api.moonshot.ai/v1` when
+`KIMI_BASE_URL` is absent. To use a vendor that exposes an OpenAI-compatible
+Kimi K3 endpoint with model ID `kimi-k3`, supply both declared names:
+
+```bash
+zeus bot create kimi-coder \
+  --template kimi-k3-coding-bot \
+  --env-from KIMI_API_KEY \
+  --env-from KIMI_BASE_URL
+```
+
+`--env-from` keeps values out of command arguments. This template does not
+accept Kimi Code subscription credentials or substitute the subscription model
+alias `k3`.

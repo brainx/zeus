@@ -575,6 +575,7 @@ class RepoContractTests(unittest.TestCase):
         for template_id in (
             "coding-bot",
             "deepseek-coding-bot",
+            "kimi-k3-coding-bot",
             "docs-writer-bot",
             "gateway-operator",
             "log-triage-bot",
@@ -649,6 +650,8 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("scripts/fresh_vps_verify.sh", script)
         self.assertIn("zeus/bundled_templates/coding-bot.toml", script)
         self.assertIn("templates/deepseek-coding-bot.toml", script)
+        self.assertIn("templates/kimi-k3-coding-bot.toml", script)
+        self.assertIn("zeus/bundled_templates/kimi-k3-coding-bot.toml", script)
         self.assertIn("templates/docs-writer-bot.toml", script)
         self.assertIn("templates/gateway-operator.toml", script)
         self.assertIn("templates/log-triage-bot.toml", script)
@@ -700,6 +703,7 @@ class RepoContractTests(unittest.TestCase):
                 self.assertRegex(stored_report_docs, rf"do not invoke[^.]*{runtime_check}")
 
         for command in (
+            "zeus audit init [--json]",
             "zeus audit doctor [--json]",
             "zeus audit run [--json]",
             "zeus audit list [--json]",
@@ -952,13 +956,15 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("focused process", compatibility_text.lower())
         self.assertIn("Windows is not currently automated", compatibility_text)
 
-    def test_env_example_lists_deepseek_and_api_auth(self) -> None:
+    def test_env_example_lists_provider_and_api_auth_settings(self) -> None:
         env = Path(".env.example").read_text(encoding="utf-8")
         api_docs = Path("docs/API.md").read_text(encoding="utf-8")
 
         self.assertIn("ZEUS_API_KEY=", env)
         self.assertIn("ZEUS_ALLOW_UNAUTH_READS=0", env)
         self.assertIn("DEEPSEEK_API_KEY=", env)
+        self.assertIn("KIMI_API_KEY=", env)
+        self.assertIn("KIMI_BASE_URL=", env)
         self.assertIn("ZEUS_ENV_PASSTHROUGH=", env)
         self.assertIn("All non-health endpoints require", api_docs)
         self.assertIn("POST /bots/<bot-id>/restart", api_docs)
