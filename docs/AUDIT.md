@@ -27,7 +27,7 @@ The first version is intentionally narrow:
 - It does not add an HTTP API, a SQLite migration, or cross-host coordination.
 - It does not audit dirty or untracked worktree content.
 - It never remediates findings and does not schedule audit runs; an operator
-  explicitly invokes one of the four local audit commands.
+  explicitly invokes one of the five local audit commands.
 
 ## Chosen Architecture
 
@@ -64,7 +64,7 @@ The implementation is divided into focused internal modules:
   artifacts.
 - `zeus.audit_doctor` verifies Git, Hermes, Docker, image, mount, network, and
   private-path prerequisites.
-- `zeus.audit` exposes a thin `AuditService` used by all four CLI actions.
+- `zeus.audit` exposes a thin `AuditService` used by all five CLI actions.
 - `zeus.bundled_skills.audit` contains the versioned `SKILL.md`.
 
 `zeus.cli` only parses and presents audit commands. It does not contain
@@ -301,6 +301,24 @@ Unknown fields and invalid types fail closed. Schema version 1 supports:
 - `limits`: bounded overrides for run duration, command duration, finding
   count, model output, report artifacts, snapshot entries, and snapshot bytes.
 
+`zeus audit init` explicitly selects the standard Kimi K3 configuration:
+
+```json
+{
+  "model": "kimi-k3",
+  "provider": "kimi-coding",
+  "provider_env": ["KIMI_API_KEY"],
+  "schema_version": 1
+}
+```
+
+Initialization discovers and revalidates the repository, enforces the same
+state-path policy as a run, and atomically creates the private configuration.
+It never replaces an existing configuration, reads or stores a credential
+value, contacts a provider, or creates an audit run. A failed initialization
+can leave newly created empty private directories, but not a partial
+configuration file.
+
 Version 1 has these hard ceilings:
 
 - one concurrent audit per repository;
@@ -331,6 +349,12 @@ selections block preflight. Every named variable must have a non-empty value at
 invocation. Model stdout and each final report artifact are individually capped
 at 1 MiB.
 
+Provider names normally derive their environment allowlist from their uppercase
+prefix. Hermes provider `kimi-coding` additionally accepts the official
+`KIMI_API_KEY` and `KIMI_BASE_URL` names. To use an OpenAI-compatible Kimi K3
+vendor endpoint, add `KIMI_BASE_URL` to `provider_env` alongside
+`KIMI_API_KEY`; the default initializer names only `KIMI_API_KEY`.
+
 The six supported categories are:
 
 1. security and trust boundaries;
@@ -342,17 +366,23 @@ The six supported categories are:
 
 ## CLI Contract
 
-Version 1 adds four local commands:
+Version 1 provides five local commands:
 
 ```text
+zeus audit init [--json]
 zeus audit doctor [--json]
 zeus audit run [--json]
 zeus audit list [--json]
 zeus audit show <run-id> [--json]
 ```
 
-All four commands discover the containing Git repository and its Zeus state
-context. `audit doctor` performs all non-model readiness checks. It reports
+All five commands discover the containing Git repository and its Zeus state
+context. `audit init` is the explicit provider-selection consent step. Human
+and JSON output identify only the provider, model, credential environment name,
+and next readiness command; they disclose neither a credential value nor a
+private absolute path.
+
+`audit doctor` performs all non-model readiness checks. It reports
 missing Docker, pinned Hermes, credential, or image prerequisites without
 creating a run or downloading dependencies.
 
@@ -535,8 +565,9 @@ The feature is additive and host-local:
 - Git repository discovery applies to every audit command. The supported Hermes
   release, Docker, configured provider credentials, and a preloaded immutable
   audit image are external runtime prerequisites for `audit run` only;
-  `audit doctor` checks readiness, while `audit list` and `audit show` do not
-  invoke those runtime checks.
+  `audit init` creates only private configuration, `audit doctor` checks
+  readiness, and `audit list` and `audit show` do not invoke those runtime
+  checks.
 - The existing generic Hermes adapter is not reused because it loads complete
   profile environments, permits generic passthrough, and buffers unbounded
   output. Audit subprocess construction has its own strict environment and

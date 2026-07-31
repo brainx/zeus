@@ -34,6 +34,10 @@ and reconciliation evidence on one host.
 - Workspace-local configuration export and import that never exports secrets.
 - A local TUI for lifecycle status and reconciliation history.
 - Local plugin discovery with explicit trust and compatibility boundaries.
+- A harness-neutral Agent Client Protocol layer for startup, sessions,
+  prompt/event streaming, cancellation, inspection, permissions, and shutdown.
+  Grok Build is the proposed first adapter; this is an evaluation item, not a
+  Zeus 0.5.0 implementation commitment.
 
 ## Out of scope
 

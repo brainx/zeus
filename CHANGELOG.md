@@ -7,6 +7,8 @@
 - Decomposed oversized lifecycle, gateway-runtime, private-I/O, and audit
   modules behind their existing compatibility facades, enforced by a
   1,200-line production-module size ratchet.
+- Added a built-in Kimi K3 Hermes template with an optional compatible endpoint
+  override and an explicit, private `zeus audit init` Kimi K3 configuration.
 - Replaced the vulnerable cryptography and Pillow pins in the hash-locked Hermes
   Agent 0.19.0 CI environment with their first patched releases while retaining
   an exact, verified compatibility override for upstream metadata.

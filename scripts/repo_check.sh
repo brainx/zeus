@@ -54,6 +54,7 @@ scripts/verify_real_hermes.sh
 scripts/fresh_vps_verify.sh
 templates/coding-bot.toml
 templates/deepseek-coding-bot.toml
+templates/kimi-k3-coding-bot.toml
 templates/docs-writer-bot.toml
 templates/gateway-operator.toml
 templates/log-triage-bot.toml
@@ -62,6 +63,7 @@ templates/support-gateway.toml
 zeus/bundled_templates/__init__.py
 zeus/bundled_templates/coding-bot.toml
 zeus/bundled_templates/deepseek-coding-bot.toml
+zeus/bundled_templates/kimi-k3-coding-bot.toml
 zeus/bundled_templates/docs-writer-bot.toml
 zeus/bundled_templates/gateway-operator.toml
 zeus/bundled_templates/log-triage-bot.toml

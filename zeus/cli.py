@@ -71,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit", help=audit_description, description=audit_description)
     audit_sub = audit.add_subparsers(dest="action", required=True)
     for action, description in (
+        ("init", "Initialize a private Kimi K3 audit configuration."),
         ("doctor", "Check audit prerequisites without running an audit."),
         ("run", "Run one isolated audit of committed HEAD."),
         ("list", "List stored audit reports."),
@@ -821,6 +822,22 @@ def _run_audit(args: argparse.Namespace) -> int:
 
     try:
         service = AuditService.from_cwd()
+        if args.action == "init":
+            config = service.initialize()
+            payload = {
+                "model": config.model,
+                "next_command": "zeus audit doctor",
+                "provider": config.provider,
+                "provider_env": list(config.provider_env),
+            }
+            if args.as_json:
+                print(json.dumps(payload, sort_keys=True))
+            else:
+                print(f"provider: {config.provider}")
+                print(f"model: {config.model}")
+                print(f"provider_env: {', '.join(config.provider_env)}")
+                print("next: zeus audit doctor")
+            return 0
         if args.action == "doctor":
             doctor_report = service.doctor()
             print(

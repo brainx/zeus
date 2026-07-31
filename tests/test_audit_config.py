@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import math
+import stat
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
@@ -9,6 +11,7 @@ from pathlib import Path
 from zeus.audit_config import (
     DEFAULT_AUDIT_IMAGE,
     AuditConfigError,
+    initialize_audit_config,
     load_audit_config,
     parse_audit_config,
 )
@@ -19,6 +22,7 @@ from zeus.audit_models import (
     AuditLimits,
     SuggestedCommand,
 )
+from zeus.private_io import UnsafeFileError
 
 CONFIGURABLE_LIMITS = {
     "overall_seconds": HARD_LIMITS.overall_seconds,
@@ -45,6 +49,69 @@ class AuditConfigTests(unittest.TestCase):
         path = audit_dir / "config.json"
         path.write_bytes(data)
         path.chmod(0o600)
+
+    def test_initializer_creates_exact_private_kimi_configuration(self) -> None:
+        config = initialize_audit_config(self.state_dir)
+        config_path = self.state_dir / "audit" / "config.json"
+        self.assertEqual(
+            {
+                "model": "kimi-k3",
+                "provider": "kimi-coding",
+                "provider_env": ["KIMI_API_KEY"],
+                "schema_version": 1,
+            },
+            json.loads(config_path.read_bytes()),
+        )
+        self.assertEqual("kimi-coding", config.provider)
+        self.assertEqual("kimi-k3", config.model)
+        self.assertEqual(("KIMI_API_KEY",), config.provider_env)
+        self.assertEqual(0o700, stat.S_IMODE(self.state_dir.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(config_path.parent.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(config_path.stat().st_mode))
+
+    def test_initializer_refuses_to_replace_existing_configuration(self) -> None:
+        initialize_audit_config(self.state_dir)
+        config_path = self.state_dir / "audit" / "config.json"
+        original = config_path.read_bytes()
+
+        with self.assertRaises(UnsafeFileError):
+            initialize_audit_config(self.state_dir)
+
+        self.assertEqual(original, config_path.read_bytes())
+
+    def test_kimi_provider_adds_canonical_aliases_to_derived_environment_names(self) -> None:
+        for provider_env in (
+            ["KIMI_API_KEY"],
+            ["KIMI_API_KEY", "KIMI_BASE_URL"],
+            ["KIMI_CODING_API_KEY"],
+        ):
+            with self.subTest(provider_env=provider_env):
+                try:
+                    config = parse_audit_config(
+                        {
+                            "schema_version": 1,
+                            "provider": "kimi-coding",
+                            "model": "kimi-k3",
+                            "provider_env": provider_env,
+                        }
+                    )
+                except AuditConfigError as exc:
+                    self.fail(f"canonical Kimi environment was rejected: {exc}")
+                self.assertEqual(tuple(provider_env), config.provider_env)
+
+        for provider_env in (
+            ["KIMI_BASE_URL"],
+            ["KIMI_API_KEY", "OPENROUTER_API_KEY"],
+        ):
+            with self.subTest(provider_env=provider_env), self.assertRaises(AuditConfigError):
+                parse_audit_config(
+                    {
+                        "schema_version": 1,
+                        "provider": "kimi-coding",
+                        "model": "kimi-k3",
+                        "provider_env": provider_env,
+                    }
+                )
 
     def test_missing_config_returns_immutable_release_defaults(self) -> None:
         config = load_audit_config(self.state_dir)

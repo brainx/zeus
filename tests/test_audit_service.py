@@ -130,8 +130,109 @@ class AuditServiceContractTests(unittest.TestCase):
         from zeus.audit import AuditService
 
         self.assertTrue(callable(AuditService.from_cwd))
-        for name in ("doctor", "run", "list_reports", "show", "show_markdown"):
-            self.assertTrue(callable(getattr(AuditService, name)))
+        for name in ("initialize", "doctor", "run", "list_reports", "show", "show_markdown"):
+            self.assertTrue(callable(getattr(AuditService, name, None)))
+
+    def test_initialize_creates_kimi_config_without_audit_run(self) -> None:
+        from zeus.audit import AuditService
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            service = AuditService.from_cwd(cwd=root, env={})
+
+            config = service.initialize()
+
+            self.assertEqual("kimi-coding", config.provider)
+            self.assertEqual("kimi-k3", config.model)
+            self.assertEqual(("KIMI_API_KEY",), config.provider_env)
+            self.assertTrue((root / ".zeus" / "audit" / "config.json").is_file())
+            self.assertFalse((root / ".zeus" / "audits").exists())
+            self.assertFalse((root / ".zeus" / "audit" / "runs").exists())
+
+    def test_initialize_allows_state_outside_repository(self) -> None:
+        from zeus.audit import AuditService
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root = base / "repository"
+            state_dir = base / "private-state"
+            self._repository(root)
+            service = AuditService.from_cwd(
+                cwd=root,
+                env={"ZEUS_STATE_DIR": str(state_dir)},
+            )
+
+            config = service.initialize()
+
+            self.assertEqual("kimi-coding", config.provider)
+            self.assertTrue((state_dir / "audit" / "config.json").is_file())
+            self.assertFalse((state_dir / "audits").exists())
+
+    def test_initialize_rejects_unignored_repository_state_without_writing(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root, ignored_state=False)
+            service = AuditService.from_cwd(cwd=root, env={})
+
+            with self.assertRaisesRegex(AuditServiceError, "ignored and untracked"):
+                service.initialize()
+
+            self.assertFalse((root / ".zeus").exists())
+
+    def test_initialize_refuses_existing_config_without_changing_bytes(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            service = AuditService.from_cwd(cwd=root, env={})
+            service.initialize()
+            config_path = root / ".zeus" / "audit" / "config.json"
+            original = config_path.read_bytes()
+
+            with self.assertRaisesRegex(AuditServiceError, "initialization failed"):
+                service.initialize()
+
+            self.assertEqual(original, config_path.read_bytes())
+
+    def test_initialize_revalidates_repository_before_writing(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            service = AuditService.from_cwd(cwd=root, env={})
+            (root / "README").write_text("changed\n", encoding="utf-8")
+            run(("git", "-C", str(root), "add", "README"), check=True, stdin=DEVNULL)
+            run(("git", "-C", str(root), "commit", "-qm", "changed"), check=True, stdin=DEVNULL)
+
+            with self.assertRaisesRegex(AuditServiceError, "initialization failed"):
+                service.initialize()
+
+            self.assertFalse((root / ".zeus" / "audit" / "config.json").exists())
+
+    def test_initialize_writer_failure_leaves_no_partial_config(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+        from zeus.private_io import UnsafeFileError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            service = AuditService.from_cwd(cwd=root, env={})
+
+            with (
+                mock.patch(
+                    "zeus.audit_config.write_private_bytes_atomic",
+                    side_effect=UnsafeFileError("injected write failure"),
+                ),
+                self.assertRaisesRegex(AuditServiceError, "initialization failed"),
+            ):
+                service.initialize()
+
+            self.assertFalse((root / ".zeus" / "audit" / "config.json").exists())
 
     def test_default_state_dir_is_repository_local_after_discovery(self) -> None:
         from zeus.audit import AuditService
