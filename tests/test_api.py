@@ -2665,8 +2665,9 @@ class ApiRateLimitTests(unittest.TestCase):
 
             rows = wait_for_access_rows(state_dir, 4)
 
-        limited_row = rows[2]
-        self.assertEqual(response_headers["x-request-id"], limited_row["request_id"])
+        limited_row = next(
+            row for row in rows if row["request_id"] == response_headers["x-request-id"]
+        )
         self.assertEqual(429, limited_row["status"])
         self.assertEqual("auth_rate_limited", limited_row["error_code"])
         self.assertEqual("/bots", limited_row["route"])
@@ -2855,8 +2856,9 @@ class ApiRateLimitTests(unittest.TestCase):
             self.assertEqual(0, claim_count)
             rows = wait_for_access_rows(state_dir, 2)
 
-        limited_row = rows[1]
-        self.assertEqual(response_headers["x-request-id"], limited_row["request_id"])
+        limited_row = next(
+            row for row in rows if row["request_id"] == response_headers["x-request-id"]
+        )
         self.assertEqual(429, limited_row["status"])
         self.assertEqual("mutation_rate_limited", limited_row["error_code"])
         self.assertEqual("/bots/{bot_id}/start", limited_row["route"])
