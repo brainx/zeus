@@ -8,6 +8,7 @@ from pathlib import Path
 
 from zeus.envfile import parse_env_text
 from zeus.gateway_marker import command_fingerprint, readiness_probe_to_payload
+from zeus.hermes_security import validate_hermes_profile_security
 from zeus.models import ID_RE
 from zeus.readiness import ReadinessProbe
 
@@ -55,6 +56,7 @@ class HermesAdapter:
             raise ValueError(f"invalid bot id: {bot_id}")
         env = _base_env()
         env.update(_load_profile_env(self.hermes_root / "profiles" / bot_id / ".env"))
+        validate_hermes_profile_security({}, env)
         env["HERMES_HOME"] = str(self.hermes_root)
         return [self.hermes_bin, "-p", bot_id, *args], env
 

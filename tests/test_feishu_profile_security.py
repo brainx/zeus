@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from zeus.audit_config import parse_audit_config
 from zeus.audit_profile import (
@@ -11,12 +13,20 @@ from zeus.audit_profile import (
     build_audit_profile,
     render_audit_profile_config,
 )
-from zeus.envfile import parse_env_text
+from zeus.envfile import dump_env, parse_env_text
+from zeus.hermes_adapter import HermesAdapter
+from zeus.hermes_security import UnsupportedFeishuWebhookModeError
 from zeus.models import BotCreateRequest, HermesTemplate, TemplateError
 from zeus.renderer import ProfileRenderer
 
 
 class FeishuProfileSecurityTests(unittest.TestCase):
+    def _runtime_adapter(self, root: Path, profile_env: str = "") -> HermesAdapter:
+        profile = root / "profiles" / "feishu-bot"
+        profile.mkdir(parents=True)
+        (profile / ".env").write_text(profile_env, encoding="utf-8")
+        return HermesAdapter("hermes", root)
+
     def _template(self, *, structured_mode: str | None = None) -> HermesTemplate:
         hermes: dict[str, object] = {
             "model": {"provider": "openrouter", "default": "x/y"},
@@ -131,6 +141,79 @@ class FeishuProfileSecurityTests(unittest.TestCase):
             "platforms.feishu.extra.connection_mode",
         ):
             render_audit_profile_config(profile)
+
+    def test_runtime_rejects_ambient_passthrough_webhook_without_echoing_values(self) -> None:
+        sensitive_value = "ambient-sensitive-value"
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self._runtime_adapter(Path(tmp) / "hermes")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "ZEUS_ENV_PASSTHROUGH": "FEISHU_CONNECTION_MODE,PRIVATE_CONTEXT",
+                        "FEISHU_CONNECTION_MODE": "  WebHook\t",
+                        "PRIVATE_CONTEXT": sensitive_value,
+                    },
+                    clear=True,
+                ),
+                self.assertRaises(UnsupportedFeishuWebhookModeError) as raised,
+            ):
+                adapter.command("feishu-bot", "gateway", "run")
+
+        message = str(raised.exception)
+        self.assertIn("FEISHU_CONNECTION_MODE", message)
+        self.assertIn("WebSocket", message)
+        self.assertNotIn(sensitive_value, message)
+
+    def test_runtime_rejects_stored_profile_webhook_without_echoing_values(self) -> None:
+        sensitive_value = "stored-sensitive-value"
+        profile_env = dump_env(
+            ["FEISHU_CONNECTION_MODE", "PRIVATE_CONTEXT"],
+            {
+                "FEISHU_CONNECTION_MODE": "\nWEBHOOK  ",
+                "PRIVATE_CONTEXT": sensitive_value,
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self._runtime_adapter(Path(tmp) / "hermes", profile_env)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                self.assertRaises(UnsupportedFeishuWebhookModeError) as raised,
+            ):
+                adapter.command("feishu-bot", "gateway", "run")
+
+        message = str(raised.exception)
+        self.assertIn("FEISHU_CONNECTION_MODE", message)
+        self.assertIn("WebSocket", message)
+        self.assertNotIn(sensitive_value, message)
+
+    def test_runtime_preserves_allowed_websocket_modes(self) -> None:
+        ambient_mode = "  WebSocket\t"
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self._runtime_adapter(Path(tmp) / "ambient")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ZEUS_ENV_PASSTHROUGH": "FEISHU_CONNECTION_MODE",
+                    "FEISHU_CONNECTION_MODE": ambient_mode,
+                },
+                clear=True,
+            ):
+                _, environment = adapter.command("feishu-bot", "gateway", "run")
+        self.assertEqual(ambient_mode, environment["FEISHU_CONNECTION_MODE"])
+
+        stored_mode = "\tWEBSOCKET  "
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self._runtime_adapter(
+                Path(tmp) / "stored",
+                dump_env(
+                    ["FEISHU_CONNECTION_MODE"],
+                    {"FEISHU_CONNECTION_MODE": stored_mode},
+                ),
+            )
+            with mock.patch.dict(os.environ, {}, clear=True):
+                _, environment = adapter.command("feishu-bot", "gateway", "run")
+        self.assertEqual(stored_mode, environment["FEISHU_CONNECTION_MODE"])
 
 
 if __name__ == "__main__":

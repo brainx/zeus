@@ -12,7 +12,7 @@ def validate_hermes_profile_security(
     config: Mapping[str, Any],
     environment: Mapping[str, Any],
 ) -> None:
-    """Reject Hermes Feishu webhook mode at every Zeus profile render boundary."""
+    """Reject Hermes Feishu webhook mode at every Zeus-managed profile boundary."""
     if _is_webhook(environment.get("FEISHU_CONNECTION_MODE")):
         raise UnsupportedFeishuWebhookModeError(
             "Feishu webhook mode is unsupported with Hermes 0.20; remove "
