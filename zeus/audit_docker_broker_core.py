@@ -25,7 +25,7 @@ from zeus.private_io import (
     validate_private_directory,
 )
 
-HERMES_VERSION = "0.19.0"
+HERMES_VERSION = "0.20.0"
 
 _STATE_SCHEMA_VERSION = 1
 _STATE_FILE_NAME = "state.json"
@@ -382,6 +382,7 @@ def _decode_state(data: bytes) -> AuditDockerBrokerState:
         "hermes-agent": "1",
         "hermes-task-id": "default",
         "hermes-profile": profile_name,
+        "hermes-egress": "off",
     }
     container_labels = _strict_dict(value["container_labels"], "container labels")
     hermes_labels = _strict_dict(value["hermes_labels"], "terminal labels")
@@ -789,6 +790,7 @@ def install_audit_docker_broker(
             "hermes-agent": "1",
             "hermes-task-id": "default",
             "hermes-profile": prepared.profile_name,
+            "hermes-egress": "off",
         },
         phase="expect_version",
         deadline=sealed_deadline,

@@ -36,19 +36,21 @@ OTHER_CONTAINER_ID = "d" * 64
 
 def _bootstrap_script(session_id: str) -> str:
     snapshot = f"/tmp/hermes-snap-{session_id}.sh"
-    temporary = f"{snapshot}.tmp.$BASHPID"
+    temporary = f"{snapshot}.tmp.XXXXXXXXXX"
     marker = f"__HERMES_CWD_{session_id}__"
     return (
         "umask 077\n"
-        f"export -p > {temporary}\n"
+        f"__hermes_snap_tmp=$(mktemp {temporary}) || exit 1\n"
+        "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp"\n'
         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
-        f'[ -n "$__hermes_fns" ] && declare -f $__hermes_fns >> {temporary} '
+        '[ -n "$__hermes_fns" ] && declare -f $__hermes_fns >> "$__hermes_snap_tmp" '
         "2>/dev/null || true\n"
-        f"alias -p >> {temporary}\n"
-        f"echo 'shopt -s expand_aliases' >> {temporary}\n"
-        f"echo 'set +e' >> {temporary}\n"
-        f"echo 'set +u' >> {temporary}\n"
-        f"mv -f {temporary} {snapshot} || rm -f {temporary}\n"
+        'alias -p >> "$__hermes_snap_tmp"\n'
+        "echo 'shopt -s expand_aliases' >> \"$__hermes_snap_tmp\"\n"
+        "echo 'set +e' >> \"$__hermes_snap_tmp\"\n"
+        "echo 'set +u' >> \"$__hermes_snap_tmp\"\n"
+        f'mv -f "$__hermes_snap_tmp" {snapshot} || rm -f "$__hermes_snap_tmp"\n'
         "builtin cd -- /workspace 2>/dev/null || true\n"
         f"""printf '\\n{marker}%s{marker}\\n' "$(pwd -P)"\n"""
     )
@@ -264,7 +266,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 "--filter",
                 f"label=hermes-profile={PROFILE}",
                 "--format",
-                "{{.ID}}\t{{.State}}",
+                '{{.ID}}\t{{.State}}\t{{.Label "hermes-egress"}}',
                 runner=active,
             ).returncode,
         )
@@ -344,6 +346,15 @@ class AuditDockerBrokerTests(unittest.TestCase):
         self.assertEqual(CONTAINER_ID, state.container_id)
         self.assertEqual(IMAGE_ID, state.image_id)
         self.assertEqual(PROFILE, state.profile_name)
+        self.assertEqual(
+            {
+                "hermes-agent": "1",
+                "hermes-task-id": "default",
+                "hermes-profile": PROFILE,
+                "hermes-egress": "off",
+            },
+            state.hermes_labels,
+        )
 
     def test_storage_probe_is_optional_and_emulated_without_create_or_run(self) -> None:
         self._install()
@@ -433,7 +444,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 "--filter",
                 f"label=hermes-profile={PROFILE}",
                 "--format",
-                "{{.ID}}\t{{.State}}",
+                '{{.ID}}\t{{.State}}\t{{.Label "hermes-egress"}}',
             ),
             (
                 "inspect",
@@ -489,7 +500,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                             "--filter",
                             f"label=hermes-profile={PROFILE}",
                             "--format",
-                            "{{.ID}}\t{{.State}}",
+                            '{{.ID}}\t{{.State}}\t{{.Label "hermes-egress"}}',
                         ).returncode,
                     )
                 result = self._invoke(*arguments)
@@ -530,7 +541,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                     self.runner.calls[-1][0][1:],
                 )
 
-    def test_bootstrap_script_must_match_the_pinned_0190_shape(self) -> None:
+    def test_bootstrap_script_must_match_the_pinned_0200_shape(self) -> None:
         mutations = (
             _bootstrap_script("0123456789ab").replace("/workspace", "/root"),
             _bootstrap_script("0123456789ab").replace("umask 077", "umask 022"),
@@ -583,7 +594,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                         "--filter",
                         f"label=hermes-profile={PROFILE}",
                         "--format",
-                        "{{.ID}}\t{{.State}}",
+                        '{{.ID}}\t{{.State}}\t{{.Label "hermes-egress"}}',
                     ).returncode,
                 )
                 self.assertEqual(
@@ -763,7 +774,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 "--filter",
                 f"label=hermes-profile={PROFILE}",
                 "--format",
-                "{{.ID}}\t{{.State}}",
+                '{{.ID}}\t{{.State}}\t{{.Label "hermes-egress"}}',
             )
             self.assertEqual(126, reordered.returncode)
         finally:
@@ -868,7 +879,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                             "--filter",
                             f"label=hermes-profile={PROFILE}",
                             "--format",
-                            "{{.ID}}\t{{.State}}",
+                            '{{.ID}}\t{{.State}}\t{{.Label "hermes-egress"}}',
                         ).returncode,
                     )
                 self.assertEqual(126, self._invoke(*target).returncode)

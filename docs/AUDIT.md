@@ -13,7 +13,7 @@ one command from a Git worktree, Zeus analyzes the committed `HEAD` in an
 isolated disposable environment, and Zeus stores a bounded report under its
 existing state directory.
 
-The audit runner accepts only Hermes Agent 0.19.0 and a preloaded,
+The audit runner accepts only Hermes Agent 0.20.0 and a preloaded,
 digest-qualified Docker image.
 
 The first version is intentionally narrow:

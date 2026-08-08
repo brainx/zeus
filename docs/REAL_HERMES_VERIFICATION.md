@@ -2,15 +2,20 @@
 
 The normal test suite uses a fake Hermes executable so the repository can be
 tested without external credentials or a Hermes install. CI separately installs
-the fully hash-locked Hermes Agent 0.19.0 environment from
-`requirements-hermes-ci.txt` on Ubuntu/Python 3.11. The lock contains Linux
-x86_64 and arm64 wheel hashes and overrides Hermes' vulnerable cryptography and
-Pillow metadata pins with their first patched releases. It also carries reviewed
-FastAPI, Requests, Rich, and tqdm updates while retaining Pydantic's exact
-pydantic-core pin. CI installs the complete lock with dependency resolution
-disabled, then permits only the four exact Hermes metadata conflicts introduced
-by the security and maintenance overrides. The gateway compatibility test must
-pass in that environment. The gate does not run the remote installer or make a
+the fully hash-locked Hermes Agent 0.20.0 environment from
+`requirements-hermes-ci.txt` on Ubuntu/Python 3.11. CI verifies and installs the
+official signed `v2026.8.3` source archive at commit
+`3c27eb6234bf91b8ceee9e9071591b31e9b148cb`, with archive SHA-256
+`370542c7219faba6300905c3b419e14e6508a31ac698a1a5174e0386990834be`.
+The lock contains the complete Linux x86_64 runtime and build closure and uses
+the reviewed `cryptography==50.0.0`, Requests, and Rich overrides while
+retaining upstream-compatible Pillow, FastAPI, pydantic-core, and tqdm pins. CI
+installs the lock with dependency resolution disabled, then permits only the
+three exact Hermes metadata conflicts introduced by the reviewed overrides.
+The verified archive is retained as an editable source checkout because Hermes
+0.20 rejects non-Nix wheel builds and requires its source-layout runtime assets.
+Both gateway compatibility and the sealed audit-broker transcript must pass in
+that environment. The gate does not run the remote installer or make a
 model-provider request.
 
 Before a release, verify against a real Hermes install:
@@ -57,7 +62,7 @@ ZEUS_VERIFY_BOT_ID=my-check-bot
 ZEUS_VERIFY_TEMPLATE=research-bot
 ZEUS_VERIFY_STATE_DIR=.zeus-real-hermes-check
 ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence
-ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0
+ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0
 ZEUS_VERIFY_API_KEY=real-hermes-local-check
 ZEUS_VERIFY_API_SERVER_HOST=127.0.0.1
 ZEUS_VERIFY_API_SERVER_PORT=4312

@@ -29,14 +29,14 @@ CONTAINER_ID = "c" * 64
 
 def _installed_pinned_hermes() -> bool:
     try:
-        return importlib.metadata.version("hermes-agent") == "0.19.0"
+        return importlib.metadata.version("hermes-agent") == "0.20.0"
     except importlib.metadata.PackageNotFoundError:
         return False
 
 
 @unittest.skipUnless(
     _installed_pinned_hermes(),
-    "requires installed hermes-agent==0.19.0",
+    "requires installed hermes-agent==0.20.0",
 )
 class PinnedHermesAuditBrokerTests(unittest.TestCase):
     def test_pinned_backend_completes_the_sealed_broker_protocol(self) -> None:
@@ -167,6 +167,7 @@ class PinnedHermesAuditBrokerTests(unittest.TestCase):
             self.assertEqual(1, state.terminal_calls)
             self.assertFalse(state.limit_breach)
             self.assertEqual("complete", state.cleanup_state)
+            self.assertEqual("off", state.hermes_labels["hermes-egress"])
 
             real_calls = [
                 json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()

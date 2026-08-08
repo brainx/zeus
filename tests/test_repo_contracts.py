@@ -211,6 +211,7 @@ class RepoContractTests(unittest.TestCase):
             "systemd/zeus-reconcile.timer",
             "scripts/repo_check.sh",
             "scripts/check_hermes_dependency_overrides.py",
+            "scripts/install_pinned_hermes.sh",
             "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
@@ -303,12 +304,14 @@ class RepoContractTests(unittest.TestCase):
                 ".tmp/real-hermes-evidence/summary.txt",
                 "python -m pip install --no-deps --require-hashes --only-binary=:all: "
                 "-r requirements-hermes-ci.txt",
+                "sh scripts/install_pinned_hermes.sh",
                 "python -m pip install -e .",
                 "python scripts/check_hermes_dependency_overrides.py",
                 "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
-                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \\\n"
+                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \\\n"
                 "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
                 "sh scripts/verify_real_hermes.sh",
+                "python -m unittest -v tests.test_pinned_hermes_audit_broker",
             ),
             "package": (
                 "python -m pip install -e . -r requirements-dev-ci.txt",
@@ -689,7 +692,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("zeus audit run", run_docs)
         for prerequisite in (
             "Docker",
-            "Hermes Agent 0.19.0",
+            "Hermes Agent 0.20.0",
             "provider credentials",
             "preloaded",
         ):
@@ -716,7 +719,7 @@ class RepoContractTests(unittest.TestCase):
         for text in (readme, security, audit, architecture, operations, compatibility, roadmap):
             with self.subTest(document=text[:24]):
                 self.assertIn("committed `HEAD`", text)
-                self.assertIn("Hermes Agent 0.19.0", text)
+                self.assertIn("Hermes Agent 0.20.0", text)
                 self.assertIn("cross-host", text)
 
         self.assertIn("preloaded", readme)
@@ -899,9 +902,10 @@ class RepoContractTests(unittest.TestCase):
                 (
                     "Linux `ubuntu-24.04`",
                     "Python 3.11",
-                    "Hash-locked Hermes Agent 0.19.0 profile rendering, strict diagnostics, "
-                    "loopback gateway readiness, process ownership, and clean shutdown "
-                    "without a model-provider credential",
+                    "Hash-locked Hermes Agent 0.20.0 source install, profile rendering, "
+                    "strict diagnostics, sealed audit-broker transcript, loopback gateway "
+                    "readiness, process ownership, and clean shutdown without a "
+                    "model-provider credential",
                 ),
             ),
             "package": (
@@ -947,8 +951,10 @@ class RepoContractTests(unittest.TestCase):
         )
         self.assertIn("lifecycle and package jobs use Python 3.11", compatibility_text)
         self.assertIn("Debian and Ubuntu", compatibility_text)
-        self.assertIn("Hermes Agent 0.19.0", compatibility_text)
-        self.assertIn("complete 60-package wheel closure", compatibility_text)
+        self.assertIn("Hermes Agent 0.20.0", compatibility_text)
+        self.assertIn(
+            "complete 61-package Linux x86_64 runtime and build closure", compatibility_text
+        )
         self.assertIn("no model-provider credential", compatibility_text)
         self.assertIn("whichever `hermes` executable is installed", compatibility_text)
         self.assertIn("Python 3.14", compatibility_text)
@@ -1079,24 +1085,55 @@ class RepoContractTests(unittest.TestCase):
         )
         hashes = re.findall(r"(?m)^    --hash=sha256:([0-9a-f]{64})(?: \\)?$", requirements)
 
-        self.assertEqual(60, len(entries))
-        self.assertEqual(60, len({name for name, _version in entries}))
+        self.assertEqual(61, len(entries))
+        self.assertEqual(61, len({name for name, _version in entries}))
         self.assertGreaterEqual(len(hashes), len(entries))
-        self.assertIn(("hermes-agent", "0.19.0"), entries)
-        self.assertIn(("cryptography", "48.0.1"), entries)
+        self.assertNotIn("hermes-agent", {name for name, _version in entries})
+        self.assertIn(("cryptography", "50.0.0"), entries)
         self.assertIn(("fastapi", "0.140.0"), entries)
         self.assertIn(("pillow", "12.3.0"), entries)
+        self.assertIn(("nemo-relay", "0.6.0"), entries)
         self.assertIn(("pydantic-core", "2.46.4"), entries)
         self.assertIn(("requests", "2.34.2"), entries)
         self.assertIn(("rich", "15.0.0"), entries)
+        self.assertIn(("setuptools", "83.0.0"), entries)
         self.assertIn(("tqdm", "4.69.1"), entries)
         self.assertIn(
-            "bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f",
+            "b42a28c1844fd9de8f3f7d540e36b66f3a9c83fceac7170ebc7a6a19edd9dcae",
+            hashes,
+        )
+        self.assertIn(
+            "849daa9e45158ac581e54506e0fcc7a24f557d1ed06dbdc074f5de7a00393cbc",
+            hashes,
+        )
+        self.assertIn(
+            "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3",
             hashes,
         )
         self.assertIn("REVIEWED OVERRIDES", requirements)
+        self.assertIn("v2026.8.3", requirements)
+        self.assertIn("3c27eb6234bf91b8ceee9e9071591b31e9b148cb", requirements)
         self.assertNotIn("--index-url", requirements)
         self.assertNotIn("git+", requirements)
+
+    def test_real_hermes_source_installer_verifies_official_release_before_install(self) -> None:
+        script = Path("scripts/install_pinned_hermes.sh").read_text(encoding="utf-8")
+
+        self.assertIn("v2026.8.3", script)
+        self.assertIn("7de39e700d2c329e15d32eb0b96e2f7cdd9fbdb2", script)
+        self.assertIn("3c27eb6234bf91b8ceee9e9071591b31e9b148cb", script)
+        self.assertIn("370542c7219faba6300905c3b419e14e6508a31ac698a1a5174e0386990834be", script)
+        self.assertIn(
+            "https://codeload.github.com/NousResearch/hermes-agent/tar.gz/refs/tags/",
+            script,
+        )
+        digest_check = script.index("sha256sum")
+        install = script.index("pip install")
+        self.assertLess(digest_check, install)
+        self.assertIn("--no-deps", script[install:])
+        self.assertIn("--no-build-isolation", script[install:])
+        self.assertIn("--editable", script[install:])
+        self.assertIn("--strip-components=1", script)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")

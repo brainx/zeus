@@ -509,7 +509,7 @@ zeus audit doctor
 
 Every audit command discovers the containing Git repository and state context.
 `audit doctor` is the non-mutating readiness preflight: it reports the selected
-provider and model and whether Docker, the exact Hermes Agent 0.19.0 executable,
+provider and model and whether Docker, the exact Hermes Agent 0.20.0 executable,
 configured credentials, and the preloaded digest-qualified image are ready. It
 does not create a run or download dependencies. A run requires an explicit
 lowercase provider, model, and one or more provider-prefixed names from the

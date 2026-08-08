@@ -9,12 +9,14 @@
   1,200-line production-module size ratchet.
 - Added a built-in Kimi K3 Hermes template with an optional compatible endpoint
   override and an explicit, private `zeus audit init` Kimi K3 configuration.
-- Replaced the vulnerable cryptography and Pillow pins in the hash-locked Hermes
-  Agent 0.19.0 CI environment with their first patched releases while retaining
-  an exact, verified compatibility override for upstream metadata.
-- Integrated the current FastAPI, Requests, Rich, and tqdm updates into the
-  real-Hermes compatibility lock with fail-closed validation for the exact
-  upstream metadata conflicts.
+- Migrated the pinned real-Hermes baseline to Hermes Agent 0.20.0 and its
+  egress-aware Docker reuse and session-snapshot transcript.
+- Replaced the retired package distribution with the official signed
+  `v2026.8.3` source tag, pinned commit, and verified source-archive checksum.
+- Closed the Hermes compression-authority advisory by adopting the upstream
+  0.20 fix in the verified audit compatibility baseline.
+- Upgraded the reviewed cryptography override to 50.0.0 and retained
+  fail-closed validation for the exact Requests and Rich metadata conflicts.
 - Expanded project acknowledgements with official Hermes Agent and Nous
   Research attribution and links.
 

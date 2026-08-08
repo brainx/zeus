@@ -13,8 +13,9 @@ make check
 
 See the [compatibility policy](docs/COMPATIBILITY.md) for the operating systems,
 Python versions, and Hermes boundary covered by committed automation. The
-committed Ubuntu/Python 3.11 gate uses the hash-locked Hermes Agent 0.19.0
-environment; the manual check below covers the operator's installed version.
+committed Ubuntu/Python 3.11 gate uses the hash-locked Hermes Agent 0.20.0
+environment installed from its verified official source release; the manual
+check below covers the operator's installed version.
 
 ## Quality Bar
 

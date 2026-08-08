@@ -95,7 +95,7 @@ class AuditServiceContractTests(unittest.TestCase):
             mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
             mock.patch(
                 "zeus.audit_doctor._pinned_hermes_version",
-                return_value=(True, "version 0.19.0"),
+                return_value=(True, "version 0.20.0"),
             ),
             mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
             mock.patch(
@@ -874,7 +874,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
                 mock.patch(
@@ -1245,7 +1245,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
             ):
@@ -1298,7 +1298,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
             ):
@@ -1357,7 +1357,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
             ):
@@ -1411,7 +1411,7 @@ class AuditServiceContractTests(unittest.TestCase):
                     mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                     mock.patch(
                         "zeus.audit_doctor._pinned_hermes_version",
-                        return_value=(True, "version 0.19.0"),
+                        return_value=(True, "version 0.20.0"),
                     ),
                     mock.patch(
                         "zeus.audit_doctor._broker_isolation_supported",
@@ -1488,7 +1488,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
             ):
@@ -1562,7 +1562,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
             ):
@@ -1625,7 +1625,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
             ):
@@ -1677,7 +1677,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
                 mock.patch(
@@ -1729,7 +1729,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
                 mock.patch(
@@ -1780,7 +1780,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
                 mock.patch(
@@ -1837,7 +1837,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 mock.patch("zeus.audit_doctor._command", return_value=(True, "available")),
                 mock.patch(
                     "zeus.audit_doctor._pinned_hermes_version",
-                    return_value=(True, "version 0.19.0"),
+                    return_value=(True, "version 0.20.0"),
                 ),
                 mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
                 mock.patch(
