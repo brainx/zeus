@@ -31,5 +31,11 @@ tar --extract --gzip --file "$archive_path" --directory "$source_directory" \
     --strip-components=1
 test -f "$source_directory/pyproject.toml"
 python -m pip install --no-deps --no-build-isolation --editable "$source_directory"
-python -c \
-    'import importlib.metadata as m; expected = "0.20.0"; actual = m.version("hermes-agent"); assert actual == expected, f"expected Hermes Agent {expected}, found {actual}"'
+python -c '
+import importlib.metadata as m
+
+expected = "0.20.0"
+actual = m.version("hermes-agent")
+if actual != expected:
+    raise SystemExit(f"expected Hermes Agent {expected}, found {actual}")
+'

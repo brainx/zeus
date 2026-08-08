@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import tomllib
@@ -1134,6 +1135,61 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("--no-build-isolation", script[install:])
         self.assertIn("--editable", script[install:])
         self.assertIn("--strip-components=1", script)
+
+    def test_real_hermes_source_installer_rejects_wrong_metadata_under_optimization(
+        self,
+    ) -> None:
+        installer = Path("scripts/install_pinned_hermes.sh").resolve()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bin_directory = root / "bin"
+            site_directory = root / "site"
+            metadata_directory = site_directory / "hermes_agent-99.0.0.dist-info"
+            bin_directory.mkdir()
+            metadata_directory.mkdir(parents=True)
+            (metadata_directory / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: hermes-agent\nVersion: 99.0.0\n",
+                encoding="utf-8",
+            )
+
+            commands = {
+                "curl": "#!/bin/sh\nexit 0\n",
+                "sha256sum": "#!/bin/sh\nexit 0\n",
+                "tar": ("#!/bin/sh\n: > .tmp/hermes-agent-v2026.8.3/pyproject.toml\n"),
+                "python": (
+                    "#!/bin/sh\n"
+                    'if [ "${1-}" = "-m" ] && [ "${2-}" = "pip" ]; then exit 0; fi\n'
+                    'exec "$REAL_PYTHON" -O "$@"\n'
+                ),
+            }
+            for name, source in commands.items():
+                executable = bin_directory / name
+                executable.write_text(source, encoding="utf-8")
+                executable.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": str(bin_directory) + os.pathsep + environment.get("PATH", ""),
+                    "PYTHONPATH": str(site_directory),
+                    "REAL_PYTHON": os.fsdecode(sys.executable),
+                }
+            )
+            shell = shutil.which("sh", path=environment["PATH"])
+            if shell is None:
+                self.fail("POSIX sh is required for the shell contract")
+            result = subprocess.run(
+                [shell, str(installer)],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("expected Hermes Agent 0.20.0, found 99.0.0", result.stderr)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")
