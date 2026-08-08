@@ -470,7 +470,7 @@ def _decode_state(data: bytes) -> AuditDockerBrokerState:
         _error("audit Docker broker cleanup lease is inconsistent")
     if phase == "remove_inflight" and cleanup_state != "running":
         _error("audit Docker broker removal state is inconsistent")
-    if phase == "closed" and cleanup_state != "complete":
+    if phase == "closed" and (cleanup_state != "complete" or active or reserved):
         _error("audit Docker broker closed state is inconsistent")
 
     return AuditDockerBrokerState(

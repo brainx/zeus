@@ -356,6 +356,96 @@ class AuditDockerBrokerTests(unittest.TestCase):
             state.hermes_labels,
         )
 
+    def test_protocol_removal_refuses_each_outstanding_terminal_signal(self) -> None:
+        self._install()
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        terminal = replace(
+            state,
+            phase="terminal",
+            bootstrap_complete=True,
+            session_id="0123456789ab",
+        )
+        scenarios = {
+            "active call": replace(terminal, active_terminal_calls=1),
+            "output reservation": replace(
+                terminal,
+                aggregate_reserved_output_bytes=terminal.per_call_reserved_output_bytes,
+            ),
+        }
+
+        for name, pending in scenarios.items():
+            for timing, now in (
+                ("within deadline", time.monotonic()),
+                ("after deadline", pending.deadline + 1),
+            ):
+                with self.subTest(name=name, timing=timing):
+                    decision = audit_docker_broker._decide(
+                        pending,
+                        ("rm", "-f", CONTAINER_ID),
+                        now,
+                    )
+                    self.assertEqual("refuse", decision.kind)
+                    self.assertEqual(pending, decision.state)
+
+    def test_concurrent_removal_waits_for_terminal_reservation_release(self) -> None:
+        runner = BlockingDockerRunner()
+        self._install(runner=runner)
+        self._advance_to_terminal(runner=runner)
+        result: list[BrokerCommandResult] = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                self._invoke(
+                    "exec",
+                    CONTAINER_ID,
+                    "bash",
+                    "-c",
+                    "first",
+                    runner=runner,
+                )
+            )
+        )
+        worker.start()
+        self.assertTrue(runner.started.wait(timeout=2))
+        try:
+            refused = self._invoke("rm", "-f", CONTAINER_ID, runner=runner)
+            self.assertEqual(126, refused.returncode)
+            self.assertNotIn(
+                ("rm", "-f", CONTAINER_ID),
+                [call[0][1:] for call in runner.calls],
+            )
+            pending = read_audit_docker_broker_state(self.prepared.state_path)
+            self.assertEqual(1, pending.active_terminal_calls)
+            self.assertEqual(
+                pending.per_call_reserved_output_bytes,
+                pending.aggregate_reserved_output_bytes,
+            )
+        finally:
+            runner.release.set()
+            worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(0, result[0].returncode)
+
+        removed = self._invoke("rm", "-f", CONTAINER_ID, runner=runner)
+        self.assertEqual(0, removed.returncode)
+        self.assertEqual(
+            1,
+            [call[0][1:] for call in runner.calls].count(("rm", "-f", CONTAINER_ID)),
+        )
+
+    def test_closed_state_rejects_outstanding_terminal_work(self) -> None:
+        self._install()
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        invalid = replace(
+            state,
+            phase="closed",
+            cleanup_state="complete",
+            active_terminal_calls=1,
+            aggregate_reserved_output_bytes=state.per_call_reserved_output_bytes,
+        )
+
+        with self.assertRaises(AuditDockerBrokerError):
+            audit_docker_broker._decode_state(audit_docker_broker._state_bytes(invalid))
+
     def test_storage_probe_is_optional_and_emulated_without_create_or_run(self) -> None:
         self._install()
         self.assertEqual(0, self._invoke("version").returncode)

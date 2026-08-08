@@ -157,6 +157,12 @@ def _decide(
         return _Decision("refuse", state)
     if state.cleanup_state == "running":
         return _Decision("refuse", state)
+    if (
+        state.phase == "terminal"
+        and arguments == _expected_removal(state)
+        and (state.active_terminal_calls or state.aggregate_reserved_output_bytes)
+    ):
+        return _Decision("refuse", state)
     if now >= state.deadline:
         return _Decision("breach", _breached(state, "overall deadline"))
     if not _arguments_are_bounded(arguments):

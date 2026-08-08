@@ -20,6 +20,8 @@
 - Blocked Feishu webhook mode at every Zeus-managed profile render boundary for
   environment and structured configuration while preserving WebSocket mode,
   because Hermes 0.20 remains affected by `GHSA-pmqc-57g8-c22c` in webhook mode.
+- Hardened the schema-v1 audit Docker broker against container removal while
+  terminal calls or output reservations remain outstanding.
 - Expanded project acknowledgements with official Hermes Agent and Nous
   Research attribution and links.
 
