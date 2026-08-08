@@ -9,6 +9,10 @@ from importlib.resources import files
 from typing import Any
 
 from zeus.audit_models import AuditConfig
+from zeus.hermes_security import (
+    UnsupportedFeishuWebhookModeError,
+    validate_hermes_profile_security,
+)
 
 AUDIT_SKILL_VERSION = "1.0.0"
 MAX_AUDIT_SKILL_BYTES = 16 * 1024
@@ -129,6 +133,10 @@ def render_audit_profile_config(profile: AuditProfile) -> bytes:
     """Render the sealed audit Hermes settings without using normal bot profiles."""
     if not isinstance(profile, AuditProfile):
         raise AuditProfileError("audit profile is invalid")
+    try:
+        validate_hermes_profile_security(profile.hermes, profile.forwarded_env)
+    except UnsupportedFeishuWebhookModeError as exc:
+        raise AuditProfileError(str(exc)) from exc
     rendered = _yaml(profile.hermes).encode("utf-8", errors="strict")
     if len(rendered) > MAX_AUDIT_PROFILE_CONFIG_BYTES:
         raise AuditProfileError("audit profile configuration exceeds its byte limit")

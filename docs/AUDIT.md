@@ -560,7 +560,8 @@ The feature is additive and host-local:
 - Existing HTTP routes and OpenAPI remain unchanged.
 - SQLite schema version 6 and `StateStore` remain unchanged.
 - Hermes bot profiles, template schema, renderer behavior, and lifecycle
-  ordering remain unchanged.
+  ordering remain unchanged except for the fail-closed Feishu webhook
+  restriction documented in the compatibility policy.
 - Runtime Python dependencies remain standard-library only.
 - Git repository discovery applies to every audit command. The supported Hermes
   release, Docker, configured provider credentials, and a preloaded immutable
@@ -572,6 +573,13 @@ The feature is additive and host-local:
   profile environments, permits generic passthrough, and buffers unbounded
   output. Audit subprocess construction has its own strict environment and
   streaming limits.
+
+The sealed audit profile disables messaging and has no operator-controlled
+Feishu settings. Its private renderer nevertheless applies the same centralized
+guard as normal bot profiles, so an injected
+`platforms.feishu.extra.connection_mode: webhook` value cannot cross that
+Zeus-managed boundary. Feishu WebSocket mode and absent Feishu configuration
+remain allowed; see [Compatibility](COMPATIBILITY.md#hermes-boundary).
 
 The first implementation supports the same POSIX environments as Zeus's private
 state protections. Provider-backed end-to-end verification remains an explicit

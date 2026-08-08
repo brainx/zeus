@@ -17,6 +17,9 @@
   0.20 fix in the verified audit compatibility baseline.
 - Upgraded the reviewed cryptography override to 50.0.0 and retained
   fail-closed validation for the exact Requests and Rich metadata conflicts.
+- Blocked Feishu webhook mode at every Zeus-managed profile render boundary for
+  environment and structured configuration while preserving WebSocket mode,
+  because Hermes 0.20 remains affected by `GHSA-pmqc-57g8-c22c` in webhook mode.
 - Expanded project acknowledgements with official Hermes Agent and Nous
   Research attribution and links.
 

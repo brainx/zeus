@@ -429,6 +429,16 @@ ZEUS_ENV_PASSTHROUGH=HTTP_PROXY,HTTPS_PROXY,NO_PROXY
 
 Keep the allowlist empty unless the Hermes process needs those values.
 
+### Feishu connection mode
+
+Hermes Agent 0.20.0 must use Feishu WebSocket mode under Zeus. Do not configure
+Feishu webhook mode while `GHSA-pmqc-57g8-c22c` remains unfixed in the pinned
+Hermes baseline. Profile preflight rejects both
+`FEISHU_CONNECTION_MODE=webhook` and
+`platforms.feishu.extra.connection_mode: webhook`, case-insensitively after
+trimming whitespace. Use `WebSocket` or omit the setting. Zeus preserves allowed
+values exactly and rejection messages do not print environment values.
+
 ## Restart Policy
 
 The sample systemd unit restarts the Zeus API with `Restart=on-failure` and `RestartSec=5s`. Bot gateway processes are supervised by Zeus itself; use `zeus bot restart <bot-id>` for a controlled stop, ownership check, and clean start.

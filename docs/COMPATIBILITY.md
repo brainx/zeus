@@ -95,6 +95,16 @@ check still uses whichever `hermes` executable is installed on `PATH` unless
 evidence. Passing the pinned baseline does not establish compatibility with every
 Hermes release or optional integration.
 
+Hermes Agent 0.20.0 remains affected by `GHSA-pmqc-57g8-c22c` when Feishu uses
+webhook connection mode. Zeus therefore supports Feishu WebSocket mode only for
+this baseline. Every Zeus-managed profile renderer rejects either
+`FEISHU_CONNECTION_MODE=webhook` or
+`platforms.feishu.extra.connection_mode: webhook`, comparing the value
+case-insensitively after trimming whitespace. Absent values and WebSocket values
+remain supported and are rendered unchanged. Remove the setting or select
+WebSocket before creating or replacing a profile; the restriction can be
+revisited only after the pinned upstream baseline contains a reviewed fix.
+
 ## Repository audit boundary
 
 Every audit command discovers a Git repository and its Zeus state context.
