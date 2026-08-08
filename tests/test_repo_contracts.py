@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -924,10 +925,10 @@ class RepoContractTests(unittest.TestCase):
             "release:build": (
                 release_jobs["build"],
                 "Tagged release build",
-                "ubuntu-latest",
+                "ubuntu-24.04",
                 ("3.11",),
                 (
-                    "Linux `ubuntu-latest`",
+                    "Linux `ubuntu-24.04`",
                     "Python 3.11",
                     "Full release gate, artifact checksums, and GitHub release artifacts",
                 ),
@@ -1356,6 +1357,7 @@ class RepoContractTests(unittest.TestCase):
         release_docs = Path("docs/RELEASE.md").read_text(encoding="utf-8")
         workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
         wheel_smoke = Path("scripts/wheel_smoke.sh").read_text(encoding="utf-8")
+        jobs = _workflow_job_bodies(workflow)
 
         self.assertIn("sh scripts/test.sh", release_docs)
         self.assertIn("sh scripts/repo_check.sh", release_docs)
@@ -1365,6 +1367,12 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("python -m build", release_docs)
         self.assertIn("twine check dist/*", release_docs)
         self.assertIn("SHA256SUMS.txt", release_docs)
+        self.assertIn("gh auth status", release_docs)
+        self.assertIn("gh api --paginate --method GET", release_docs)
+        self.assertIn("dependabot/alerts?state=open&per_page=100", release_docs)
+        self.assertIn("release-relevant", release_docs)
+        self.assertIn("Before tagging, fix every", release_docs)
+        self.assertIn("documented mitigation", release_docs)
         self.assertIn("tags:", workflow)
         self.assertIn('"v*.*.*"', workflow)
         self.assertIn("make release-check", workflow)
@@ -1385,6 +1393,11 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("actions/upload-artifact@", workflow)
         self.assertIn("actions/download-artifact@", workflow)
         self.assertIn("cd dist && sha256sum -c SHA256SUMS.txt", workflow)
+        self.assertEqual({"build", "publish"}, set(jobs))
+        self.assertEqual("ubuntu-24.04", _job_level_scalar(jobs["build"], "runs-on"))
+        self.assertEqual("20", _job_level_scalar(jobs["build"], "timeout-minutes"))
+        self.assertEqual("ubuntu-24.04", _job_level_scalar(jobs["publish"], "runs-on"))
+        self.assertEqual("10", _job_level_scalar(jobs["publish"], "timeout-minutes"))
         self.assertIn("annotated version tags", release_docs)
         self.assertIn("GitHub-verified annotated tag", release_docs)
         self.assertIn("v0.3.0 release predates", release_docs)
@@ -1392,6 +1405,32 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn('build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"', wheel_smoke)
         self.assertIn('fail "ZEUS_WHEEL_SMOKE_BUILD must be 0 or 1"', wheel_smoke)
         self.assertIn('fail "expected exactly one wheel in dist/"', wheel_smoke)
+
+    def test_hero_image_is_optimized_and_metadata_free(self) -> None:
+        hero = Path("docs/assets/zeus-hero.png").read_bytes()
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn('src="docs/assets/zeus-hero.png"', readme)
+        self.assertIn('alt="Zeus: many Hermes bots, one local supervisor"', readme)
+        self.assertTrue(hero.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertLess(len(hero), 200 * 1024)
+
+        offset = 8
+        chunks: list[tuple[bytes, bytes]] = []
+        while offset < len(hero):
+            self.assertGreaterEqual(len(hero) - offset, 12)
+            length = struct.unpack(">I", hero[offset : offset + 4])[0]
+            chunk_type = hero[offset + 4 : offset + 8]
+            chunk_end = offset + 12 + length
+            self.assertLessEqual(chunk_end, len(hero))
+            chunks.append((chunk_type, hero[offset + 8 : offset + 8 + length]))
+            offset = chunk_end
+
+        self.assertEqual(len(hero), offset)
+        self.assertEqual(b"IHDR", chunks[0][0])
+        self.assertEqual((1800, 720), struct.unpack(">II", chunks[0][1][:8]))
+        self.assertEqual(b"IEND", chunks[-1][0])
+        self.assertTrue(all(chunk_type[0] & 0x20 == 0 for chunk_type, _ in chunks))
 
     def test_makefile_has_release_check_target(self) -> None:
         makefile = Path("Makefile").read_text(encoding="utf-8")

@@ -14,15 +14,15 @@ an untested platform or external Hermes release into a support claim.
 | macOS process lifecycle | macOS `macos-26` | Python 3.13 | Focused process, fake-Hermes integration, and gateway-launcher recovery tests |
 | Real Hermes compatibility | Linux `ubuntu-24.04` | Python 3.11 | Hash-locked Hermes Agent 0.20.0 source install, profile rendering, strict diagnostics, sealed audit-broker transcript, loopback gateway readiness, process ownership, and clean shutdown without a model-provider credential |
 | Package build | Linux `ubuntu-24.04` | Python 3.11 | Wheel and source build, installed-wheel smoke test, dependency consistency, and metadata checks |
-| Tagged release build | Linux `ubuntu-latest` | Python 3.11 | Full release gate, artifact checksums, and GitHub release artifacts |
+| Tagged release build | Linux `ubuntu-24.04` | Python 3.11 | Full release gate, artifact checksums, and GitHub release artifacts |
 
 In short, the focused Linux lifecycle and package jobs use Python 3.11. Main CI
-uses the explicit `ubuntu-24.04` image, while the separate tagged-release
-workflow still uses `ubuntu-latest`. The focused macOS lane uses `macos-26` and
-Python 3.13. Windows is not currently automated. GitHub manages the contents of
-all hosted runner images and may update them over time; results from an
-individual developer machine remain local evidence rather than an automated
-platform guarantee.
+and both tagged-release jobs use the explicit `ubuntu-24.04` image. The release
+build is bounded to 20 minutes and the privileged publish job to 10 minutes.
+The focused macOS lane uses `macos-26` and Python 3.13. Windows is not currently
+automated. GitHub manages the contents of all hosted runner images and may update
+them over time; results from an individual developer machine remain local evidence
+rather than an automated platform guarantee.
 
 Python 3.14 is a provisional Zeus-only lane with `continue-on-error` behavior.
 It does not promote Python 3.14 to required Hermes compatibility: the repository

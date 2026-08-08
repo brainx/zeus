@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/zeus-hero.png" alt="Zeus Hermes Orchestrator" width="900">
+  <img src="docs/assets/zeus-hero.png" alt="Zeus: many Hermes bots, one local supervisor" width="900">
 </p>
 
 # Zeus Hermes Orchestrator

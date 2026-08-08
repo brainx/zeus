@@ -59,7 +59,27 @@ historical v0.3.0 release predates this policy and remains unchanged.
    sh scripts/generate_checksums.sh dist
    ```
 
-4. Confirm the release commit is signed and GitHub-verified, then create and push
+4. Before creating a tag, inspect Dependabot alerts through an authenticated
+   GitHub CLI session:
+
+   ```bash
+   gh auth status
+   gh api --paginate --method GET \
+     -H "Accept: application/vnd.github+json" \
+     "repos/brainx/zeus/dependabot/alerts?state=open&per_page=100" \
+     --jq '.[] | {number, dependency: .dependency.package.name, manifest: .dependency.manifest_path, severity: .security_advisory.severity, summary: .security_advisory.summary}'
+   ```
+
+   These commands use the existing authenticated session and do not print its
+   credential; do not run `gh auth token` or echo an access token. Treat every
+   open alert affecting a runtime, development/release, build, CI, or GitHub
+   Actions dependency as release-relevant. Before tagging, fix every
+   release-relevant alert or record an explicit mitigation in the release PR:
+   the alert number, affected dependency and exposure, compensating control,
+   owner, and a review or removal deadline. Tagging is blocked while a
+   release-relevant open alert lacks that documented mitigation.
+
+5. Confirm the release commit is signed and GitHub-verified, then create and push
    a signed annotated tag:
 
    ```bash
@@ -72,7 +92,7 @@ historical v0.3.0 release predates this policy and remains unchanged.
    report both the tag and commit verification objects as `verified` with reason
    `valid`. Configure the signing identity with GitHub before pushing the tag.
 
-5. Confirm the GitHub release workflow completed and attached the generated
+6. Confirm the GitHub release workflow completed and attached the generated
    `dist/*` artifacts plus `dist/SHA256SUMS.txt` to the GitHub Release.
 
 ## GitHub Release Workflow
@@ -83,7 +103,9 @@ historical v0.3.0 release predates this policy and remains unchanged.
 to require a GitHub-verified annotated tag and referenced commit. The checker
 binds the tag target to the workflow's `GITHUB_SHA`, reads `GITHUB_TOKEN` only
 from the environment, rejects redirects and malformed responses, and never logs
-the token or raw response bodies. Its read-only build job runs
+the token or raw response bodies. Both jobs use the explicit `ubuntu-24.04`
+runner; the read-only build job is bounded to 20 minutes and the privileged
+publish job to 10 minutes. The build job runs
 `make release-check`, including tests, source-and-branch coverage, repository
 contracts, formatting, lint, type checks, Bandit, ShellCheck, package build,
 wheel smoke verification, metadata checks, and checksum generation. Only after
