@@ -1003,7 +1003,7 @@ class AuditContainerRuntime:
                     str(AUDIT_GID),
                     str(AUDIT_UID),
                     str(AUDIT_GID),
-                    "[]",
+                    f"[{AUDIT_GID}]",
                     "/proc/self/status",
                     ".",
                 ),

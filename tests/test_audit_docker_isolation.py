@@ -77,6 +77,7 @@ class RealDockerAuditIsolationTests(unittest.TestCase):
 import os, pathlib, socket, stat, sys
 workspace = pathlib.Path("/workspace")
 committed = workspace / "committed.txt"
+assert os.getgroups() == [int(sys.argv[4])]
 assert committed.read_bytes() == b"committed\n"
 assert stat.S_IMODE(committed.stat().st_mode) == 0o600
 assert not (workspace / ".git").exists()
@@ -139,6 +140,7 @@ else:
                         str(sentinel),
                         str(listener_port),
                         bridge_gateway,
+                        str(AUDIT_GID),
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,

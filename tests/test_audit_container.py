@@ -408,7 +408,7 @@ class AuditContainerTests(unittest.TestCase):
                 str(AUDIT_GID),
                 str(AUDIT_UID),
                 str(AUDIT_GID),
-                "[]",
+                f"[{AUDIT_GID}]",
                 "/proc/self/status",
                 ".",
             ),
@@ -1015,6 +1015,12 @@ class AuditContainerTests(unittest.TestCase):
                 "expected_groups": [group + 1 for group in os.getgroups()]
                 if os.getgroups()
                 else [1]
+            },
+            "supplementary-groups-extra": {
+                "expected_groups": [
+                    *os.getgroups(),
+                    max([os.getgid(), *os.getgroups()]) + 1,
+                ]
             },
             "no-new-privileges": {"process_status": "NoNewPrivs:\t0\nSeccomp:\t2\nCapEff:\t0\n"},
             "seccomp": {"process_status": "NoNewPrivs:\t1\nSeccomp:\t0\nCapEff:\t0\n"},
