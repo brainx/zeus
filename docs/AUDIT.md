@@ -149,13 +149,14 @@ analysis and validates the copy. The command container has no host bind mounts.
 The real source worktree, audit control directory, Hermes home, Docker socket,
 user home, caches, and credential paths are never mounted.
 
-The workspace tmpfs is created with the audit UID and GID. Zeus seeds it through
-the Docker archive interface using normalized ownership while preserving
-regular-file modes and confined symlink targets. Before validation is sealed,
-Zeus compares the copied manifest and executes a write-and-delete probe as the
-same unprivileged UID used for every audit command. Ownership normalization
-occurs through the trusted Docker daemon, not through a privileged process in
-the command container.
+The workspace tmpfs is created with the audit UID and GID. Zeus streams its
+bounded archive to an isolated Python extractor running as that same
+unprivileged UID and GID. The extractor creates only confined directories,
+regular files, and symlinks without following destination symlinks, while
+preserving regular-file modes. Before validation is sealed, Zeus compares the
+seeded manifest and executes a write-and-delete probe as the same unprivileged
+UID used for every audit command. No privileged process seeds the command
+container.
 
 Writes inside `/workspace` are allowed so builds and tests can operate normally.
 They consume only the bounded tmpfs and disappear with the container. Zeus

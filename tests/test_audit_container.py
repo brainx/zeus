@@ -255,6 +255,54 @@ class AuditContainerTests(unittest.TestCase):
         )
         return runtime, runner, prepared
 
+    @staticmethod
+    def _seed_archive(
+        entries: list[tuple[tarfile.TarInfo, bytes | None]],
+    ) -> bytes:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for member, content in entries:
+                source = None if content is None else io.BytesIO(content)
+                archive.addfile(member, source)
+        return output.getvalue()
+
+    @staticmethod
+    def _seed_member(
+        name: str,
+        entry_type: bytes,
+        *,
+        content: bytes = b"",
+        linkname: str = "",
+        mode: int = 0o644,
+    ) -> tuple[tarfile.TarInfo, bytes | None]:
+        member = tarfile.TarInfo(name)
+        member.type = entry_type
+        member.mode = mode
+        member.linkname = linkname
+        if entry_type in tarfile.REGULAR_TYPES:
+            member.size = len(content)
+            return member, content
+        return member, None
+
+    @staticmethod
+    def _run_seed(workspace: Path, archive: bytes) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                getattr(audit_container, "_SEED_SCRIPT", ""),
+                str(HARD_LIMITS.snapshot_entries),
+                str(HARD_LIMITS.snapshot_blob_bytes),
+            ],
+            cwd=workspace,
+            input=archive,
+            capture_output=True,
+            shell=False,
+            timeout=5,
+            check=False,
+        )
+
     def test_prepare_uses_exact_commands_minimal_environment_and_archive(self) -> None:
         _runtime, runner, prepared = self._prepare()
         docker = "/usr/bin/docker"
@@ -306,9 +354,23 @@ class AuditContainerTests(unittest.TestCase):
         )
         self.assertEqual((docker, "start", CONTAINER_ID), runner.calls[2][0])
         self.assertEqual(
-            (docker, "cp", "--archive", "-", f"{CONTAINER_ID}:/workspace"),
+            (
+                docker,
+                "exec",
+                "-i",
+                f"--user={AUDIT_UID}:{AUDIT_GID}",
+                "--workdir=/workspace",
+                CONTAINER_ID,
+                "python3",
+                "-I",
+                "-c",
+                getattr(audit_container, "_SEED_SCRIPT", "<missing seed script>"),
+                str(HARD_LIMITS.snapshot_entries),
+                str(HARD_LIMITS.snapshot_blob_bytes),
+            ),
             runner.calls[3][0],
         )
+        self.assertFalse(any(call[0][1] == "cp" for call in runner.calls))
         archive_bytes = runner.calls[3][1] or b""
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
             members = {member.name: member for member in archive.getmembers()}
@@ -352,6 +414,97 @@ class AuditContainerTests(unittest.TestCase):
             self.assertEqual({"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}, env)
         self.assertEqual(CONTAINER_ID, prepared.container_id)
         self.assertEqual(0o700, stat.S_IMODE(prepared.broker_dir.lstat().st_mode))
+
+    def test_seed_script_preserves_files_directories_modes_and_confined_symlinks(
+        self,
+    ) -> None:
+        archive = self._seed_archive(
+            [
+                self._seed_member("pkg", tarfile.DIRTYPE, mode=0o700),
+                self._seed_member("README.md", tarfile.REGTYPE, content=b"committed\n", mode=0o644),
+                self._seed_member(
+                    "pkg/tool.sh",
+                    tarfile.REGTYPE,
+                    content=b"#!/bin/sh\nexit 0\n",
+                    mode=0o755,
+                ),
+                self._seed_member(
+                    "pkg/readme-link",
+                    tarfile.SYMTYPE,
+                    linkname="../README.md",
+                    mode=0o777,
+                ),
+            ]
+        )
+        workspace = self.root / "seed-workspace"
+        workspace.mkdir(mode=0o700)
+
+        result = self._run_seed(workspace, archive)
+
+        self.assertEqual(b"", result.stderr)
+        self.assertEqual(0, result.returncode)
+        self.assertTrue((workspace / "README.md").is_file())
+        self.assertEqual(b"committed\n", (workspace / "README.md").read_bytes())
+        self.assertEqual(b"#!/bin/sh\nexit 0\n", (workspace / "pkg/tool.sh").read_bytes())
+        self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg").lstat().st_mode))
+        self.assertEqual(0o755, stat.S_IMODE((workspace / "pkg/tool.sh").lstat().st_mode))
+        self.assertEqual("../README.md", os.readlink(workspace / "pkg/readme-link"))
+
+    def test_seed_script_rejects_unsafe_paths_types_and_symlinks_without_outside_writes(
+        self,
+    ) -> None:
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"preserve")
+        cases = {
+            "absolute": self._seed_member(
+                str(outside / "absolute"), tarfile.REGTYPE, content=b"escape"
+            ),
+            "parent-traversal": self._seed_member(
+                "../outside/parent", tarfile.REGTYPE, content=b"escape"
+            ),
+            "hardlink": self._seed_member("hardlink", tarfile.LNKTYPE, linkname=str(sentinel)),
+            "character-device": self._seed_member("device", tarfile.CHRTYPE),
+            "block-device": self._seed_member("block-device", tarfile.BLKTYPE),
+            "fifo": self._seed_member("fifo", tarfile.FIFOTYPE),
+            "escaping-symlink": self._seed_member(
+                "escape-link", tarfile.SYMTYPE, linkname="../outside/sentinel"
+            ),
+        }
+        for name, member in cases.items():
+            with self.subTest(name=name):
+                workspace = self.root / f"unsafe-{name}"
+                workspace.mkdir(mode=0o700)
+                before = sentinel.stat()
+
+                result = self._run_seed(workspace, self._seed_archive([member]))
+
+                after = sentinel.stat()
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual(b"preserve", sentinel.read_bytes())
+                self.assertEqual(before.st_ino, after.st_ino)
+                self.assertEqual(before.st_nlink, after.st_nlink)
+                self.assertFalse((outside / "absolute").exists())
+                self.assertFalse((outside / "parent").exists())
+
+    def test_seed_script_rejects_destination_symlink_without_outside_writes(self) -> None:
+        outside = self.root / "destination-outside"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"preserve")
+        workspace = self.root / "destination-workspace"
+        workspace.mkdir(mode=0o700)
+        os.symlink(outside, workspace / "pkg")
+        archive = self._seed_archive(
+            [self._seed_member("pkg/escape", tarfile.REGTYPE, content=b"escape")]
+        )
+
+        result = self._run_seed(workspace, archive)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(b"preserve", sentinel.read_bytes())
+        self.assertFalse((outside / "escape").exists())
 
     def test_tagged_digest_uses_configured_ref_and_canonical_repo_digest_binding(self) -> None:
         digest = DEFAULT_AUDIT_IMAGE.rsplit("@sha256:", 1)[1]
