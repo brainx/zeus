@@ -151,6 +151,12 @@ class SupervisorCliApiTests(unittest.TestCase):
         hermes.chmod(0o755)
         return str(hermes.resolve())
 
+    def _write_profile_config(self, profile: Path) -> None:
+        (profile / "config.yaml").write_text("model: test\n", encoding="utf-8")
+        env_path = profile / ".env"
+        if not env_path.exists():
+            env_path.write_text("", encoding="utf-8")
+
     def _gateway_argv(self, hermes_bin: str, bot_id: str = "coder") -> list[str]:
         return [hermes_bin, "-p", bot_id, "gateway", "run"]
 
@@ -256,6 +262,9 @@ class SupervisorCliApiTests(unittest.TestCase):
         bot_id: str,
         argv: list[str],
     ) -> None:
+        profile_path.mkdir(parents=True, exist_ok=True)
+        if not (profile_path / "config.yaml").exists():
+            self._write_profile_config(profile_path)
         payload = supervisor.adapter.launcher_payload(
             bot_id,
             operation_id="a" * 32,
@@ -277,6 +286,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_root = Path(tmp) / ".zeus" / "hermes"
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
+            self._write_profile_config(profile)
             (profile / ".env").write_text(
                 "# OPENROUTER_API_KEY=\nDEEPSEEK_API_KEY=test-key\nexport CUSTOM_FLAG='enabled'\n",
                 encoding="utf-8",
@@ -293,6 +303,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_root = Path(tmp) / ".zeus" / "hermes"
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
+            self._write_profile_config(profile)
             (profile / ".env").write_text(
                 'OPENROUTER_API_KEY="line one\\nline two # not comment"\n',
                 encoding="utf-8",
@@ -307,6 +318,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_root = Path(tmp) / ".zeus" / "hermes"
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
+            self._write_profile_config(profile)
             (profile / ".env").write_text(
                 "HERMES_HOME=/tmp/different-hermes\nCUSTOM_FLAG=enabled\n",
                 encoding="utf-8",
@@ -322,6 +334,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_root = Path(tmp) / ".zeus" / "hermes"
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
+            self._write_profile_config(profile)
             (profile / ".env").write_text("OPENROUTER_API_KEY=profile-key\n", encoding="utf-8")
             with patch.dict(
                 os.environ,
@@ -344,6 +357,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_root = Path(tmp) / ".zeus" / "hermes"
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
+            self._write_profile_config(profile)
             (profile / ".env").write_text("", encoding="utf-8")
             with patch.dict(
                 os.environ,
@@ -365,6 +379,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_root = root / ".zeus" / "hermes"
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
+            self._write_profile_config(profile)
             hermes_bin = self._fake_hermes_path(root)
             (profile / ".env").write_text(
                 "OPENROUTER_API_KEY=private-launch-secret\n",
@@ -397,12 +412,53 @@ class SupervisorCliApiTests(unittest.TestCase):
                 payload["marker_path"],
             )
 
+    def test_supervisor_rejects_unsafe_persisted_profile_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_root = root / ".zeus" / "hermes"
+            profile = hermes_root / "profiles" / "coder"
+            profile.mkdir(parents=True)
+            (profile / "config.yaml").write_text(
+                "platforms:\n"
+                "  feishu:\n"
+                "    extra:\n"
+                "      connection_mode: webhook\n",
+                encoding="utf-8",
+            )
+            (profile / ".env").write_text("", encoding="utf-8")
+            store = StateStore(root / "zeus.db")
+            store.init()
+            store.upsert_bot(
+                BotRecord(
+                    bot_id="coder",
+                    template_id="coding-bot",
+                    display_name="Coder",
+                    profile_path=str(profile),
+                )
+            )
+
+            def forbidden_popen(*args: object, **kwargs: object) -> FakePopen:
+                self.fail("unsafe persisted profile must not launch")
+
+            supervisor = Supervisor(
+                store,
+                self._fake_hermes_path(root),
+                hermes_root,
+                popen_factory=forbidden_popen,
+            )
+            status = supervisor.start("coder")
+
+        self.assertEqual(BotStatus.failed, status.status)
+        self.assertIn("platforms.feishu.extra.connection_mode", status.message)
+        self.assertIsNone(status.pid)
+
     def test_strict_runtime_contract_accepts_schema3_and_rejects_compat_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             hermes_root = root / "hermes"
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
+            self._write_profile_config(profile)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -624,6 +680,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -671,6 +728,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             (profile_path / ".env").write_text(
                 "API_SERVER_ENABLED=1\nAPI_SERVER_PORT=4312\n",
                 encoding="utf-8",
@@ -714,6 +772,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             (profile_path / ".env").write_text(
                 "API_SERVER_ENABLED=1\nAPI_SERVER_PORT=4312\n",
                 encoding="utf-8",
@@ -754,6 +813,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             (profile_path / ".env").write_text(
                 "API_SERVER_ENABLED=1\nAPI_SERVER_PORT=4312\n",
                 encoding="utf-8",
@@ -796,6 +856,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             (profile_path / ".env").write_text(
                 "API_SERVER_ENABLED=1\nAPI_SERVER_PORT=4312\n",
                 encoding="utf-8",
@@ -873,6 +934,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -920,6 +982,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             outer.chmod(0o755)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             store = StateStore(root / "zeus.db")
             store.init()
             store.upsert_bot(
@@ -971,6 +1034,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes = root / "missing-hermes"
             hermes.write_text("#!/bin/sh\n", encoding="utf-8")
             hermes.chmod(0o755)
@@ -1238,6 +1302,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             hermes_bin = self._fake_hermes_path(root)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             store = StateStore(root / "zeus.db")
             store.init()
             store.upsert_bot(
@@ -1295,6 +1360,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -1887,6 +1953,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -2007,6 +2074,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -3418,6 +3486,7 @@ password = "plain-password"
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -3593,6 +3662,7 @@ password = "plain-password"
             root = Path(tmp)
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store = StateStore(root / "zeus.db")
             store.init()
@@ -3663,6 +3733,7 @@ password = "plain-password"
 
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             profile_path.mkdir(parents=True)
+            self._write_profile_config(profile_path)
             hermes_bin = self._fake_hermes_path(root)
             store.upsert_bot(
                 BotRecord(
@@ -3697,6 +3768,7 @@ password = "plain-password"
             profile_path = root / ".zeus" / "hermes" / "profiles" / "coder"
             logs_path = profile_path / "logs"
             logs_path.mkdir(parents=True, mode=0o700)
+            self._write_profile_config(profile_path)
             target_log = root / "external-gateway-target.log"
             target_log.write_text("external gateway target\n", encoding="utf-8")
             target_mode = target_log.stat().st_mode & 0o777

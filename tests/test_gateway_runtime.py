@@ -72,6 +72,7 @@ class GatewayRuntimeTests(unittest.TestCase):
         profile = hermes_root / "profiles" / self.bot_id
         profile.mkdir(parents=True)
         (profile / ".env").write_text("", encoding="utf-8")
+        (profile / "config.yaml").write_text("model: test\n", encoding="utf-8")
         hermes = self._fake_hermes(root)
         adapter = HermesAdapter(hermes, hermes_root)
         manager = ProfileManager(hermes_root, root / "archive")
