@@ -22,7 +22,10 @@ from zeus.gateway_runtime_core import (
     gateway_process_launch_kwargs,
 )
 from zeus.gateway_runtime_stop import _GatewayRuntimeStop
-from zeus.models import BotRecord, TemplateError
+from zeus.hermes_profile_config import HermesProfileConfigError
+from zeus.hermes_profile_environment import HermesProfileEnvironmentError
+from zeus.hermes_security import UnsupportedFeishuWebhookModeError
+from zeus.models import BotRecord, StoredProfilePreflightError, TemplateError
 from zeus.private_io import open_private_append
 from zeus.readiness import ReadinessProbe
 
@@ -40,14 +43,21 @@ class _GatewayRuntimeLaunch(_GatewayRuntimeStop):
         safe_profile = self.safe_profile_path(record.bot_id, record.profile_path)
         if not safe_profile.is_dir() or safe_profile.is_symlink():
             raise TemplateError("registered bot profile is not a safe directory")
-        _argv, env = self.adapter.command(record.bot_id, "gateway", "run")
-        readiness = self.readiness_probe(env, timeout_seconds=timeout_seconds)
-        self.adapter.launcher_payload(
-            record.bot_id,
-            operation_id="0" * 32,
-            desired_revision=max(1, record.desired_revision + 1),
-            readiness_probe=readiness,
-        )
+        try:
+            _argv, env = self.adapter.command(record.bot_id, "gateway", "run")
+            readiness = self.readiness_probe(env, timeout_seconds=timeout_seconds)
+            self.adapter.launcher_payload(
+                record.bot_id,
+                operation_id="0" * 32,
+                desired_revision=max(1, record.desired_revision + 1),
+                readiness_probe=readiness,
+            )
+        except (
+            HermesProfileConfigError,
+            HermesProfileEnvironmentError,
+            UnsupportedFeishuWebhookModeError,
+        ) as exc:
+            raise StoredProfilePreflightError(str(exc)) from exc
         return readiness
 
     def launch(

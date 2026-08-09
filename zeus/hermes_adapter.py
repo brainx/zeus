@@ -6,8 +6,13 @@ import subprocess  # nosec B404
 import sys
 from pathlib import Path
 
-from zeus.envfile import parse_env_text
 from zeus.gateway_marker import command_fingerprint, readiness_probe_to_payload
+from zeus.hermes_profile_config import (
+    load_hermes_legacy_gateway_config,
+    load_hermes_profile_config,
+)
+from zeus.hermes_profile_environment import load_hermes_profile_environment
+from zeus.hermes_security import validate_hermes_profile_security
 from zeus.models import ID_RE
 from zeus.readiness import ReadinessProbe
 
@@ -20,12 +25,6 @@ SAFE_ENV_DEFAULTS = [
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
 ]
-
-
-def _load_profile_env(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    return parse_env_text(path.read_text(encoding="utf-8"))
 
 
 def _base_env() -> dict[str, str]:
@@ -53,8 +52,15 @@ class HermesAdapter:
     def command(self, bot_id: str, *args: str) -> tuple[list[str], dict[str, str]]:
         if not ID_RE.match(bot_id):
             raise ValueError(f"invalid bot id: {bot_id}")
+        profile_path = self.hermes_root / "profiles" / bot_id
         env = _base_env()
-        env.update(_load_profile_env(self.hermes_root / "profiles" / bot_id / ".env"))
+        env.update(load_hermes_profile_environment(profile_path / ".env"))
+        config = load_hermes_profile_config(profile_path / "config.yaml")
+        legacy_gateway = load_hermes_legacy_gateway_config(profile_path / "gateway.json")
+        validate_hermes_profile_security(config, env)
+        if legacy_gateway:
+            validate_hermes_profile_security(legacy_gateway, env)
+        env.setdefault("FEISHU_CONNECTION_MODE", "websocket")
         env["HERMES_HOME"] = str(self.hermes_root)
         return [self.hermes_bin, "-p", bot_id, *args], env
 

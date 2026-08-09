@@ -30,7 +30,7 @@ Do not open public issues for vulnerabilities involving secrets, process control
 - Audit repository commands run in a prevalidated Docker container with network
   mode `none`, no host bind mounts, an unprivileged UID, dropped capabilities,
   a read-only root filesystem, and bounded tmpfs storage. The audit path is
-  available only when the exact Hermes Agent 0.19.0 executable and a preloaded
+  available only when the exact Hermes Agent 0.20.0 executable and a preloaded
   digest-qualified image pass preflight; it has no local-terminal fallback.
 - Hermes is a host process for the operator-selected provider. `zeus audit
   doctor` discloses that provider and model, and an audit can send selected

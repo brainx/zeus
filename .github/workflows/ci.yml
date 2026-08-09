@@ -78,6 +78,29 @@ jobs:
       - name: Run subprocess lifecycle tests
         run: python -m unittest tests.test_subprocess_lifecycle
 
+  audit-docker-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      ZEUS_RUN_DOCKER_ISOLATION: "1"
+      ZEUS_AUDIT_TEST_IMAGE: "nikolaik/python-nodejs:python3.11-nodejs20@sha256:8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install package and dev tools
+        run: python -m pip install -e .
+      - name: Verify Docker and preload the pinned audit image
+        run: |
+          docker version
+          docker info
+          docker pull "$ZEUS_AUDIT_TEST_IMAGE"
+      - name: Run real Docker audit isolation test
+        run: python -m unittest -v tests.test_audit_docker_isolation.RealDockerAuditIsolationTests.test_real_docker_isolation
+
   macos-process-lifecycle:
     runs-on: macos-26
     timeout-minutes: 15
@@ -110,6 +133,8 @@ jobs:
       - name: Install pinned Hermes compatibility environment
         run: |-
           python -m pip install --no-deps --require-hashes --only-binary=:all: -r requirements-hermes-ci.txt
+      - name: Install verified Hermes source release
+        run: sh scripts/install_pinned_hermes.sh
       - name: Install Zeus
         run: python -m pip install -e .
       - name: Check pinned dependency overrides
@@ -117,9 +142,18 @@ jobs:
       - name: Verify real Hermes without provider credentials
         run: |
           ZEUS_VERIFY_START_GATEWAY=1 \
-          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \
+          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \
           ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \
           sh scripts/verify_real_hermes.sh
+      - name: Verify pinned Hermes audit broker transcript
+        run: |
+          mkdir -p .tmp/real-hermes-evidence
+          chmod 0700 .tmp/real-hermes-evidence
+          umask 077
+          printf '%s\n' 'result=failed' \
+            'failure_stage=pinned_hermes_audit_broker' \
+            > .tmp/real-hermes-evidence/summary.txt
+          python -m unittest -v tests.test_pinned_hermes_audit_broker
       - name: Upload sanitized failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

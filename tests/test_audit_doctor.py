@@ -102,12 +102,12 @@ class AuditDoctorContractTests(unittest.TestCase):
     def test_pinned_hermes_version_requires_documented_first_line_shape(self) -> None:
         from zeus.audit_doctor import _pinned_hermes_version
 
-        accepted = b"Hermes Agent v0.19.0 (2026.7.20)\nPython: 3.11.13\nPlatform: test\n"
+        accepted = b"Hermes Agent v0.20.0 (2026.8.3)\nPython: 3.11.13\nPlatform: test\n"
         rejected = (
-            b"0.19.0\n",
-            b"Hermes Agent v0.19.0\n",
-            b"prefix Hermes Agent v0.19.0 (2026.7.20)\n",
-            b"Hermes Agent v0.18.0 (2026.7.20)\n",
+            b"0.20.0\n",
+            b"Hermes Agent v0.20.0\n",
+            b"prefix Hermes Agent v0.20.0 (2026.8.3)\n",
+            b"Hermes Agent v0.19.0 (2026.8.3)\n",
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -132,7 +132,7 @@ class AuditDoctorContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             executable = self._version_executable(
                 Path(temporary),
-                b"Hermes Agent v0.19.0 (2026.7.20)\n" + b"x" * 8192,
+                b"Hermes Agent v0.20.0 (2026.8.3)\n" + b"x" * 8192,
                 sleep=5,
             )
             started = time.monotonic()
@@ -168,7 +168,7 @@ class AuditDoctorContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             executable, marker = self._forking_executable(
                 Path(temporary),
-                b"Hermes Agent v0.19.0 (2026.7.20)\n",
+                b"Hermes Agent v0.20.0 (2026.8.3)\n",
             )
             try:
                 ok, observation = _pinned_hermes_version(
@@ -189,7 +189,7 @@ class AuditDoctorContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             executable = self._version_executable(
                 Path(temporary),
-                b"Hermes Agent v0.19.0 (2026.7.20)\n",
+                b"Hermes Agent v0.20.0 (2026.8.3)\n",
             )
 
             def clean_but_report_failure(process) -> bool:
@@ -312,7 +312,7 @@ class AuditDoctorContractTests(unittest.TestCase):
             mock.patch("zeus.audit_doctor._command", return_value=(True, "available")) as command,
             mock.patch(
                 "zeus.audit_doctor._pinned_hermes_version",
-                return_value=(True, "version 0.19.0"),
+                return_value=(True, "version 0.20.0"),
             ),
             mock.patch("zeus.audit_doctor._broker_isolation_supported", return_value=True),
         ):

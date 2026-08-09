@@ -4,7 +4,9 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
+import sys
 import tempfile
 import textwrap
 import tomllib
@@ -13,6 +15,7 @@ from pathlib import Path
 
 from scripts.check_version_tag import _has_exact_changelog_heading
 from zeus import __version__
+from zeus.audit_config import DEFAULT_AUDIT_IMAGE
 from zeus.state import SCHEMA_VERSION
 
 
@@ -92,6 +95,17 @@ def _job_run_commands(job_body: str) -> tuple[str, ...]:
             index += 1
         commands.append(textwrap.dedent("\n".join(block)).strip())
     return tuple(commands)
+
+
+def _job_step_bodies(job_body: str) -> tuple[str, ...]:
+    lines = job_body.splitlines()
+    starts = [index for index, line in enumerate(lines) if re.match(r"^      - ", line)]
+    return tuple(
+        textwrap.dedent(
+            "\n".join(lines[start : starts[index + 1] if index + 1 < len(starts) else None])
+        ).strip()
+        for index, start in enumerate(starts)
+    )
 
 
 def _markdown_table_rows(markdown: str) -> dict[str, tuple[str, ...]]:
@@ -211,6 +225,7 @@ class RepoContractTests(unittest.TestCase):
             "systemd/zeus-reconcile.timer",
             "scripts/repo_check.sh",
             "scripts/check_hermes_dependency_overrides.py",
+            "scripts/install_pinned_hermes.sh",
             "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
@@ -241,6 +256,46 @@ class RepoContractTests(unittest.TestCase):
         self.assertFalse(Path("docs/superpowers").exists())
         self.assertFalse(Path("docs/REPO_GENERATION.md").exists())
 
+    def test_ci_runs_fail_closed_real_docker_audit_isolation(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        jobs = _workflow_job_bodies(workflow)
+        image = (
+            "nikolaik/python-nodejs:python3.11-nodejs20@sha256:"
+            "8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
+        )
+        selector = (
+            "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests."
+            "test_real_docker_isolation"
+        )
+        required_gate_signals = {
+            "Docker isolation opt-in": 'ZEUS_RUN_DOCKER_ISOLATION: "1"',
+            "digest-pinned audit image": f'ZEUS_AUDIT_TEST_IMAGE: "{image}"',
+            "real Docker isolation test": selector,
+        }
+        job = jobs["audit-docker-isolation"]
+        missing_signals = tuple(
+            name for name, signal in required_gate_signals.items() if signal not in job
+        )
+
+        self.assertEqual(image, DEFAULT_AUDIT_IMAGE)
+        self.assertEqual((), missing_signals)
+
+        self.assertEqual("ubuntu-24.04", _job_level_scalar(job, "runs-on"))
+        self.assertEqual("15", _job_level_scalar(job, "timeout-minutes"))
+        self.assertEqual(("3.11",), _job_python_versions(job))
+        self.assertRegex(job, r"(?m)^    permissions:\n      contents: read\s*$")
+        self.assertNotIn("continue-on-error:", job)
+        self.assertNotRegex(job, r"(?m)^ {4,}if:\s")
+        self.assertNotIn("secrets.", job)
+        self.assertEqual(
+            (
+                "python -m pip install -e .",
+                'docker version\ndocker info\ndocker pull "$ZEUS_AUDIT_TEST_IMAGE"',
+                f"python -m unittest -v {selector}",
+            ),
+            _job_run_commands(job),
+        )
+
     def test_ci_runs_project_test_script_on_supported_python_versions(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
         jobs = _workflow_job_bodies(workflow)
@@ -249,6 +304,7 @@ class RepoContractTests(unittest.TestCase):
             "test": "ubuntu-24.04",
             "python-3-14": "ubuntu-24.04",
             "lifecycle-subprocess": "ubuntu-24.04",
+            "audit-docker-isolation": "ubuntu-24.04",
             "macos-process-lifecycle": "macos-26",
             "real-hermes": "ubuntu-24.04",
             "package": "ubuntu-24.04",
@@ -257,6 +313,7 @@ class RepoContractTests(unittest.TestCase):
             "test": ("3.11", "3.12", "3.13"),
             "python-3-14": ("3.14",),
             "lifecycle-subprocess": ("3.11",),
+            "audit-docker-isolation": ("3.11",),
             "macos-process-lifecycle": ("3.13",),
             "real-hermes": ("3.11",),
             "package": ("3.11",),
@@ -265,6 +322,7 @@ class RepoContractTests(unittest.TestCase):
             "test": "${{ matrix.python-version }}",
             "python-3-14": '"3.14"',
             "lifecycle-subprocess": '"3.11"',
+            "audit-docker-isolation": '"3.11"',
             "macos-process-lifecycle": '"3.13"',
             "real-hermes": '"3.11"',
             "package": '"3.11"',
@@ -290,6 +348,13 @@ class RepoContractTests(unittest.TestCase):
                 "python -m pip install -e . -r requirements-dev-ci.txt",
                 "python -m unittest tests.test_subprocess_lifecycle",
             ),
+            "audit-docker-isolation": (
+                "python -m pip install -e .",
+                'docker version\ndocker info\ndocker pull "$ZEUS_AUDIT_TEST_IMAGE"',
+                "python -m unittest -v "
+                "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests."
+                "test_real_docker_isolation",
+            ),
             "macos-process-lifecycle": (
                 "python -m pip install -e . -r requirements-dev-ci.txt",
                 "python -m unittest -v \\\n"
@@ -303,12 +368,20 @@ class RepoContractTests(unittest.TestCase):
                 ".tmp/real-hermes-evidence/summary.txt",
                 "python -m pip install --no-deps --require-hashes --only-binary=:all: "
                 "-r requirements-hermes-ci.txt",
+                "sh scripts/install_pinned_hermes.sh",
                 "python -m pip install -e .",
                 "python scripts/check_hermes_dependency_overrides.py",
                 "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
-                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.19.0 \\\n"
+                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \\\n"
                 "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
                 "sh scripts/verify_real_hermes.sh",
+                "mkdir -p .tmp/real-hermes-evidence\n"
+                "chmod 0700 .tmp/real-hermes-evidence\n"
+                "umask 077\n"
+                "printf '%s\\n' 'result=failed' \\\n"
+                "  'failure_stage=pinned_hermes_audit_broker' \\\n"
+                "  > .tmp/real-hermes-evidence/summary.txt\n"
+                "python -m unittest -v tests.test_pinned_hermes_audit_broker",
             ),
             "package": (
                 "python -m pip install -e . -r requirements-dev-ci.txt",
@@ -372,6 +445,66 @@ class RepoContractTests(unittest.TestCase):
             "twine check dist/*",
         ):
             self.assertLess(pip_check_index, package_commands.index(later_command))
+
+    def test_real_hermes_broker_failure_evidence_is_private_and_ordered(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        commands = _job_run_commands(_workflow_job_bodies(workflow)["real-hermes"])
+        verifier = (
+            "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
+            "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \\\n"
+            "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
+            "sh scripts/verify_real_hermes.sh"
+        )
+        broker = (
+            "mkdir -p .tmp/real-hermes-evidence\n"
+            "chmod 0700 .tmp/real-hermes-evidence\n"
+            "umask 077\n"
+            "printf '%s\\n' 'result=failed' \\\n"
+            "  'failure_stage=pinned_hermes_audit_broker' \\\n"
+            "  > .tmp/real-hermes-evidence/summary.txt\n"
+            "python -m unittest -v tests.test_pinned_hermes_audit_broker"
+        )
+
+        self.assertIn(verifier, commands)
+        self.assertIn(broker, commands)
+        self.assertEqual(commands.index(verifier) + 1, commands.index(broker))
+        self.assertIn("if-no-files-found: error", _workflow_job_bodies(workflow)["real-hermes"])
+
+    def test_real_hermes_broker_upload_step_is_exact_and_immediate(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        steps = _job_step_bodies(_workflow_job_bodies(workflow)["real-hermes"])
+        broker_name = "- name: Verify pinned Hermes audit broker transcript"
+        broker_indexes = [index for index, step in enumerate(steps) if step.startswith(broker_name)]
+        expected_upload = (
+            "- name: Upload sanitized failure evidence\n"
+            "  if: failure()\n"
+            "  uses: actions/upload-artifact@"
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n"
+            "  with:\n"
+            "    name: real-hermes-failure-evidence\n"
+            "    path: .tmp/real-hermes-evidence/summary.txt\n"
+            "    if-no-files-found: error\n"
+            "    retention-days: 7"
+        )
+
+        self.assertEqual(1, len(broker_indexes))
+        upload_index = broker_indexes[0] + 1
+        self.assertLess(upload_index, len(steps))
+        self.assertEqual(expected_upload, steps[upload_index])
+        self.assertEqual(1, steps.count(expected_upload))
+
+    def test_pinned_hermes_broker_selects_a_trusted_linux_system_python(self) -> None:
+        source = Path("tests/test_pinned_hermes_audit_broker.py").read_text(encoding="utf-8")
+
+        self.assertIn('Path("/usr/bin/python3")', source)
+        self.assertIn('sys.platform.startswith("linux")', source)
+        self.assertIn("Path(sys.executable)", source)
+        self.assertIn(".resolve(strict=True)", source)
+        self.assertIn("stat.S_ISREG(python_metadata.st_mode)", source)
+        self.assertIn("python_metadata.st_uid", source)
+        self.assertIn("stat.S_IXUSR", source)
+        self.assertIn("stat.S_IWGRP | stat.S_IWOTH", source)
+        self.assertNotIn("python_executable=Path(sys.executable).resolve()", source)
 
     def test_ci_toolchain_is_exactly_pinned_and_updated_weekly(self) -> None:
         expected = {
@@ -689,7 +822,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("zeus audit run", run_docs)
         for prerequisite in (
             "Docker",
-            "Hermes Agent 0.19.0",
+            "Hermes Agent 0.20.0",
             "provider credentials",
             "preloaded",
         ):
@@ -716,7 +849,7 @@ class RepoContractTests(unittest.TestCase):
         for text in (readme, security, audit, architecture, operations, compatibility, roadmap):
             with self.subTest(document=text[:24]):
                 self.assertIn("committed `HEAD`", text)
-                self.assertIn("Hermes Agent 0.19.0", text)
+                self.assertIn("Hermes Agent 0.20.0", text)
                 self.assertIn("cross-host", text)
 
         self.assertIn("preloaded", readme)
@@ -880,6 +1013,18 @@ class RepoContractTests(unittest.TestCase):
                     "Focused multi-process lifecycle and locking behavior",
                 ),
             ),
+            "audit-docker-isolation": (
+                ci_jobs["audit-docker-isolation"],
+                "Audit Docker isolation",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Real Docker containment, including network denial, host-secret "
+                    "exclusion, read-only root, and cleanup",
+                ),
+            ),
             "macos-process-lifecycle": (
                 ci_jobs["macos-process-lifecycle"],
                 "macOS process lifecycle",
@@ -899,9 +1044,10 @@ class RepoContractTests(unittest.TestCase):
                 (
                     "Linux `ubuntu-24.04`",
                     "Python 3.11",
-                    "Hash-locked Hermes Agent 0.19.0 profile rendering, strict diagnostics, "
-                    "loopback gateway readiness, process ownership, and clean shutdown "
-                    "without a model-provider credential",
+                    "Hash-locked Hermes Agent 0.20.0 source install, profile rendering, "
+                    "strict diagnostics, sealed audit-broker transcript, loopback gateway "
+                    "readiness, process ownership, and clean shutdown without a "
+                    "model-provider credential",
                 ),
             ),
             "package": (
@@ -919,10 +1065,10 @@ class RepoContractTests(unittest.TestCase):
             "release:build": (
                 release_jobs["build"],
                 "Tagged release build",
-                "ubuntu-latest",
+                "ubuntu-24.04",
                 ("3.11",),
                 (
-                    "Linux `ubuntu-latest`",
+                    "Linux `ubuntu-24.04`",
                     "Python 3.11",
                     "Full release gate, artifact checksums, and GitHub release artifacts",
                 ),
@@ -945,10 +1091,15 @@ class RepoContractTests(unittest.TestCase):
             f'`requires-python = "{requires_python.group(1)}"`',
             compatibility_text,
         )
-        self.assertIn("lifecycle and package jobs use Python 3.11", compatibility_text)
+        self.assertIn(
+            "lifecycle, audit-isolation, and package jobs use Python 3.11",
+            compatibility_text,
+        )
         self.assertIn("Debian and Ubuntu", compatibility_text)
-        self.assertIn("Hermes Agent 0.19.0", compatibility_text)
-        self.assertIn("complete 60-package wheel closure", compatibility_text)
+        self.assertIn("Hermes Agent 0.20.0", compatibility_text)
+        self.assertIn(
+            "complete 61-package Linux x86_64 runtime and build closure", compatibility_text
+        )
         self.assertIn("no model-provider credential", compatibility_text)
         self.assertIn("whichever `hermes` executable is installed", compatibility_text)
         self.assertIn("Python 3.14", compatibility_text)
@@ -1079,24 +1230,110 @@ class RepoContractTests(unittest.TestCase):
         )
         hashes = re.findall(r"(?m)^    --hash=sha256:([0-9a-f]{64})(?: \\)?$", requirements)
 
-        self.assertEqual(60, len(entries))
-        self.assertEqual(60, len({name for name, _version in entries}))
+        self.assertEqual(61, len(entries))
+        self.assertEqual(61, len({name for name, _version in entries}))
         self.assertGreaterEqual(len(hashes), len(entries))
-        self.assertIn(("hermes-agent", "0.19.0"), entries)
-        self.assertIn(("cryptography", "48.0.1"), entries)
+        self.assertNotIn("hermes-agent", {name for name, _version in entries})
+        self.assertIn(("cryptography", "50.0.0"), entries)
         self.assertIn(("fastapi", "0.140.0"), entries)
         self.assertIn(("pillow", "12.3.0"), entries)
+        self.assertIn(("nemo-relay", "0.6.0"), entries)
         self.assertIn(("pydantic-core", "2.46.4"), entries)
         self.assertIn(("requests", "2.34.2"), entries)
         self.assertIn(("rich", "15.0.0"), entries)
+        self.assertIn(("setuptools", "83.0.0"), entries)
         self.assertIn(("tqdm", "4.69.1"), entries)
         self.assertIn(
-            "bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f",
+            "b42a28c1844fd9de8f3f7d540e36b66f3a9c83fceac7170ebc7a6a19edd9dcae",
+            hashes,
+        )
+        self.assertIn(
+            "849daa9e45158ac581e54506e0fcc7a24f557d1ed06dbdc074f5de7a00393cbc",
+            hashes,
+        )
+        self.assertIn(
+            "29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3",
             hashes,
         )
         self.assertIn("REVIEWED OVERRIDES", requirements)
+        self.assertIn("v2026.8.3", requirements)
+        self.assertIn("3c27eb6234bf91b8ceee9e9071591b31e9b148cb", requirements)
         self.assertNotIn("--index-url", requirements)
         self.assertNotIn("git+", requirements)
+
+    def test_real_hermes_source_installer_verifies_official_release_before_install(self) -> None:
+        script = Path("scripts/install_pinned_hermes.sh").read_text(encoding="utf-8")
+
+        self.assertIn("v2026.8.3", script)
+        self.assertIn("7de39e700d2c329e15d32eb0b96e2f7cdd9fbdb2", script)
+        self.assertIn("3c27eb6234bf91b8ceee9e9071591b31e9b148cb", script)
+        self.assertIn("370542c7219faba6300905c3b419e14e6508a31ac698a1a5174e0386990834be", script)
+        self.assertIn(
+            "https://codeload.github.com/NousResearch/hermes-agent/tar.gz/refs/tags/",
+            script,
+        )
+        digest_check = script.index("sha256sum")
+        install = script.index("pip install")
+        self.assertLess(digest_check, install)
+        self.assertIn("--no-deps", script[install:])
+        self.assertIn("--no-build-isolation", script[install:])
+        self.assertIn("--editable", script[install:])
+        self.assertIn("--strip-components=1", script)
+
+    def test_real_hermes_source_installer_rejects_wrong_metadata_under_optimization(
+        self,
+    ) -> None:
+        installer = Path("scripts/install_pinned_hermes.sh").resolve()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            bin_directory = root / "bin"
+            site_directory = root / "site"
+            metadata_directory = site_directory / "hermes_agent-99.0.0.dist-info"
+            bin_directory.mkdir()
+            metadata_directory.mkdir(parents=True)
+            (metadata_directory / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: hermes-agent\nVersion: 99.0.0\n",
+                encoding="utf-8",
+            )
+
+            commands = {
+                "curl": "#!/bin/sh\nexit 0\n",
+                "sha256sum": "#!/bin/sh\nexit 0\n",
+                "tar": ("#!/bin/sh\n: > .tmp/hermes-agent-v2026.8.3/pyproject.toml\n"),
+                "python": (
+                    "#!/bin/sh\n"
+                    'if [ "${1-}" = "-m" ] && [ "${2-}" = "pip" ]; then exit 0; fi\n'
+                    'exec "$REAL_PYTHON" -O "$@"\n'
+                ),
+            }
+            for name, source in commands.items():
+                executable = bin_directory / name
+                executable.write_text(source, encoding="utf-8")
+                executable.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": str(bin_directory) + os.pathsep + environment.get("PATH", ""),
+                    "PYTHONPATH": str(site_directory),
+                    "REAL_PYTHON": os.fsdecode(sys.executable),
+                }
+            )
+            shell = shutil.which("sh", path=environment["PATH"])
+            if shell is None:
+                self.fail("POSIX sh is required for the shell contract")
+            result = subprocess.run(
+                [shell, str(installer)],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("expected Hermes Agent 0.20.0, found 99.0.0", result.stderr)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")
@@ -1263,6 +1500,7 @@ class RepoContractTests(unittest.TestCase):
         release_docs = Path("docs/RELEASE.md").read_text(encoding="utf-8")
         workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
         wheel_smoke = Path("scripts/wheel_smoke.sh").read_text(encoding="utf-8")
+        jobs = _workflow_job_bodies(workflow)
 
         self.assertIn("sh scripts/test.sh", release_docs)
         self.assertIn("sh scripts/repo_check.sh", release_docs)
@@ -1272,6 +1510,12 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("python -m build", release_docs)
         self.assertIn("twine check dist/*", release_docs)
         self.assertIn("SHA256SUMS.txt", release_docs)
+        self.assertIn("gh auth status", release_docs)
+        self.assertIn("gh api --paginate --method GET", release_docs)
+        self.assertIn("dependabot/alerts?state=open&per_page=100", release_docs)
+        self.assertIn("release-relevant", release_docs)
+        self.assertIn("Before tagging, fix every", release_docs)
+        self.assertIn("documented mitigation", release_docs)
         self.assertIn("tags:", workflow)
         self.assertIn('"v*.*.*"', workflow)
         self.assertIn("make release-check", workflow)
@@ -1292,6 +1536,11 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("actions/upload-artifact@", workflow)
         self.assertIn("actions/download-artifact@", workflow)
         self.assertIn("cd dist && sha256sum -c SHA256SUMS.txt", workflow)
+        self.assertEqual({"build", "publish"}, set(jobs))
+        self.assertEqual("ubuntu-24.04", _job_level_scalar(jobs["build"], "runs-on"))
+        self.assertEqual("20", _job_level_scalar(jobs["build"], "timeout-minutes"))
+        self.assertEqual("ubuntu-24.04", _job_level_scalar(jobs["publish"], "runs-on"))
+        self.assertEqual("10", _job_level_scalar(jobs["publish"], "timeout-minutes"))
         self.assertIn("annotated version tags", release_docs)
         self.assertIn("GitHub-verified annotated tag", release_docs)
         self.assertIn("v0.3.0 release predates", release_docs)
@@ -1299,6 +1548,32 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn('build_artifacts="${ZEUS_WHEEL_SMOKE_BUILD:-1}"', wheel_smoke)
         self.assertIn('fail "ZEUS_WHEEL_SMOKE_BUILD must be 0 or 1"', wheel_smoke)
         self.assertIn('fail "expected exactly one wheel in dist/"', wheel_smoke)
+
+    def test_hero_image_is_optimized_and_metadata_free(self) -> None:
+        hero = Path("docs/assets/zeus-hero.png").read_bytes()
+        readme = Path("README.md").read_text(encoding="utf-8")
+
+        self.assertIn('src="docs/assets/zeus-hero.png"', readme)
+        self.assertIn('alt="Zeus: many Hermes bots, one local supervisor"', readme)
+        self.assertTrue(hero.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertLess(len(hero), 200 * 1024)
+
+        offset = 8
+        chunks: list[tuple[bytes, bytes]] = []
+        while offset < len(hero):
+            self.assertGreaterEqual(len(hero) - offset, 12)
+            length = struct.unpack(">I", hero[offset : offset + 4])[0]
+            chunk_type = hero[offset + 4 : offset + 8]
+            chunk_end = offset + 12 + length
+            self.assertLessEqual(chunk_end, len(hero))
+            chunks.append((chunk_type, hero[offset + 8 : offset + 8 + length]))
+            offset = chunk_end
+
+        self.assertEqual(len(hero), offset)
+        self.assertEqual(b"IHDR", chunks[0][0])
+        self.assertEqual((1800, 720), struct.unpack(">II", chunks[0][1][:8]))
+        self.assertEqual(b"IEND", chunks[-1][0])
+        self.assertTrue(all(chunk_type[0] & 0x20 == 0 for chunk_type, _ in chunks))
 
     def test_makefile_has_release_check_target(self) -> None:
         makefile = Path("Makefile").read_text(encoding="utf-8")

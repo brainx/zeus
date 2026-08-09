@@ -11,6 +11,7 @@ from zeus.models import (
     BotRecord,
     BotStatus,
     BotStatusResponse,
+    StoredProfilePreflightError,
 )
 from zeus.readiness import ReadinessProbe
 from zeus.supervisor_core import (
@@ -110,7 +111,7 @@ class _SupervisorStart(_SupervisorRuntime):
             )
         try:
             probe = self._preflight_start(record, timeout_seconds=timeout_seconds)
-        except OSError as exc:
+        except (OSError, StoredProfilePreflightError) as exc:
             message = f"failed to start gateway: {exc}"
             self._update_lifecycle(
                 context,
@@ -171,7 +172,7 @@ class _SupervisorStart(_SupervisorRuntime):
         if isinstance(probe, _ReadinessProbeUnset):
             try:
                 probe = self._preflight_start(record, timeout_seconds=timeout_seconds)
-            except OSError as exc:
+            except (OSError, StoredProfilePreflightError) as exc:
                 return BotStatusResponse(
                     bot_id,
                     BotStatus.failed,

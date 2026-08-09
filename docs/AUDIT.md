@@ -13,7 +13,7 @@ one command from a Git worktree, Zeus analyzes the committed `HEAD` in an
 isolated disposable environment, and Zeus stores a bounded report under its
 existing state directory.
 
-The audit runner accepts only Hermes Agent 0.19.0 and a preloaded,
+The audit runner accepts only Hermes Agent 0.20.0 and a preloaded,
 digest-qualified Docker image.
 
 The first version is intentionally narrow:
@@ -149,13 +149,15 @@ analysis and validates the copy. The command container has no host bind mounts.
 The real source worktree, audit control directory, Hermes home, Docker socket,
 user home, caches, and credential paths are never mounted.
 
-The workspace tmpfs is created with the audit UID and GID. Zeus seeds it through
-the Docker archive interface using normalized ownership while preserving
-regular-file modes and confined symlink targets. Before validation is sealed,
-Zeus compares the copied manifest and executes a write-and-delete probe as the
-same unprivileged UID used for every audit command. Ownership normalization
-occurs through the trusted Docker daemon, not through a privileged process in
-the command container.
+The workspace tmpfs is created with the audit UID and GID. Zeus streams its
+bounded archive to an isolated Python extractor running as that same
+unprivileged UID and GID. The extractor creates only confined directories,
+regular files, and symlinks without following destination symlinks, while
+preserving the materializer's private modes (`0600` for regular files and
+`0700` for executable files). Before validation is sealed, Zeus compares the
+seeded manifest and executes a write-and-delete probe as the same unprivileged
+UID used for every audit command. No privileged process seeds the command
+container.
 
 Writes inside `/workspace` are allowed so builds and tests can operate normally.
 They consume only the bounded tmpfs and disappear with the container. Zeus
@@ -560,7 +562,8 @@ The feature is additive and host-local:
 - Existing HTTP routes and OpenAPI remain unchanged.
 - SQLite schema version 6 and `StateStore` remain unchanged.
 - Hermes bot profiles, template schema, renderer behavior, and lifecycle
-  ordering remain unchanged.
+  ordering remain unchanged except for the fail-closed Feishu webhook
+  restriction documented in the compatibility policy.
 - Runtime Python dependencies remain standard-library only.
 - Git repository discovery applies to every audit command. The supported Hermes
   release, Docker, configured provider credentials, and a preloaded immutable
@@ -572,6 +575,13 @@ The feature is additive and host-local:
   profile environments, permits generic passthrough, and buffers unbounded
   output. Audit subprocess construction has its own strict environment and
   streaming limits.
+
+The sealed audit profile disables messaging and has no operator-controlled
+Feishu settings. Its private renderer nevertheless applies the same centralized
+guard as normal bot profiles, so an injected
+`platforms.feishu.extra.connection_mode: webhook` value cannot cross that
+Zeus-managed boundary. Feishu WebSocket mode and absent Feishu configuration
+remain allowed; see [Compatibility](COMPATIBILITY.md#hermes-boundary).
 
 The first implementation supports the same POSIX environments as Zeus's private
 state protections. Provider-backed end-to-end verification remains an explicit

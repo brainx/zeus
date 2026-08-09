@@ -16,7 +16,7 @@ and reconciliation evidence on one host.
   real-Hermes verification scripts.
 - Wheel builds, installed-wheel smoke checks, and GitHub release artifacts.
 - Host-local repository audits of committed `HEAD` with a packaged skill,
-  Hermes Agent 0.19.0 compatibility gate, preloaded Docker image, bounded
+  Hermes Agent 0.20.0 compatibility gate, preloaded Docker image, bounded
   private reports, cleanup, and fail-closed isolation controls. Audits are
   report-only: they do not remediate or schedule work.
 - Focused internal lifecycle, gateway-runtime, private-I/O, and audit modules

@@ -1582,6 +1582,7 @@ class SupervisorIntentRecoveryTests(unittest.TestCase):
         profile = hermes_root / "profiles" / "coder"
         profile.mkdir(parents=True)
         (profile / ".env").write_text("", encoding="utf-8")
+        (profile / "config.yaml").write_text("model: test\n", encoding="utf-8")
         hermes = root / "bin" / "hermes"
         hermes.parent.mkdir(parents=True)
         hermes.write_text("#!/bin/sh\n", encoding="utf-8")

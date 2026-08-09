@@ -15,26 +15,28 @@ from zeus.audit_docker_broker_core import (
 
 def _expected_bootstrap_script(session_id: str) -> str:
     snapshot = f"{_CONTAINER_TEMP}/hermes-snap-{session_id}.sh"
-    temporary = f"{snapshot}.tmp.$BASHPID"
+    temporary = f"{snapshot}.tmp.XXXXXXXXXX"
     marker = f"__HERMES_CWD_{session_id}__"
     return (
         "umask 077\n"
-        f"export -p > {temporary}\n"
+        f"__hermes_snap_tmp=$(mktemp {temporary}) || exit 1\n"
+        "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp"\n'
         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
-        f'[ -n "$__hermes_fns" ] && declare -f $__hermes_fns >> {temporary} '
+        '[ -n "$__hermes_fns" ] && declare -f $__hermes_fns >> "$__hermes_snap_tmp" '
         "2>/dev/null || true\n"
-        f"alias -p >> {temporary}\n"
-        f"echo 'shopt -s expand_aliases' >> {temporary}\n"
-        f"echo 'set +e' >> {temporary}\n"
-        f"echo 'set +u' >> {temporary}\n"
-        f"mv -f {temporary} {snapshot} || rm -f {temporary}\n"
+        'alias -p >> "$__hermes_snap_tmp"\n'
+        "echo 'shopt -s expand_aliases' >> \"$__hermes_snap_tmp\"\n"
+        "echo 'set +e' >> \"$__hermes_snap_tmp\"\n"
+        "echo 'set +u' >> \"$__hermes_snap_tmp\"\n"
+        f'mv -f "$__hermes_snap_tmp" {snapshot} || rm -f "$__hermes_snap_tmp"\n'
         "builtin cd -- /workspace 2>/dev/null || true\n"
         f"""printf '\\n{marker}%s{marker}\\n' "$(pwd -P)"\n"""
     )
 
 
 def _bootstrap_session_id(script: str) -> str | None:
-    prefix = "export -p > /tmp/hermes-snap-"
+    prefix = "__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-"
     start = script.find(prefix)
     if start < 0:
         return None
@@ -84,7 +86,7 @@ def _expected_reuse_probe(state: AuditDockerBrokerState) -> tuple[str, ...]:
         "--filter",
         f"label=hermes-profile={state.profile_name}",
         "--format",
-        "{{.ID}}\t{{.State}}",
+        '{{.ID}}\t{{.State}}\t{{.Label "hermes-egress"}}',
     )
 
 
@@ -155,6 +157,12 @@ def _decide(
         return _Decision("refuse", state)
     if state.cleanup_state == "running":
         return _Decision("refuse", state)
+    if (
+        state.phase == "terminal"
+        and arguments == _expected_removal(state)
+        and (state.active_terminal_calls or state.aggregate_reserved_output_bytes)
+    ):
+        return _Decision("refuse", state)
     if now >= state.deadline:
         return _Decision("breach", _breached(state, "overall deadline"))
     if not _arguments_are_bounded(arguments):
@@ -172,7 +180,7 @@ def _decide(
     elif state.phase == "expect_image" and arguments == _expected_image_inspect(state):
         return _Decision("image", replace(state, phase="image_inflight"))
     elif state.phase == "expect_reuse" and arguments == _expected_reuse_probe(state):
-        output = f"{state.container_id}\trunning\n".encode("ascii")
+        output = f"{state.container_id}\trunning\toff\n".encode("ascii")
         return _Decision("emulated", replace(state, phase="expect_network"), output)
     elif state.phase == "expect_network" and arguments == _expected_network_inspect(state):
         return _Decision("network", replace(state, phase="network_inflight"))

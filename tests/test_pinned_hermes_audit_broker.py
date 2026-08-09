@@ -29,14 +29,14 @@ CONTAINER_ID = "c" * 64
 
 def _installed_pinned_hermes() -> bool:
     try:
-        return importlib.metadata.version("hermes-agent") == "0.19.0"
+        return importlib.metadata.version("hermes-agent") == "0.20.0"
     except importlib.metadata.PackageNotFoundError:
         return False
 
 
 @unittest.skipUnless(
     _installed_pinned_hermes(),
-    "requires installed hermes-agent==0.19.0",
+    "requires installed hermes-agent==0.20.0",
 )
 class PinnedHermesAuditBrokerTests(unittest.TestCase):
     def test_pinned_backend_completes_the_sealed_broker_protocol(self) -> None:
@@ -91,12 +91,27 @@ class PinnedHermesAuditBrokerTests(unittest.TestCase):
                 broker_dir=broker_dir,
                 state_path=state_path,
             )
+            python_candidate = (
+                Path("/usr/bin/python3")
+                if sys.platform.startswith("linux")
+                else Path(sys.executable)
+            )
+            broker_python = python_candidate.resolve(strict=True)
+            python_metadata = broker_python.lstat()
+            self.assertTrue(stat.S_ISREG(python_metadata.st_mode))
+            self.assertEqual(broker_python, broker_python.resolve(strict=True))
+            self.assertIn(python_metadata.st_uid, {0, os.geteuid()})
+            self.assertNotEqual(0, python_metadata.st_mode & stat.S_IXUSR)
+            self.assertEqual(
+                0,
+                python_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH),
+            )
             broker_executable = install_audit_docker_broker(
                 prepared,
                 docker_executable=real_docker,
                 limits=HARD_LIMITS,
                 deadline=time.monotonic() + 120,
-                python_executable=Path(sys.executable).resolve(),
+                python_executable=broker_python,
             )
             self.assertEqual(0o500, stat.S_IMODE(broker_executable.lstat().st_mode))
 
@@ -167,6 +182,7 @@ class PinnedHermesAuditBrokerTests(unittest.TestCase):
             self.assertEqual(1, state.terminal_calls)
             self.assertFalse(state.limit_breach)
             self.assertEqual("complete", state.cleanup_state)
+            self.assertEqual("off", state.hermes_labels["hermes-egress"])
 
             real_calls = [
                 json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()

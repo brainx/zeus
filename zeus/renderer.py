@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from zeus.envfile import dump_env
+from zeus.hermes_security import (
+    UnsupportedFeishuWebhookModeError,
+    validate_hermes_profile_security,
+)
 from zeus.models import BotCreateRequest, BotRecord, HermesTemplate, TemplateError
 from zeus.private_io import (
     UnsafeFileError,
@@ -71,6 +75,10 @@ class ProfileRenderer:
     def preflight(self, request: BotCreateRequest, template: HermesTemplate) -> dict[str, str]:
         """Validate and serialize a profile without mutating the filesystem."""
         validate_request_env(request, template)
+        try:
+            validate_hermes_profile_security(template.hermes.to_config(), request.env)
+        except UnsupportedFeishuWebhookModeError as exc:
+            raise TemplateError(str(exc)) from exc
         return _rendered_profile_files(request, template)
 
     @contextmanager

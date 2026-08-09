@@ -48,7 +48,7 @@ class AuditCliContractTests(unittest.TestCase):
             status,
             AuditMetadata(
                 "1",
-                "0.19.0",
+                "0.20.0",
                 "1",
                 None,
                 "a" * 40,
@@ -265,7 +265,7 @@ class AuditCliContractTests(unittest.TestCase):
             AuditStatus.completed,
             AuditMetadata(
                 "1",
-                "0.19.0",
+                "0.20.0",
                 "1",
                 None,
                 "a" * 40,

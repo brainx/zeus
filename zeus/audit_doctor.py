@@ -29,7 +29,7 @@ from zeus.config import Settings
 from zeus.private_io import UnsafeFileError, inspect_private_directory
 
 _VERSION_OUTPUT_BYTES = 4096
-_VERSION_FIRST_LINE = f"Hermes Agent v{HERMES_VERSION} (2026.7.20)"
+_VERSION_FIRST_LINE = f"Hermes Agent v{HERMES_VERSION} (2026.8.3)"
 _PROCESS_CHUNK = 64 * 1024
 _PROCESS_TERM_SECONDS = 0.2
 _PROCESS_KILL_SECONDS = 0.2

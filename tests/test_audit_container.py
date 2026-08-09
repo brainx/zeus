@@ -94,9 +94,9 @@ class AuditContainerTests(unittest.TestCase):
         self.snapshot_root.mkdir(mode=0o700)
         (self.snapshot_root / "pkg").mkdir(mode=0o700)
         (self.snapshot_root / "README.md").write_bytes(b"committed\n")
-        (self.snapshot_root / "README.md").chmod(0o644)
+        (self.snapshot_root / "README.md").chmod(0o600)
         (self.snapshot_root / "pkg" / "tool.sh").write_bytes(b"#!/bin/sh\nexit 0\n")
-        (self.snapshot_root / "pkg" / "tool.sh").chmod(0o755)
+        (self.snapshot_root / "pkg" / "tool.sh").chmod(0o700)
         os.symlink("README.md", self.snapshot_root / "link")
         root_result = self.snapshot_root.lstat()
         identity = audit_workspace._PathIdentity(
@@ -114,7 +114,7 @@ class AuditContainerTests(unittest.TestCase):
                     path="README.md",
                     object_id="f" * 40,
                     git_mode="100644",
-                    mode=0o644,
+                    mode=0o600,
                     size=10,
                     sha256="cc2e4bb51f522b77c0c3ad04f7a87386a7e06d4fa287c004b6c066410c5c24dc",
                 ),
@@ -131,7 +131,7 @@ class AuditContainerTests(unittest.TestCase):
                     path="pkg/tool.sh",
                     object_id="2" * 40,
                     git_mode="100755",
-                    mode=0o755,
+                    mode=0o700,
                     size=17,
                     sha256="306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb",
                 ),
@@ -193,7 +193,8 @@ class AuditContainerTests(unittest.TestCase):
                 "PortBindings": {},
                 "Tmpfs": {
                     "/workspace": (
-                        f"rw,nosuid,nodev,size=2147483648,uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
+                        f"rw,exec,nosuid,nodev,size=2147483648,uid={AUDIT_UID},"
+                        f"gid={AUDIT_GID},mode=0700"
                     ),
                     "/tmp": (
                         f"rw,noexec,nosuid,nodev,size=536870912,uid={AUDIT_UID},"
@@ -201,10 +202,7 @@ class AuditContainerTests(unittest.TestCase):
                     ),
                 },
             },
-            "Mounts": [
-                {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
-                {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
-            ],
+            "Mounts": [],
             "NetworkSettings": {
                 "Ports": {},
                 "Networks": {
@@ -226,9 +224,6 @@ class AuditContainerTests(unittest.TestCase):
                         "NetworkID": "network-id",
                     }
                 },
-                "IPAddress": "",
-                "Gateway": "",
-                "MacAddress": "",
             },
             "State": {"Running": True},
         }
@@ -255,8 +250,68 @@ class AuditContainerTests(unittest.TestCase):
         )
         return runtime, runner, prepared
 
+    @staticmethod
+    def _seed_archive(
+        entries: list[tuple[tarfile.TarInfo, bytes | None]],
+    ) -> bytes:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for member, content in entries:
+                source = None if content is None else io.BytesIO(content)
+                archive.addfile(member, source)
+        return output.getvalue()
+
+    @staticmethod
+    def _seed_member(
+        name: str,
+        entry_type: bytes,
+        *,
+        content: bytes = b"",
+        linkname: str = "",
+        mode: int = 0o600,
+    ) -> tuple[tarfile.TarInfo, bytes | None]:
+        member = tarfile.TarInfo(name)
+        member.type = entry_type
+        member.mode = mode
+        member.linkname = linkname
+        if entry_type in tarfile.REGULAR_TYPES:
+            member.size = len(content)
+            return member, content
+        return member, None
+
+    @staticmethod
+    def _run_seed(
+        workspace: Path,
+        archive: bytes,
+        *,
+        expected_entries: int,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                getattr(audit_container, "_SEED_SCRIPT", ""),
+                str(expected_entries),
+                str(HARD_LIMITS.snapshot_blob_bytes),
+            ],
+            cwd=workspace,
+            input=archive,
+            capture_output=True,
+            shell=False,
+            timeout=5,
+            check=False,
+        )
+
     def test_prepare_uses_exact_commands_minimal_environment_and_archive(self) -> None:
-        _runtime, runner, prepared = self._prepare()
+        _runtime, runner, prepared = self._prepare(
+            self._inspect(
+                Mounts=[
+                    {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+                    {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+                ]
+            )
+        )
         docker = "/usr/bin/docker"
         name = f"zeus-audit-{RUN_ID}"
         profile = f"audit-{RUN_ID}"
@@ -289,7 +344,7 @@ class AuditContainerTests(unittest.TestCase):
                 "--memory=4294967296",
                 "--memory-swap=4294967296",
                 (
-                    f"--tmpfs=/workspace:rw,nosuid,nodev,size=2147483648,"
+                    f"--tmpfs=/workspace:rw,exec,nosuid,nodev,size=2147483648,"
                     f"uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
                 ),
                 (
@@ -306,9 +361,23 @@ class AuditContainerTests(unittest.TestCase):
         )
         self.assertEqual((docker, "start", CONTAINER_ID), runner.calls[2][0])
         self.assertEqual(
-            (docker, "cp", "--archive", "-", f"{CONTAINER_ID}:/workspace"),
+            (
+                docker,
+                "exec",
+                "-i",
+                f"--user={AUDIT_UID}:{AUDIT_GID}",
+                "--workdir=/workspace",
+                CONTAINER_ID,
+                "python3",
+                "-I",
+                "-c",
+                getattr(audit_container, "_SEED_SCRIPT", "<missing seed script>"),
+                "4",
+                str(HARD_LIMITS.snapshot_blob_bytes),
+            ),
             runner.calls[3][0],
         )
+        self.assertFalse(any(call[0][1] == "cp" for call in runner.calls))
         archive_bytes = runner.calls[3][1] or b""
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
             members = {member.name: member for member in archive.getmembers()}
@@ -319,7 +388,7 @@ class AuditContainerTests(unittest.TestCase):
             self.assertEqual(AUDIT_UID, members["README.md"].uid)
             self.assertEqual(AUDIT_GID, members["README.md"].gid)
             self.assertEqual(0, members["README.md"].mtime)
-            self.assertEqual(0o644, members["README.md"].mode)
+            self.assertEqual(0o600, members["README.md"].mode)
             self.assertEqual(0o700, members["pkg"].mode)
             self.assertEqual("README.md", members["link"].linkname)
             source = archive.extractfile(members["pkg/tool.sh"])
@@ -341,9 +410,14 @@ class AuditContainerTests(unittest.TestCase):
                 str(AUDIT_GID),
                 str(AUDIT_UID),
                 str(AUDIT_GID),
-                "[]",
+                f"[{AUDIT_GID}]",
                 "/proc/self/status",
+                "/proc/self/mountinfo",
                 ".",
+                "/workspace",
+                "/tmp",
+                str(HARD_LIMITS.workspace_bytes),
+                str(HARD_LIMITS.temp_bytes),
             ),
             runner.calls[4][0],
         )
@@ -352,6 +426,152 @@ class AuditContainerTests(unittest.TestCase):
             self.assertEqual({"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}, env)
         self.assertEqual(CONTAINER_ID, prepared.container_id)
         self.assertEqual(0o700, stat.S_IMODE(prepared.broker_dir.lstat().st_mode))
+
+    def test_seed_script_preserves_files_directories_modes_and_confined_symlinks(
+        self,
+    ) -> None:
+        archive = self._seed_archive(
+            [
+                self._seed_member("pkg", tarfile.DIRTYPE, mode=0o700),
+                self._seed_member("README.md", tarfile.REGTYPE, content=b"committed\n", mode=0o600),
+                self._seed_member(
+                    "pkg/tool.sh",
+                    tarfile.REGTYPE,
+                    content=b"#!/bin/sh\nexit 0\n",
+                    mode=0o700,
+                ),
+                self._seed_member(
+                    "pkg/readme-link",
+                    tarfile.SYMTYPE,
+                    linkname="../README.md",
+                    mode=0o777,
+                ),
+            ]
+        )
+        workspace = self.root / "seed-workspace"
+        workspace.mkdir(mode=0o700)
+
+        result = self._run_seed(workspace, archive, expected_entries=4)
+
+        self.assertEqual(b"", result.stderr)
+        self.assertEqual(0, result.returncode)
+        self.assertTrue((workspace / "README.md").is_file())
+        self.assertEqual(b"committed\n", (workspace / "README.md").read_bytes())
+        self.assertEqual(b"#!/bin/sh\nexit 0\n", (workspace / "pkg/tool.sh").read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE((workspace / "README.md").lstat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg").lstat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg/tool.sh").lstat().st_mode))
+        self.assertEqual("../README.md", os.readlink(workspace / "pkg/readme-link"))
+
+    def test_real_seed_archive_round_trips_private_file_modes(self) -> None:
+        spool = self.root / "seed-round-trip-spool"
+        spool.mkdir(mode=0o700)
+        archive = audit_container._build_seed_archive(
+            self.snapshot,
+            _deadline(),
+            limits=HARD_LIMITS,
+            spool_dir=spool,
+        )
+        try:
+            archive_bytes = archive.read()
+        finally:
+            archive.close()
+        workspace = self.root / "seed-round-trip-workspace"
+        workspace.mkdir(mode=0o700)
+
+        result = self._run_seed(workspace, archive_bytes, expected_entries=4)
+
+        self.assertEqual(0, result.returncode, result.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(b"", result.stderr)
+        self.assertEqual(0o600, stat.S_IMODE((workspace / "README.md").lstat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg/tool.sh").lstat().st_mode))
+
+    def test_seed_script_counts_directories_against_the_entry_limit(self) -> None:
+        workspace = self.root / "directory-limit-workspace"
+        workspace.mkdir(mode=0o700)
+        archive = self._seed_archive(
+            [
+                self._seed_member("first", tarfile.DIRTYPE, mode=0o700),
+                self._seed_member("second", tarfile.DIRTYPE, mode=0o700),
+            ]
+        )
+
+        result = self._run_seed(workspace, archive, expected_entries=1)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(b"workspace seed entry limit exceeded", result.stderr)
+        self.assertTrue((workspace / "first").is_dir())
+        self.assertFalse((workspace / "second").exists())
+
+    def test_seed_script_rejects_missing_expected_archive_members(self) -> None:
+        workspace = self.root / "missing-member-workspace"
+        workspace.mkdir(mode=0o700)
+        archive = self._seed_archive([self._seed_member("only", tarfile.DIRTYPE, mode=0o700)])
+
+        result = self._run_seed(workspace, archive, expected_entries=2)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(b"workspace seed entry count mismatch", result.stderr)
+
+    def test_seed_script_rejects_unsafe_paths_types_and_symlinks_without_outside_writes(
+        self,
+    ) -> None:
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"preserve")
+        cases = {
+            "absolute": self._seed_member(
+                str(outside / "absolute"), tarfile.REGTYPE, content=b"escape"
+            ),
+            "parent-traversal": self._seed_member(
+                "../outside/parent", tarfile.REGTYPE, content=b"escape"
+            ),
+            "hardlink": self._seed_member("hardlink", tarfile.LNKTYPE, linkname=str(sentinel)),
+            "character-device": self._seed_member("device", tarfile.CHRTYPE),
+            "block-device": self._seed_member("block-device", tarfile.BLKTYPE),
+            "fifo": self._seed_member("fifo", tarfile.FIFOTYPE),
+            "escaping-symlink": self._seed_member(
+                "escape-link", tarfile.SYMTYPE, linkname="../outside/sentinel"
+            ),
+        }
+        for name, member in cases.items():
+            with self.subTest(name=name):
+                workspace = self.root / f"unsafe-{name}"
+                workspace.mkdir(mode=0o700)
+                before = sentinel.stat()
+
+                result = self._run_seed(
+                    workspace,
+                    self._seed_archive([member]),
+                    expected_entries=1,
+                )
+
+                after = sentinel.stat()
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual(b"preserve", sentinel.read_bytes())
+                self.assertEqual(before.st_ino, after.st_ino)
+                self.assertEqual(before.st_nlink, after.st_nlink)
+                self.assertFalse((outside / "absolute").exists())
+                self.assertFalse((outside / "parent").exists())
+
+    def test_seed_script_rejects_destination_symlink_without_outside_writes(self) -> None:
+        outside = self.root / "destination-outside"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"preserve")
+        workspace = self.root / "destination-workspace"
+        workspace.mkdir(mode=0o700)
+        os.symlink(outside, workspace / "pkg")
+        archive = self._seed_archive(
+            [self._seed_member("pkg/escape", tarfile.REGTYPE, content=b"escape")]
+        )
+
+        result = self._run_seed(workspace, archive, expected_entries=1)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual(b"preserve", sentinel.read_bytes())
+        self.assertFalse((outside / "escape").exists())
 
     def test_tagged_digest_uses_configured_ref_and_canonical_repo_digest_binding(self) -> None:
         digest = DEFAULT_AUDIT_IMAGE.rsplit("@sha256:", 1)[1]
@@ -529,8 +749,28 @@ class AuditContainerTests(unittest.TestCase):
             )
 
     def test_rejects_mount_volume_port_device_privilege_and_namespace_drift(self) -> None:
+        legacy_tmpfs_mounts = [
+            {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+            {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+        ]
         mutations = {
             "mount": ("Mounts", [{"Type": "bind", "Source": "/", "Destination": "/host"}]),
+            "mount-extra": (
+                "Mounts",
+                [
+                    *legacy_tmpfs_mounts,
+                    {"Type": "bind", "Source": "/", "Destination": "/host", "RW": False},
+                ],
+            ),
+            "mount-duplicate": ("Mounts", [*legacy_tmpfs_mounts, legacy_tmpfs_mounts[0]]),
+            "mount-partial": ("Mounts", legacy_tmpfs_mounts[:1]),
+            "mount-malformed": (
+                "Mounts",
+                [
+                    {"Type": "tmpfs", "Destination": "/workspace", "RW": "true"},
+                    legacy_tmpfs_mounts[1],
+                ],
+            ),
             "host-mount": (
                 "HostConfig.Mounts",
                 [{"Type": "bind", "Source": "/", "Target": "/host"}],
@@ -566,6 +806,24 @@ class AuditContainerTests(unittest.TestCase):
                         limits=HARD_LIMITS,
                         deadline=_deadline(),
                     )
+
+    def test_accepts_empty_or_exact_legacy_tmpfs_mount_summary(self) -> None:
+        summaries = (
+            [],
+            [
+                {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+                {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+            ],
+            [
+                {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+                {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+            ],
+        )
+        for mounts in summaries:
+            with self.subTest(mounts=mounts):
+                runtime, _runner, prepared = self._prepare(self._inspect(Mounts=mounts))
+                self.assertEqual(CONTAINER_ID, prepared.container_id)
+                runtime.cleanup(prepared)
 
     def test_rejects_network_security_user_resource_and_identity_drift(self) -> None:
         mutations = {
@@ -604,6 +862,7 @@ class AuditContainerTests(unittest.TestCase):
                 },
             ),
             "effective-ip": ("NetworkSettings.IPAddress", "172.17.0.2"),
+            "effective-ip-null": ("NetworkSettings.IPAddress", None),
             "effective-gateway": ("NetworkSettings.Gateway", "172.17.0.1"),
             "effective-mac": ("NetworkSettings.MacAddress", "02:42:ac:11:00:02"),
             "none-network-ip": (
@@ -633,6 +892,23 @@ class AuditContainerTests(unittest.TestCase):
                         limits=HARD_LIMITS,
                         deadline=_deadline(),
                     )
+
+    def test_accepts_current_or_legacy_empty_top_level_network_summary(self) -> None:
+        summaries = (
+            {},
+            {"IPAddress": "", "Gateway": "", "MacAddress": ""},
+        )
+        for summary in summaries:
+            with self.subTest(summary=summary):
+                value = self._inspect()
+                network = value["NetworkSettings"]
+                self.assertIsInstance(network, dict)
+                for field in ("IPAddress", "Gateway", "MacAddress"):
+                    network.pop(field, None)  # type: ignore[union-attr]
+                network.update(summary)  # type: ignore[union-attr]
+                runtime, _runner, prepared = self._prepare(value)
+                self.assertEqual(CONTAINER_ID, prepared.container_id)
+                runtime.cleanup(prepared)
 
     def test_cleanup_removes_only_exact_reinspected_owned_identity(self) -> None:
         runtime, runner, prepared = self._prepare()
@@ -722,6 +998,34 @@ class AuditContainerTests(unittest.TestCase):
         ]
         return workspace, manifest
 
+    @staticmethod
+    def _mountinfo_entry(
+        identifier: int,
+        path: Path,
+        mount_options: str,
+        *,
+        filesystem_type: str = "tmpfs",
+        source: str = "tmpfs",
+        super_options: str = "rw",
+    ) -> str:
+        result = path.stat()
+        device = f"{os.major(result.st_dev)}:{os.minor(result.st_dev)}"
+        return (
+            f"{identifier} 1 {device} / {path} {mount_options} - "
+            f"{filesystem_type} {source} {super_options}\n"
+        )
+
+    def _validation_mountinfo(self, workspace: Path, temp_root: Path) -> str:
+        return self._mountinfo_entry(
+            100,
+            workspace,
+            "rw,nosuid,nodev,relatime",
+        ) + self._mountinfo_entry(
+            101,
+            temp_root,
+            "rw,nosuid,nodev,noexec,relatime",
+        )
+
     def _run_validation(
         self,
         workspace: Path,
@@ -734,9 +1038,24 @@ class AuditContainerTests(unittest.TestCase):
         expected_groups: list[int] | None = None,
         process_status: str = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t0000000000000000\n",
         probe_root: Path | None = None,
+        mountinfo: str | None = None,
+        temp_root: Path | None = None,
+        expected_workspace_bytes: int | None = None,
+        expected_temp_bytes: int | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         status_path = workspace.parent / "process-status"
         status_path.write_text(process_status, encoding="ascii")
+        effective_temp_root = workspace.parent / "temp" if temp_root is None else temp_root
+        effective_temp_root.mkdir(mode=0o700, exist_ok=True)
+        mountinfo_path = workspace.parent / "mountinfo"
+        mountinfo_path.write_text(
+            self._validation_mountinfo(workspace, effective_temp_root)
+            if mountinfo is None
+            else mountinfo,
+            encoding="ascii",
+        )
+        workspace_filesystem = os.statvfs(workspace)
+        temp_filesystem = os.statvfs(effective_temp_root)
         return subprocess.run(
             [
                 sys.executable,
@@ -749,7 +1068,20 @@ class AuditContainerTests(unittest.TestCase):
                 str(os.getgid() if expected_entry_gid is None else expected_entry_gid),
                 json.dumps(os.getgroups() if expected_groups is None else expected_groups),
                 str(status_path),
+                str(mountinfo_path),
                 str(workspace if probe_root is None else probe_root),
+                str(workspace),
+                str(effective_temp_root),
+                str(
+                    workspace_filesystem.f_blocks * workspace_filesystem.f_frsize
+                    if expected_workspace_bytes is None
+                    else expected_workspace_bytes
+                ),
+                str(
+                    temp_filesystem.f_blocks * temp_filesystem.f_frsize
+                    if expected_temp_bytes is None
+                    else expected_temp_bytes
+                ),
             ],
             cwd=workspace,
             input=json.dumps(manifest, separators=(",", ":")).encode(),
@@ -803,6 +1135,12 @@ class AuditContainerTests(unittest.TestCase):
                 if os.getgroups()
                 else [1]
             },
+            "supplementary-groups-extra": {
+                "expected_groups": [
+                    *os.getgroups(),
+                    max([os.getgid(), *os.getgroups()]) + 1,
+                ]
+            },
             "no-new-privileges": {"process_status": "NoNewPrivs:\t0\nSeccomp:\t2\nCapEff:\t0\n"},
             "seccomp": {"process_status": "NoNewPrivs:\t1\nSeccomp:\t0\nCapEff:\t0\n"},
             "capabilities": {"process_status": "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t1\n"},
@@ -829,6 +1167,123 @@ class AuditContainerTests(unittest.TestCase):
             )
 
             self.assertNotEqual(0, completed.returncode)
+
+    def test_workspace_validation_rejects_effective_mount_drift(self) -> None:
+        mutations = {
+            "workspace-noexec": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "rw,nosuid,nodev,noexec,relatime",
+                1,
+            ),
+            "workspace-suid": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "rw,nodev,relatime",
+                1,
+            ),
+            "workspace-device-enabled": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "rw,nosuid,relatime",
+                1,
+            ),
+            "workspace-read-only": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "ro,nosuid,nodev,relatime",
+                1,
+            ),
+            "workspace-wrong-filesystem": lambda value: value.replace(
+                "- tmpfs tmpfs rw",
+                "- ext4 /dev/root rw",
+                1,
+            ),
+            "workspace-wrong-source": lambda value: value.replace(
+                "- tmpfs tmpfs rw",
+                "- tmpfs other rw",
+                1,
+            ),
+            "workspace-wrong-device": lambda value: value.replace(
+                value.split(" ", 3)[2],
+                "0:0",
+                1,
+            ),
+            "workspace-wrong-root": lambda value: value.replace(" / ", " /nested ", 1),
+            "workspace-escaped-near-match": lambda value: value.replace(
+                value.split(" ")[4],
+                value.split(" ")[4] + r"\040near",
+                1,
+            ),
+            "temp-executable": lambda value: value.replace(
+                "rw,nosuid,nodev,noexec,relatime",
+                "rw,nosuid,nodev,relatime",
+                1,
+            ),
+            "missing-temp": lambda value: value.splitlines(keepends=True)[0],
+            "duplicate-workspace": lambda value: value.splitlines(keepends=True)[0] + value,
+            "malformed-separator": lambda value: value.replace(" - tmpfs", " tmpfs", 1),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                workspace, manifest = self._validation_fixture(base)
+                temp_root = base / "temp"
+                temp_root.mkdir(mode=0o700)
+                mountinfo = mutate(self._validation_mountinfo(workspace, temp_root))
+                self.assertNotEqual(
+                    0,
+                    self._run_validation(
+                        workspace,
+                        manifest,
+                        mountinfo=mountinfo,
+                        temp_root=temp_root,
+                    ).returncode,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace, manifest = self._validation_fixture(base)
+            filesystem = os.statvfs(workspace)
+            self.assertNotEqual(
+                0,
+                self._run_validation(
+                    workspace,
+                    manifest,
+                    expected_workspace_bytes=(
+                        filesystem.f_blocks * filesystem.f_frsize + filesystem.f_frsize
+                    ),
+                ).returncode,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace, manifest = self._validation_fixture(base)
+            temp_root = base / "temp"
+            temp_root.mkdir(mode=0o700)
+            filesystem = os.statvfs(temp_root)
+            self.assertNotEqual(
+                0,
+                self._run_validation(
+                    workspace,
+                    manifest,
+                    temp_root=temp_root,
+                    expected_temp_bytes=(
+                        filesystem.f_blocks * filesystem.f_frsize + filesystem.f_frsize
+                    ),
+                ).returncode,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace, manifest = self._validation_fixture(base)
+            temp_root = base / "temp"
+            temp_root.mkdir(mode=0o700)
+            temp_root.chmod(0o755)
+            self.assertNotEqual(
+                0,
+                self._run_validation(
+                    workspace,
+                    manifest,
+                    temp_root=temp_root,
+                ).returncode,
+            )
 
     def test_archive_enforces_limits_deadline_and_private_spool(self) -> None:
         private_spool = self.root / "spool"
@@ -896,7 +1351,7 @@ class AuditContainerTests(unittest.TestCase):
         ) -> None:
             if tarinfo.name == "README.md" and fileobj is not None:
                 (self.snapshot_root / "README.md").write_bytes(b"tampered!\n")
-                (self.snapshot_root / "README.md").chmod(0o644)
+                (self.snapshot_root / "README.md").chmod(0o600)
             original_addfile(archive, tarinfo, fileobj)
 
         with mock.patch.object(tarfile.TarFile, "addfile", new=mutate_before_stream):
