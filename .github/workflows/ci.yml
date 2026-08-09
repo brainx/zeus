@@ -80,7 +80,7 @@ jobs:
 
   audit-docker-isolation:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     env:

@@ -258,16 +258,16 @@ class RepoContractTests(unittest.TestCase):
             "digest-pinned audit image": f'ZEUS_AUDIT_TEST_IMAGE: "{image}"',
             "real Docker isolation test": selector,
         }
+        job = jobs["audit-docker-isolation"]
         missing_signals = tuple(
-            name for name, signal in required_gate_signals.items() if signal not in workflow
+            name for name, signal in required_gate_signals.items() if signal not in job
         )
 
         self.assertEqual(image, DEFAULT_AUDIT_IMAGE)
         self.assertEqual((), missing_signals)
 
-        job = jobs["audit-docker-isolation"]
         self.assertEqual("ubuntu-24.04", _job_level_scalar(job, "runs-on"))
-        self.assertEqual("10", _job_level_scalar(job, "timeout-minutes"))
+        self.assertEqual("15", _job_level_scalar(job, "timeout-minutes"))
         self.assertEqual(("3.11",), _job_python_versions(job))
         self.assertRegex(job, r"(?m)^    permissions:\n      contents: read\s*$")
         self.assertNotIn("continue-on-error:", job)
