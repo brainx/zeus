@@ -63,9 +63,7 @@ def _parse_document(text: str) -> dict[str, Any]:
         raise _UnsupportedYamlError
     text = text.replace("\r\n", "\n")
     if "\r" in text or any(
-        ord(character) < 0x20
-        or 0x7F <= ord(character) <= 0x9F
-        or character in {"\u2028", "\u2029"}
+        ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F or character in {"\u2028", "\u2029"}
         for character in text
         if character != "\n"
     ):
@@ -214,9 +212,7 @@ def _parse_key(value: str) -> str:
     if any(character in parsed for character in "[]{}"):
         raise _UnsupportedYamlError
     if not quoted and (
-        parsed.casefold() in _YAML_IMPLICIT_KEYS
-        or parsed[0].isdigit()
-        or parsed[0] in "+-.~"
+        parsed.casefold() in _YAML_IMPLICIT_KEYS or parsed[0].isdigit() or parsed[0] in "+-.~"
     ):
         raise _UnsupportedYamlError
     return parsed
@@ -229,9 +225,7 @@ def _parse_scalar(value: str) -> Any:
         return _parse_json_value(value)
     if value[0] in "&*!|>@`" or value in {"---", "..."}:
         raise _UnsupportedYamlError
-    if ": " in value or any(
-        token.startswith(("&", "*", "!")) for token in value.split()
-    ):
+    if ": " in value or any(token.startswith(("&", "*", "!")) for token in value.split()):
         raise _UnsupportedYamlError
     return value
 

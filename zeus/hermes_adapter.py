@@ -26,6 +26,7 @@ SAFE_ENV_DEFAULTS = [
     "REQUESTS_CA_BUNDLE",
 ]
 
+
 def _base_env() -> dict[str, str]:
     env: dict[str, str] = {}
     for name in SAFE_ENV_DEFAULTS:

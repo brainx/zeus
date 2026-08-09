@@ -425,10 +425,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             profile = hermes_root / "profiles" / "coder"
             profile.mkdir(parents=True)
             (profile / "config.yaml").write_text(
-                "platforms:\n"
-                "  feishu:\n"
-                "    extra:\n"
-                "      connection_mode: webhook\n",
+                "platforms:\n  feishu:\n    extra:\n      connection_mode: webhook\n",
                 encoding="utf-8",
             )
             (profile / ".env").write_text("", encoding="utf-8")

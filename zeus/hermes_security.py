@@ -53,8 +53,7 @@ def _root_feishu_connection_modes(config: Mapping[str, Any]) -> list[tuple[str, 
     matches = [
         value
         for key, value in config.items()
-        if isinstance(key, str)
-        and key.strip().casefold() == "feishu_connection_mode"
+        if isinstance(key, str) and key.strip().casefold() == "feishu_connection_mode"
     ]
     if len(matches) > 1:
         raise UnsupportedFeishuWebhookModeError(

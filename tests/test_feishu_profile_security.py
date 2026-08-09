@@ -228,12 +228,10 @@ class FeishuProfileSecurityTests(unittest.TestCase):
         sensitive_value = "dotenv-sensitive-value"
         cases = {
             "inline comment": (
-                "FEISHU_CONNECTION_MODE=webhook # comment\n"
-                f"PRIVATE_CONTEXT={sensitive_value}\n"
+                f"FEISHU_CONNECTION_MODE=webhook # comment\nPRIVATE_CONTEXT={sensitive_value}\n"
             ),
             "quoted key": (
-                "'FEISHU_CONNECTION_MODE'=webhook\n"
-                f"PRIVATE_CONTEXT={sensitive_value}\n"
+                f"'FEISHU_CONNECTION_MODE'=webhook\nPRIVATE_CONTEXT={sensitive_value}\n"
             ),
             "duplicate alternate key": (
                 "FEISHU_CONNECTION_MODE=websocket\n"
@@ -246,12 +244,10 @@ class FeishuProfileSecurityTests(unittest.TestCase):
                 f"PRIVATE_CONTEXT={sensitive_value}\n"
             ),
             "nul sanitized by Hermes": (
-                "\x00FEISHU_CONNECTION_MODE=webhook\n"
-                f"PRIVATE_CONTEXT={sensitive_value}\n"
+                f"\x00FEISHU_CONNECTION_MODE=webhook\nPRIVATE_CONTEXT={sensitive_value}\n"
             ),
             "bom sanitized by Hermes": (
-                "\ufeffFEISHU_CONNECTION_MODE=webhook\n"
-                f"PRIVATE_CONTEXT={sensitive_value}\n"
+                f"\ufeffFEISHU_CONNECTION_MODE=webhook\nPRIVATE_CONTEXT={sensitive_value}\n"
             ),
         }
         for name, profile_env in cases.items():
@@ -382,8 +378,7 @@ class FeishuProfileSecurityTests(unittest.TestCase):
             "canonical": 'FEISHU_CONNECTION_MODE: "  WebHook\\t"\n',
             "case alias": "feishu_connection_mode: WEBHOOK\n",
             "normalized duplicate": (
-                "FEISHU_CONNECTION_MODE: websocket\n"
-                "feishu_connection_mode: webhook\n"
+                "FEISHU_CONNECTION_MODE: websocket\nfeishu_connection_mode: webhook\n"
             ),
         }
         for name, config in cases.items():
@@ -431,16 +426,10 @@ class FeishuProfileSecurityTests(unittest.TestCase):
                 "        connection_mode: webhook\n"
             ),
             "gateway.feishu.extra.connection_mode": (
-                "gateway:\n"
-                "  feishu:\n"
-                "    extra:\n"
-                "      connection_mode: WEBHOOK\n"
+                "gateway:\n  feishu:\n    extra:\n      connection_mode: WEBHOOK\n"
             ),
             "platforms.feishu.extra.connection_mode case variant": (
-                "platforms:\n"
-                "  FEISHU:\n"
-                "    extra:\n"
-                "      connection_mode: webhook\n"
+                "platforms:\n  FEISHU:\n    extra:\n      connection_mode: webhook\n"
             ),
             "gateway.platforms.feishu.extra.connection_mode case variant": (
                 "gateway:\n"
@@ -450,10 +439,7 @@ class FeishuProfileSecurityTests(unittest.TestCase):
                 "        connection_mode: webhook\n"
             ),
             "gateway.feishu.extra.connection_mode case variant": (
-                "gateway:\n"
-                "  FEISHU:\n"
-                "    extra:\n"
-                "      connection_mode: webhook\n"
+                "gateway:\n  FEISHU:\n    extra:\n      connection_mode: webhook\n"
             ),
             "platforms.feishu.extra.connection_mode normalized duplicate": (
                 "platforms:\n"
@@ -487,9 +473,7 @@ class FeishuProfileSecurityTests(unittest.TestCase):
         self.assertEqual(["hermes", "-p", "feishu-bot", "gateway", "run"], argv)
 
     def test_command_rejects_webhook_in_legacy_gateway_config(self) -> None:
-        legacy = (
-            '{"platforms":{"feishu":{"extra":{"connection_mode":" webhook "}}}}'
-        )
+        legacy = '{"platforms":{"feishu":{"extra":{"connection_mode":" webhook "}}}}'
         with tempfile.TemporaryDirectory() as tmp:
             adapter = self._runtime_adapter(
                 Path(tmp) / "hermes",
@@ -515,12 +499,7 @@ class FeishuProfileSecurityTests(unittest.TestCase):
         self.assertEqual(["hermes", "-p", "feishu-bot", "gateway", "run"], argv)
 
     def test_launcher_payload_rejects_webhook_in_persisted_profile_config(self) -> None:
-        config = (
-            "platforms:\n"
-            "  feishu:\n"
-            "    extra:\n"
-            "      connection_mode: WEBHOOK\n"
-        )
+        config = "platforms:\n  feishu:\n    extra:\n      connection_mode: WEBHOOK\n"
         with tempfile.TemporaryDirectory() as tmp:
             adapter = self._runtime_adapter(Path(tmp) / "hermes", profile_config=config)
             with self.assertRaisesRegex(
@@ -535,12 +514,7 @@ class FeishuProfileSecurityTests(unittest.TestCase):
                 )
 
     def test_run_rejects_webhook_in_persisted_profile_config_before_launch(self) -> None:
-        config = (
-            "platforms:\n"
-            "  feishu:\n"
-            "    extra:\n"
-            "      connection_mode: webhook\n"
-        )
+        config = "platforms:\n  feishu:\n    extra:\n      connection_mode: webhook\n"
         with tempfile.TemporaryDirectory() as tmp:
             adapter = self._runtime_adapter(Path(tmp) / "hermes", profile_config=config)
             with (
@@ -587,12 +561,7 @@ class FeishuProfileSecurityTests(unittest.TestCase):
 
     def test_runtime_entry_points_allow_persisted_websocket_mode(self) -> None:
         mode = "  WebSocket\\t"
-        config = (
-            "platforms:\n"
-            "  feishu:\n"
-            "    extra:\n"
-            f'      connection_mode: "{mode}"\n'
-        )
+        config = f'platforms:\n  feishu:\n    extra:\n      connection_mode: "{mode}"\n'
         with tempfile.TemporaryDirectory() as tmp:
             adapter = self._runtime_adapter(
                 Path(tmp) / "hermes",
