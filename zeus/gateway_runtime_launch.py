@@ -25,7 +25,7 @@ from zeus.gateway_runtime_stop import _GatewayRuntimeStop
 from zeus.hermes_profile_config import HermesProfileConfigError
 from zeus.hermes_profile_environment import HermesProfileEnvironmentError
 from zeus.hermes_security import UnsupportedFeishuWebhookModeError
-from zeus.models import BotRecord, TemplateError
+from zeus.models import BotRecord, StoredProfilePreflightError, TemplateError
 from zeus.private_io import open_private_append
 from zeus.readiness import ReadinessProbe
 
@@ -57,7 +57,7 @@ class _GatewayRuntimeLaunch(_GatewayRuntimeStop):
             HermesProfileEnvironmentError,
             UnsupportedFeishuWebhookModeError,
         ) as exc:
-            raise TemplateError(str(exc)) from exc
+            raise StoredProfilePreflightError(str(exc)) from exc
         return readiness
 
     def launch(

@@ -131,6 +131,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         profile_path = root / "hermes" / "profiles" / "coder"
         profile_path.mkdir(parents=True, exist_ok=True)
         (profile_path / ".env").write_text("", encoding="utf-8")
+        (profile_path / "config.yaml").write_text("model: test\n", encoding="utf-8")
         store = StateStore(root / "zeus.db")
         store.init()
         store.upsert_bot(
@@ -284,6 +285,19 @@ class LifecycleRegressionTests(unittest.TestCase):
             for timeout in (-1.0, 0.09, 301.0, float("inf"), float("nan")):
                 with self.subTest(timeout=timeout), self.assertRaises(TemplateError):
                     supervisor.start("coder", timeout_seconds=timeout)
+                loaded = store.get_bot("coder")
+                assert loaded is not None
+                # Invalid caller input must not be converted into a failed projection.
+                self.assertEqual(BotStatus.stopped, loaded.status)
+                # Validation must remain before lifecycle intent creation.
+                self.assertIsNone(loaded.pending_operation_id)
+                # Rejected caller input must not become a lifecycle failure event.
+                self.assertEqual(
+                    [],
+                    store.list_lifecycle_events("coder", limit=10, before=None),
+                )
+                # Rejected caller input must not be recorded as a gateway start failure.
+                self.assertFalse(store.audit_log_path().exists())
 
     def test_start_and_stop_events_share_operation_context_without_synthetic_cli_request_id(
         self,

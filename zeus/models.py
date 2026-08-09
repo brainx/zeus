@@ -20,6 +20,10 @@ class TemplateError(ValueError):
     pass
 
 
+class StoredProfilePreflightError(TemplateError):
+    """Raised when persisted profile data fails gateway launch preflight."""
+
+
 class BotStatus(StrEnum):
     stopped = "stopped"
     starting = "starting"
