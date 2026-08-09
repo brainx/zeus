@@ -15,6 +15,7 @@ from pathlib import Path
 
 from scripts.check_version_tag import _has_exact_changelog_heading
 from zeus import __version__
+from zeus.audit_config import DEFAULT_AUDIT_IMAGE
 from zeus.state import SCHEMA_VERSION
 
 
@@ -244,6 +245,42 @@ class RepoContractTests(unittest.TestCase):
         self.assertFalse(Path("docs/superpowers").exists())
         self.assertFalse(Path("docs/REPO_GENERATION.md").exists())
 
+    def test_ci_runs_fail_closed_real_docker_audit_isolation(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        jobs = _workflow_job_bodies(workflow)
+        image = (
+            "nikolaik/python-nodejs:python3.11-nodejs20@sha256:"
+            "8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
+        )
+        selector = "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests"
+        required_gate_signals = {
+            "Docker isolation opt-in": 'ZEUS_RUN_DOCKER_ISOLATION: "1"',
+            "digest-pinned audit image": f'ZEUS_AUDIT_TEST_IMAGE: "{image}"',
+            "real Docker isolation test": selector,
+        }
+        missing_signals = tuple(
+            name for name, signal in required_gate_signals.items() if signal not in workflow
+        )
+
+        self.assertEqual(image, DEFAULT_AUDIT_IMAGE)
+        self.assertEqual((), missing_signals)
+
+        job = jobs["audit-docker-isolation"]
+        self.assertEqual("ubuntu-24.04", _job_level_scalar(job, "runs-on"))
+        self.assertEqual("10", _job_level_scalar(job, "timeout-minutes"))
+        self.assertEqual(("3.11",), _job_python_versions(job))
+        self.assertRegex(job, r"(?m)^    permissions:\n      contents: read\s*$")
+        self.assertNotIn("continue-on-error:", job)
+        self.assertNotIn("secrets.", job)
+        self.assertEqual(
+            (
+                "python -m pip install -e . -r requirements-dev-ci.txt",
+                'docker version\ndocker info\ndocker pull "$ZEUS_AUDIT_TEST_IMAGE"',
+                f"python -m unittest -v {selector}",
+            ),
+            _job_run_commands(job),
+        )
+
     def test_ci_runs_project_test_script_on_supported_python_versions(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
         jobs = _workflow_job_bodies(workflow)
@@ -252,6 +289,7 @@ class RepoContractTests(unittest.TestCase):
             "test": "ubuntu-24.04",
             "python-3-14": "ubuntu-24.04",
             "lifecycle-subprocess": "ubuntu-24.04",
+            "audit-docker-isolation": "ubuntu-24.04",
             "macos-process-lifecycle": "macos-26",
             "real-hermes": "ubuntu-24.04",
             "package": "ubuntu-24.04",
@@ -260,6 +298,7 @@ class RepoContractTests(unittest.TestCase):
             "test": ("3.11", "3.12", "3.13"),
             "python-3-14": ("3.14",),
             "lifecycle-subprocess": ("3.11",),
+            "audit-docker-isolation": ("3.11",),
             "macos-process-lifecycle": ("3.13",),
             "real-hermes": ("3.11",),
             "package": ("3.11",),
@@ -268,6 +307,7 @@ class RepoContractTests(unittest.TestCase):
             "test": "${{ matrix.python-version }}",
             "python-3-14": '"3.14"',
             "lifecycle-subprocess": '"3.11"',
+            "audit-docker-isolation": '"3.11"',
             "macos-process-lifecycle": '"3.13"',
             "real-hermes": '"3.11"',
             "package": '"3.11"',
@@ -292,6 +332,12 @@ class RepoContractTests(unittest.TestCase):
             "lifecycle-subprocess": (
                 "python -m pip install -e . -r requirements-dev-ci.txt",
                 "python -m unittest tests.test_subprocess_lifecycle",
+            ),
+            "audit-docker-isolation": (
+                "python -m pip install -e . -r requirements-dev-ci.txt",
+                'docker version\ndocker info\ndocker pull "$ZEUS_AUDIT_TEST_IMAGE"',
+                "python -m unittest -v "
+                "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests",
             ),
             "macos-process-lifecycle": (
                 "python -m pip install -e . -r requirements-dev-ci.txt",
@@ -885,6 +931,18 @@ class RepoContractTests(unittest.TestCase):
                     "Focused multi-process lifecycle and locking behavior",
                 ),
             ),
+            "audit-docker-isolation": (
+                ci_jobs["audit-docker-isolation"],
+                "Audit Docker isolation",
+                "ubuntu-24.04",
+                ("3.11",),
+                (
+                    "Linux `ubuntu-24.04`",
+                    "Python 3.11",
+                    "Real Docker containment, including network denial, host-secret "
+                    "exclusion, read-only root, and cleanup",
+                ),
+            ),
             "macos-process-lifecycle": (
                 ci_jobs["macos-process-lifecycle"],
                 "macOS process lifecycle",
@@ -951,7 +1009,10 @@ class RepoContractTests(unittest.TestCase):
             f'`requires-python = "{requires_python.group(1)}"`',
             compatibility_text,
         )
-        self.assertIn("lifecycle and package jobs use Python 3.11", compatibility_text)
+        self.assertIn(
+            "lifecycle, audit-isolation, and package jobs use Python 3.11",
+            compatibility_text,
+        )
         self.assertIn("Debian and Ubuntu", compatibility_text)
         self.assertIn("Hermes Agent 0.20.0", compatibility_text)
         self.assertIn(

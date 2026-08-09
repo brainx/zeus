@@ -11,18 +11,20 @@ an untested platform or external Hermes release into a support claim.
 | Main CI matrix | Linux `ubuntu-24.04` | Python 3.11, 3.12, and 3.13 | Unit and integration tests, repository contracts, source-and-branch coverage, formatting, lint, typing, Bandit, and ShellCheck |
 | Provisional Python compatibility | Linux `ubuntu-24.04` | Python 3.14 | Full Zeus test suite; non-required and Zeus-only because the pinned Hermes baseline requires Python below 3.14 |
 | Subprocess lifecycle | Linux `ubuntu-24.04` | Python 3.11 | Focused multi-process lifecycle and locking behavior |
+| Audit Docker isolation | Linux `ubuntu-24.04` | Python 3.11 | Real Docker containment, including network denial, host-secret exclusion, read-only root, and cleanup |
 | macOS process lifecycle | macOS `macos-26` | Python 3.13 | Focused process, fake-Hermes integration, and gateway-launcher recovery tests |
 | Real Hermes compatibility | Linux `ubuntu-24.04` | Python 3.11 | Hash-locked Hermes Agent 0.20.0 source install, profile rendering, strict diagnostics, sealed audit-broker transcript, loopback gateway readiness, process ownership, and clean shutdown without a model-provider credential |
 | Package build | Linux `ubuntu-24.04` | Python 3.11 | Wheel and source build, installed-wheel smoke test, dependency consistency, and metadata checks |
 | Tagged release build | Linux `ubuntu-24.04` | Python 3.11 | Full release gate, artifact checksums, and GitHub release artifacts |
 
-In short, the focused Linux lifecycle and package jobs use Python 3.11. Main CI
-and both tagged-release jobs use the explicit `ubuntu-24.04` image. The release
-build is bounded to 20 minutes and the privileged publish job to 10 minutes.
-The focused macOS lane uses `macos-26` and Python 3.13. Windows is not currently
-automated. GitHub manages the contents of all hosted runner images and may update
-them over time; results from an individual developer machine remain local evidence
-rather than an automated platform guarantee.
+In short, the focused Linux lifecycle, audit-isolation, and package jobs use
+Python 3.11. Main CI and both tagged-release jobs use the explicit
+`ubuntu-24.04` image. The release build is bounded to 20 minutes and the
+privileged publish job to 10 minutes. The focused macOS lane uses `macos-26` and
+Python 3.13. Windows is not currently automated. GitHub manages the contents of
+all hosted runner images and may update them over time; results from an
+individual developer machine remain local evidence rather than an automated
+platform guarantee.
 
 Python 3.14 is a provisional Zeus-only lane with `continue-on-error` behavior.
 It does not promote Python 3.14 to required Hermes compatibility: the repository
@@ -119,10 +121,12 @@ Hermes process.
 
 The repository-command container is admitted only after Zeus validates network
 mode `none`, no host bind mounts, an unprivileged UID, dropped capabilities,
-read-only root, bounded tmpfs, and the pinned image. The real Linux Docker
-isolation gate is deliberately opt-in: set `ZEUS_RUN_DOCKER_ISOLATION=1` and
-`ZEUS_AUDIT_TEST_IMAGE` on a Linux Docker host to execute it. A skipped gate,
-including when Docker is unavailable, does not establish runtime isolation.
+read-only root, bounded tmpfs, and the pinned image. CI runs the real Linux
+Docker isolation gate on Ubuntu 24.04 with the exact default image digest
+preloaded. Local runs remain deliberately opt-in: set
+`ZEUS_RUN_DOCKER_ISOLATION=1` and `ZEUS_AUDIT_TEST_IMAGE` on a Linux Docker host
+to execute it. A skipped local gate, including when Docker is unavailable,
+does not establish runtime isolation.
 
 Audit always examines the exact committed `HEAD`, not dirty or untracked
 content. It is report-only: it does not remediate, schedule work, or coordinate

@@ -78,6 +78,29 @@ jobs:
       - name: Run subprocess lifecycle tests
         run: python -m unittest tests.test_subprocess_lifecycle
 
+  audit-docker-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      ZEUS_RUN_DOCKER_ISOLATION: "1"
+      ZEUS_AUDIT_TEST_IMAGE: "nikolaik/python-nodejs:python3.11-nodejs20@sha256:8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install package and dev tools
+        run: python -m pip install -e . -r requirements-dev-ci.txt
+      - name: Verify Docker and preload the pinned audit image
+        run: |
+          docker version
+          docker info
+          docker pull "$ZEUS_AUDIT_TEST_IMAGE"
+      - name: Run real Docker audit isolation test
+        run: python -m unittest -v tests.test_audit_docker_isolation.RealDockerAuditIsolationTests
+
   macos-process-lifecycle:
     runs-on: macos-26
     timeout-minutes: 15
