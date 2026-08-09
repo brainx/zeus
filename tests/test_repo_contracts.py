@@ -97,6 +97,17 @@ def _job_run_commands(job_body: str) -> tuple[str, ...]:
     return tuple(commands)
 
 
+def _job_step_bodies(job_body: str) -> tuple[str, ...]:
+    lines = job_body.splitlines()
+    starts = [index for index, line in enumerate(lines) if re.match(r"^      - ", line)]
+    return tuple(
+        textwrap.dedent(
+            "\n".join(lines[start : starts[index + 1] if index + 1 < len(starts) else None])
+        ).strip()
+        for index, start in enumerate(starts)
+    )
+
+
 def _markdown_table_rows(markdown: str) -> dict[str, tuple[str, ...]]:
     rows: dict[str, tuple[str, ...]] = {}
     for line in markdown.splitlines():
@@ -458,6 +469,29 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn(broker, commands)
         self.assertEqual(commands.index(verifier) + 1, commands.index(broker))
         self.assertIn("if-no-files-found: error", _workflow_job_bodies(workflow)["real-hermes"])
+
+    def test_real_hermes_broker_upload_step_is_exact_and_immediate(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        steps = _job_step_bodies(_workflow_job_bodies(workflow)["real-hermes"])
+        broker_name = "- name: Verify pinned Hermes audit broker transcript"
+        broker_indexes = [index for index, step in enumerate(steps) if step.startswith(broker_name)]
+        expected_upload = (
+            "- name: Upload sanitized failure evidence\n"
+            "  if: failure()\n"
+            "  uses: actions/upload-artifact@"
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1\n"
+            "  with:\n"
+            "    name: real-hermes-failure-evidence\n"
+            "    path: .tmp/real-hermes-evidence/summary.txt\n"
+            "    if-no-files-found: error\n"
+            "    retention-days: 7"
+        )
+
+        self.assertEqual(1, len(broker_indexes))
+        upload_index = broker_indexes[0] + 1
+        self.assertLess(upload_index, len(steps))
+        self.assertEqual(expected_upload, steps[upload_index])
+        self.assertEqual(1, steps.count(expected_upload))
 
     def test_pinned_hermes_broker_selects_a_trusted_linux_system_python(self) -> None:
         source = Path("tests/test_pinned_hermes_audit_broker.py").read_text(encoding="utf-8")
