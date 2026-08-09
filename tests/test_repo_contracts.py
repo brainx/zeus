@@ -252,7 +252,10 @@ class RepoContractTests(unittest.TestCase):
             "nikolaik/python-nodejs:python3.11-nodejs20@sha256:"
             "8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
         )
-        selector = "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests"
+        selector = (
+            "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests."
+            "test_real_docker_isolation"
+        )
         required_gate_signals = {
             "Docker isolation opt-in": 'ZEUS_RUN_DOCKER_ISOLATION: "1"',
             "digest-pinned audit image": f'ZEUS_AUDIT_TEST_IMAGE: "{image}"',
@@ -271,10 +274,11 @@ class RepoContractTests(unittest.TestCase):
         self.assertEqual(("3.11",), _job_python_versions(job))
         self.assertRegex(job, r"(?m)^    permissions:\n      contents: read\s*$")
         self.assertNotIn("continue-on-error:", job)
+        self.assertNotRegex(job, r"(?m)^ {4,}if:\s")
         self.assertNotIn("secrets.", job)
         self.assertEqual(
             (
-                "python -m pip install -e . -r requirements-dev-ci.txt",
+                "python -m pip install -e .",
                 'docker version\ndocker info\ndocker pull "$ZEUS_AUDIT_TEST_IMAGE"',
                 f"python -m unittest -v {selector}",
             ),
@@ -334,10 +338,11 @@ class RepoContractTests(unittest.TestCase):
                 "python -m unittest tests.test_subprocess_lifecycle",
             ),
             "audit-docker-isolation": (
-                "python -m pip install -e . -r requirements-dev-ci.txt",
+                "python -m pip install -e .",
                 'docker version\ndocker info\ndocker pull "$ZEUS_AUDIT_TEST_IMAGE"',
                 "python -m unittest -v "
-                "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests",
+                "tests.test_audit_docker_isolation.RealDockerAuditIsolationTests."
+                "test_real_docker_isolation",
             ),
             "macos-process-lifecycle": (
                 "python -m pip install -e . -r requirements-dev-ci.txt",
