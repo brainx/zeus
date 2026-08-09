@@ -31,6 +31,7 @@ from zeus.doctor import _check_bots, _check_runtime_paths, run_doctor
 from zeus.envfile import parse_env_text
 from zeus.errors import BotArchiveError, BotDeleteError, BotExistsError
 from zeus.hermes_adapter import HermesAdapter
+from zeus.hermes_profile_environment import HermesProfileEnvironmentError
 from zeus.lifecycle import LifecycleEventInput
 from zeus.logging_utils import redact_secrets
 from zeus.models import BotRecord, BotStatus, BotStatusResponse, DesiredState, RestartPolicy
@@ -313,7 +314,7 @@ class SupervisorCliApiTests(unittest.TestCase):
 
             self.assertEqual("line one\nline two # not comment", env["OPENROUTER_API_KEY"])
 
-    def test_adapter_does_not_allow_profile_env_to_override_hermes_home(self) -> None:
+    def test_adapter_rejects_profile_env_hermes_home_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hermes_root = Path(tmp) / ".zeus" / "hermes"
             profile = hermes_root / "profiles" / "coder"
@@ -324,10 +325,15 @@ class SupervisorCliApiTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            _, env = HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
+            with self.assertRaises(HermesProfileEnvironmentError) as raised:
+                HermesAdapter("hermes", hermes_root).command("coder", "gateway", "run")
 
-            self.assertEqual(str(hermes_root), env["HERMES_HOME"])
-            self.assertEqual("enabled", env["CUSTOM_FLAG"])
+            self.assertEqual(
+                "Hermes profile environment could not be validated safely",
+                str(raised.exception),
+            )
+            self.assertNotIn("different-hermes", str(raised.exception))
+            self.assertNotIn("enabled", str(raised.exception))
 
     def test_adapter_does_not_leak_parent_secrets_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -21,6 +21,7 @@ from zeus.hermes_profile_config import (
     HERMES_PROFILE_CONFIG_MAX_BYTES,
     HermesProfileConfigError,
 )
+from zeus.hermes_profile_environment import HermesProfileEnvironmentError
 from zeus.hermes_security import UnsupportedFeishuWebhookModeError
 from zeus.models import BotCreateRequest, HermesTemplate, TemplateError
 from zeus.renderer import ProfileRenderer
@@ -264,6 +265,63 @@ class FeishuProfileSecurityTests(unittest.TestCase):
                     str(raised.exception),
                 )
                 self.assertNotIn(sensitive_value, str(raised.exception))
+
+    def test_runtime_entry_points_reject_persisted_hermes_home_override(self) -> None:
+        assignments = (
+            "HERMES_HOME=/tmp/redirected-sensitive-profile\n",
+            "export HERMES_HOME = /tmp/redirected-sensitive-profile\n",
+            "'HERMES_HOME'=/tmp/redirected-sensitive-profile\n",
+        )
+        for entry_point in ("command", "launcher_payload", "run"):
+            for assignment in assignments:
+                with (
+                    self.subTest(entry_point=entry_point, assignment=assignment),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    adapter = self._runtime_adapter(
+                        Path(tmp) / "hermes",
+                        assignment,
+                    )
+                    with (
+                        mock.patch(
+                            "zeus.hermes_adapter.subprocess.run",
+                            side_effect=AssertionError("Hermes must not launch"),
+                        ) as run,
+                        self.assertRaises(HermesProfileEnvironmentError) as raised,
+                    ):
+                        if entry_point == "command":
+                            adapter.command("feishu-bot", "gateway", "run")
+                        elif entry_point == "launcher_payload":
+                            adapter.launcher_payload(
+                                "feishu-bot",
+                                operation_id="a" * 32,
+                                desired_revision=1,
+                                readiness_probe=None,
+                            )
+                        else:
+                            adapter.run("feishu-bot", "gateway", "run")
+
+                    self.assertEqual(
+                        "Hermes profile environment could not be validated safely",
+                        str(raised.exception),
+                    )
+                    self.assertNotIn("redirected-sensitive-profile", str(raised.exception))
+                    run.assert_not_called()
+
+    def test_runtime_allows_non_overriding_profile_op_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            adapter = self._runtime_adapter(root)
+            profile = root / "profiles" / "feishu-bot"
+            (profile / ".op.env").write_text(
+                "HERMES_HOME=/tmp/non-overriding-profile\n",
+                encoding="utf-8",
+            )
+
+            argv, environment = adapter.command("feishu-bot", "gateway", "run")
+
+        self.assertEqual(["hermes", "-p", "feishu-bot", "gateway", "run"], argv)
+        self.assertEqual(str(root), environment["HERMES_HOME"])
 
     def test_runtime_preserves_allowed_websocket_modes(self) -> None:
         ambient_mode = "  WebSocket\t"

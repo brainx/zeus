@@ -11,6 +11,7 @@ HERMES_PROFILE_ENV_MAX_BYTES = 64 * 1024
 _FEISHU_MODE = "FEISHU_CONNECTION_MODE"
 _INVALID_ENV_MESSAGE = "Hermes profile environment could not be validated safely"
 _UNQUOTED_MODE_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
+_RESERVED_PROFILE_KEYS = frozenset({"HERMES_HOME"})
 
 
 class HermesProfileEnvironmentError(ValueError):
@@ -30,6 +31,7 @@ def load_hermes_profile_environment(path: Path) -> dict[str, str]:
         )
         text = data.decode("utf-8", errors="strict")
         text = _validated_text(text)
+        _reject_reserved_assignments(text)
         found_mode, mode = _strict_feishu_mode(text)
         values = parse_env_text(text)
         if found_mode:
@@ -84,6 +86,33 @@ def _strict_feishu_mode(text: str) -> tuple[bool, str]:
         mode = _parse_mode_value(assignment.group(1).strip())
         found = True
     return found, mode
+
+
+def _reject_reserved_assignments(text: str) -> None:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export") and len(line) > len("export"):
+            suffix = line[len("export")]
+            if suffix.isspace():
+                line = line[len("export") :].lstrip()
+
+        if line.startswith(("'", '"')):
+            quote = line[0]
+            closing = line.find(quote, 1)
+            if closing < 0:
+                continue
+            key = line[1:closing]
+            remainder = line[closing + 1 :]
+        else:
+            key_match = re.match(r"([^=\s#]+)", line)
+            if key_match is None:
+                continue
+            key = key_match.group(1)
+            remainder = line[key_match.end() :]
+        if key in _RESERVED_PROFILE_KEYS and re.match(r"\s*=", remainder):
+            raise _UnsupportedDotenvError
 
 
 def _parse_mode_value(raw_value: str) -> str:
