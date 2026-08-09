@@ -364,6 +364,12 @@ class RepoContractTests(unittest.TestCase):
                 "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \\\n"
                 "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
                 "sh scripts/verify_real_hermes.sh",
+                "mkdir -p .tmp/real-hermes-evidence\n"
+                "chmod 0700 .tmp/real-hermes-evidence\n"
+                "umask 077\n"
+                "printf '%s\\n' 'result=failed' \\\n"
+                "  'failure_stage=pinned_hermes_audit_broker' \\\n"
+                "  > .tmp/real-hermes-evidence/summary.txt\n"
                 "python -m unittest -v tests.test_pinned_hermes_audit_broker",
             ),
             "package": (
@@ -428,6 +434,43 @@ class RepoContractTests(unittest.TestCase):
             "twine check dist/*",
         ):
             self.assertLess(pip_check_index, package_commands.index(later_command))
+
+    def test_real_hermes_broker_failure_evidence_is_private_and_ordered(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        commands = _job_run_commands(_workflow_job_bodies(workflow)["real-hermes"])
+        verifier = (
+            "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
+            "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \\\n"
+            "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
+            "sh scripts/verify_real_hermes.sh"
+        )
+        broker = (
+            "mkdir -p .tmp/real-hermes-evidence\n"
+            "chmod 0700 .tmp/real-hermes-evidence\n"
+            "umask 077\n"
+            "printf '%s\\n' 'result=failed' \\\n"
+            "  'failure_stage=pinned_hermes_audit_broker' \\\n"
+            "  > .tmp/real-hermes-evidence/summary.txt\n"
+            "python -m unittest -v tests.test_pinned_hermes_audit_broker"
+        )
+
+        self.assertIn(verifier, commands)
+        self.assertIn(broker, commands)
+        self.assertEqual(commands.index(verifier) + 1, commands.index(broker))
+        self.assertIn("if-no-files-found: error", _workflow_job_bodies(workflow)["real-hermes"])
+
+    def test_pinned_hermes_broker_selects_a_trusted_linux_system_python(self) -> None:
+        source = Path("tests/test_pinned_hermes_audit_broker.py").read_text(encoding="utf-8")
+
+        self.assertIn('Path("/usr/bin/python3")', source)
+        self.assertIn('sys.platform.startswith("linux")', source)
+        self.assertIn("Path(sys.executable)", source)
+        self.assertIn(".resolve(strict=True)", source)
+        self.assertIn("stat.S_ISREG(python_metadata.st_mode)", source)
+        self.assertIn("python_metadata.st_uid", source)
+        self.assertIn("stat.S_IXUSR", source)
+        self.assertIn("stat.S_IWGRP | stat.S_IWOTH", source)
+        self.assertNotIn("python_executable=Path(sys.executable).resolve()", source)
 
     def test_ci_toolchain_is_exactly_pinned_and_updated_weekly(self) -> None:
         expected = {

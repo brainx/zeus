@@ -146,7 +146,14 @@ jobs:
           ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \
           sh scripts/verify_real_hermes.sh
       - name: Verify pinned Hermes audit broker transcript
-        run: python -m unittest -v tests.test_pinned_hermes_audit_broker
+        run: |
+          mkdir -p .tmp/real-hermes-evidence
+          chmod 0700 .tmp/real-hermes-evidence
+          umask 077
+          printf '%s\n' 'result=failed' \
+            'failure_stage=pinned_hermes_audit_broker' \
+            > .tmp/real-hermes-evidence/summary.txt
+          python -m unittest -v tests.test_pinned_hermes_audit_broker
       - name: Upload sanitized failure evidence
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

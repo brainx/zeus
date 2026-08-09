@@ -91,12 +91,27 @@ class PinnedHermesAuditBrokerTests(unittest.TestCase):
                 broker_dir=broker_dir,
                 state_path=state_path,
             )
+            python_candidate = (
+                Path("/usr/bin/python3")
+                if sys.platform.startswith("linux")
+                else Path(sys.executable)
+            )
+            broker_python = python_candidate.resolve(strict=True)
+            python_metadata = broker_python.lstat()
+            self.assertTrue(stat.S_ISREG(python_metadata.st_mode))
+            self.assertEqual(broker_python, broker_python.resolve(strict=True))
+            self.assertIn(python_metadata.st_uid, {0, os.geteuid()})
+            self.assertNotEqual(0, python_metadata.st_mode & stat.S_IXUSR)
+            self.assertEqual(
+                0,
+                python_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH),
+            )
             broker_executable = install_audit_docker_broker(
                 prepared,
                 docker_executable=real_docker,
                 limits=HARD_LIMITS,
                 deadline=time.monotonic() + 120,
-                python_executable=Path(sys.executable).resolve(),
+                python_executable=broker_python,
             )
             self.assertEqual(0o500, stat.S_IMODE(broker_executable.lstat().st_mode))
 
