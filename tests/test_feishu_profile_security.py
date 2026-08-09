@@ -293,6 +293,13 @@ class FeishuProfileSecurityTests(unittest.TestCase):
                 _, environment = adapter.command("feishu-bot", "gateway", "run")
         self.assertEqual(stored_mode, environment["FEISHU_CONNECTION_MODE"])
 
+    def test_runtime_defaults_missing_mode_to_websocket_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self._runtime_adapter(Path(tmp) / "hermes")
+            _argv, environment = adapter.command("feishu-bot", "gateway", "run")
+
+        self.assertEqual("websocket", environment["FEISHU_CONNECTION_MODE"])
+
     def test_command_rejects_webhook_in_persisted_profile_config(self) -> None:
         sensitive_value = "persisted-sensitive-value"
         config = (
@@ -311,6 +318,50 @@ class FeishuProfileSecurityTests(unittest.TestCase):
         self.assertIn("platforms.feishu.extra.connection_mode", message)
         self.assertIn("WebSocket", message)
         self.assertNotIn(sensitive_value, message)
+
+    def test_command_rejects_root_environment_bridge_webhook_modes(self) -> None:
+        cases = {
+            "canonical": 'FEISHU_CONNECTION_MODE: "  WebHook\\t"\n',
+            "case alias": "feishu_connection_mode: WEBHOOK\n",
+            "normalized duplicate": (
+                "FEISHU_CONNECTION_MODE: websocket\n"
+                "feishu_connection_mode: webhook\n"
+            ),
+        }
+        for name, config in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                adapter = self._runtime_adapter(Path(tmp) / "hermes", profile_config=config)
+                with self.assertRaisesRegex(
+                    UnsupportedFeishuWebhookModeError,
+                    "FEISHU_CONNECTION_MODE",
+                ):
+                    adapter.command("feishu-bot", "gateway", "run")
+
+    def test_command_rejects_dynamic_root_environment_bridge_modes(self) -> None:
+        for expression in ("${FEISHU_MODE}", "${env:FEISHU_MODE}"):
+            with self.subTest(expression=expression), tempfile.TemporaryDirectory() as tmp:
+                adapter = self._runtime_adapter(
+                    Path(tmp) / "hermes",
+                    dump_env(["FEISHU_MODE"], {"FEISHU_MODE": "webhook"}),
+                    profile_config=f'FEISHU_CONNECTION_MODE: "{expression}"\n',
+                )
+                with self.assertRaisesRegex(
+                    UnsupportedFeishuWebhookModeError,
+                    "FEISHU_CONNECTION_MODE",
+                ):
+                    adapter.command("feishu-bot", "gateway", "run")
+
+    def test_command_allows_safe_root_environment_bridge_modes(self) -> None:
+        for mode in ("websocket", '"  WebSocket\\t"'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                adapter = self._runtime_adapter(
+                    Path(tmp) / "hermes",
+                    profile_config=f"FEISHU_CONNECTION_MODE: {mode}\n",
+                )
+                argv, environment = adapter.command("feishu-bot", "gateway", "run")
+
+                self.assertEqual(["hermes", "-p", "feishu-bot", "gateway", "run"], argv)
+                self.assertEqual("websocket", environment["FEISHU_CONNECTION_MODE"])
 
     def test_command_rejects_gateway_aliases_for_persisted_feishu_mode(self) -> None:
         cases = {
@@ -502,8 +553,8 @@ class FeishuProfileSecurityTests(unittest.TestCase):
                 result = adapter.run("feishu-bot", "gateway", "run")
 
         self.assertEqual(completed, result)
-        self.assertNotIn("FEISHU_CONNECTION_MODE", command_env)
-        self.assertNotIn("FEISHU_CONNECTION_MODE", payload["env"])
+        self.assertEqual("websocket", command_env["FEISHU_CONNECTION_MODE"])
+        self.assertEqual("websocket", payload["env"]["FEISHU_CONNECTION_MODE"])
         run.assert_called_once()
 
     def test_runtime_rejects_missing_or_ambiguous_persisted_config(self) -> None:

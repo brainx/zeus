@@ -59,6 +59,7 @@ class HermesAdapter:
         validate_hermes_profile_security(config, env)
         if legacy_gateway:
             validate_hermes_profile_security(legacy_gateway, env)
+        env.setdefault("FEISHU_CONNECTION_MODE", "websocket")
         env["HERMES_HOME"] = str(self.hermes_root)
         return [self.hermes_bin, "-p", bot_id, *args], env
 

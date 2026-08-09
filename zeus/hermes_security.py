@@ -25,7 +25,9 @@ def validate_hermes_profile_security(
             "FEISHU_CONNECTION_MODE or set it to WebSocket"
         )
 
-    for field, mode in _feishu_connection_modes(config):
+    modes = _root_feishu_connection_modes(config)
+    modes.extend(_feishu_connection_modes(config))
+    for field, mode in modes:
         if _uses_environment_interpolation(mode):
             raise UnsupportedFeishuWebhookModeError(
                 "Feishu connection mode interpolation is unsupported; set "
@@ -45,6 +47,21 @@ def _nested_value(value: Mapping[str, Any], *path: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _root_feishu_connection_modes(config: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    matches = [
+        value
+        for key, value in config.items()
+        if isinstance(key, str)
+        and key.strip().casefold() == "feishu_connection_mode"
+    ]
+    if len(matches) > 1:
+        raise UnsupportedFeishuWebhookModeError(
+            "Feishu connection mode configuration is ambiguous; set "
+            "FEISHU_CONNECTION_MODE only once"
+        )
+    return [("FEISHU_CONNECTION_MODE", matches[0])] if matches else []
 
 
 def _feishu_connection_modes(config: Mapping[str, Any]) -> list[tuple[str, Any]]:
