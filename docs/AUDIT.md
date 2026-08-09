@@ -153,7 +153,8 @@ The workspace tmpfs is created with the audit UID and GID. Zeus streams its
 bounded archive to an isolated Python extractor running as that same
 unprivileged UID and GID. The extractor creates only confined directories,
 regular files, and symlinks without following destination symlinks, while
-preserving regular-file modes. Before validation is sealed, Zeus compares the
+preserving the materializer's private modes (`0600` for regular files and
+`0700` for executable files). Before validation is sealed, Zeus compares the
 seeded manifest and executes a write-and-delete probe as the same unprivileged
 UID used for every audit command. No privileged process seeds the command
 container.

@@ -74,9 +74,11 @@ class RealDockerAuditIsolationTests(unittest.TestCase):
                 )
                 runtime.validate(prepared)
                 script = r"""
-import os, pathlib, socket, sys
+import os, pathlib, socket, stat, sys
 workspace = pathlib.Path("/workspace")
-assert (workspace / "committed.txt").read_bytes() == b"committed\n"
+committed = workspace / "committed.txt"
+assert committed.read_bytes() == b"committed\n"
+assert stat.S_IMODE(committed.stat().st_mode) == 0o600
 assert not (workspace / ".git").exists()
 assert not pathlib.Path("/var/run/docker.sock").exists()
 assert not pathlib.Path("/root/.docker/config.json").exists()
@@ -226,7 +228,7 @@ else:
         content = b"committed\n"
         source = snapshot_root / "committed.txt"
         source.write_bytes(content)
-        source.chmod(0o644)
+        source.chmod(0o600)
         result = snapshot_root.lstat()
         identity = audit_workspace._PathIdentity(
             device=result.st_dev,
@@ -243,7 +245,7 @@ else:
                     path="committed.txt",
                     object_id="a" * 40,
                     git_mode="100644",
-                    mode=0o644,
+                    mode=0o600,
                     size=len(content),
                     sha256=hashlib.sha256(content).hexdigest(),
                 ),

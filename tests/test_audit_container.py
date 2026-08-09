@@ -94,9 +94,9 @@ class AuditContainerTests(unittest.TestCase):
         self.snapshot_root.mkdir(mode=0o700)
         (self.snapshot_root / "pkg").mkdir(mode=0o700)
         (self.snapshot_root / "README.md").write_bytes(b"committed\n")
-        (self.snapshot_root / "README.md").chmod(0o644)
+        (self.snapshot_root / "README.md").chmod(0o600)
         (self.snapshot_root / "pkg" / "tool.sh").write_bytes(b"#!/bin/sh\nexit 0\n")
-        (self.snapshot_root / "pkg" / "tool.sh").chmod(0o755)
+        (self.snapshot_root / "pkg" / "tool.sh").chmod(0o700)
         os.symlink("README.md", self.snapshot_root / "link")
         root_result = self.snapshot_root.lstat()
         identity = audit_workspace._PathIdentity(
@@ -114,7 +114,7 @@ class AuditContainerTests(unittest.TestCase):
                     path="README.md",
                     object_id="f" * 40,
                     git_mode="100644",
-                    mode=0o644,
+                    mode=0o600,
                     size=10,
                     sha256="cc2e4bb51f522b77c0c3ad04f7a87386a7e06d4fa287c004b6c066410c5c24dc",
                 ),
@@ -131,7 +131,7 @@ class AuditContainerTests(unittest.TestCase):
                     path="pkg/tool.sh",
                     object_id="2" * 40,
                     git_mode="100755",
-                    mode=0o755,
+                    mode=0o700,
                     size=17,
                     sha256="306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb",
                 ),
@@ -273,7 +273,7 @@ class AuditContainerTests(unittest.TestCase):
         *,
         content: bytes = b"",
         linkname: str = "",
-        mode: int = 0o644,
+        mode: int = 0o600,
     ) -> tuple[tarfile.TarInfo, bytes | None]:
         member = tarfile.TarInfo(name)
         member.type = entry_type
@@ -386,7 +386,7 @@ class AuditContainerTests(unittest.TestCase):
             self.assertEqual(AUDIT_UID, members["README.md"].uid)
             self.assertEqual(AUDIT_GID, members["README.md"].gid)
             self.assertEqual(0, members["README.md"].mtime)
-            self.assertEqual(0o644, members["README.md"].mode)
+            self.assertEqual(0o600, members["README.md"].mode)
             self.assertEqual(0o700, members["pkg"].mode)
             self.assertEqual("README.md", members["link"].linkname)
             source = archive.extractfile(members["pkg/tool.sh"])
@@ -426,12 +426,12 @@ class AuditContainerTests(unittest.TestCase):
         archive = self._seed_archive(
             [
                 self._seed_member("pkg", tarfile.DIRTYPE, mode=0o700),
-                self._seed_member("README.md", tarfile.REGTYPE, content=b"committed\n", mode=0o644),
+                self._seed_member("README.md", tarfile.REGTYPE, content=b"committed\n", mode=0o600),
                 self._seed_member(
                     "pkg/tool.sh",
                     tarfile.REGTYPE,
                     content=b"#!/bin/sh\nexit 0\n",
-                    mode=0o755,
+                    mode=0o700,
                 ),
                 self._seed_member(
                     "pkg/readme-link",
@@ -451,9 +451,33 @@ class AuditContainerTests(unittest.TestCase):
         self.assertTrue((workspace / "README.md").is_file())
         self.assertEqual(b"committed\n", (workspace / "README.md").read_bytes())
         self.assertEqual(b"#!/bin/sh\nexit 0\n", (workspace / "pkg/tool.sh").read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE((workspace / "README.md").lstat().st_mode))
         self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg").lstat().st_mode))
-        self.assertEqual(0o755, stat.S_IMODE((workspace / "pkg/tool.sh").lstat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg/tool.sh").lstat().st_mode))
         self.assertEqual("../README.md", os.readlink(workspace / "pkg/readme-link"))
+
+    def test_real_seed_archive_round_trips_private_file_modes(self) -> None:
+        spool = self.root / "seed-round-trip-spool"
+        spool.mkdir(mode=0o700)
+        archive = audit_container._build_seed_archive(
+            self.snapshot,
+            _deadline(),
+            limits=HARD_LIMITS,
+            spool_dir=spool,
+        )
+        try:
+            archive_bytes = archive.read()
+        finally:
+            archive.close()
+        workspace = self.root / "seed-round-trip-workspace"
+        workspace.mkdir(mode=0o700)
+
+        result = self._run_seed(workspace, archive_bytes, expected_entries=4)
+
+        self.assertEqual(0, result.returncode, result.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(b"", result.stderr)
+        self.assertEqual(0o600, stat.S_IMODE((workspace / "README.md").lstat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg/tool.sh").lstat().st_mode))
 
     def test_seed_script_counts_directories_against_the_entry_limit(self) -> None:
         workspace = self.root / "directory-limit-workspace"
@@ -1085,7 +1109,7 @@ class AuditContainerTests(unittest.TestCase):
         ) -> None:
             if tarinfo.name == "README.md" and fileobj is not None:
                 (self.snapshot_root / "README.md").write_bytes(b"tampered!\n")
-                (self.snapshot_root / "README.md").chmod(0o644)
+                (self.snapshot_root / "README.md").chmod(0o600)
             original_addfile(archive, tarinfo, fileobj)
 
         with mock.patch.object(tarfile.TarFile, "addfile", new=mutate_before_stream):

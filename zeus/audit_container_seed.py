@@ -122,7 +122,7 @@ try:
                     continue
 
                 if member.type == tarfile.REGTYPE:
-                    if mode not in (0o644, 0o755) or member.size < 0:
+                    if mode not in (0o600, 0o700) or member.size < 0:
                         raise RuntimeError("workspace seed file metadata is invalid")
                     content_bytes += member.size
                     if content_bytes > max_bytes:
