@@ -74,16 +74,36 @@ class RealDockerAuditIsolationTests(unittest.TestCase):
                 )
                 runtime.validate(prepared)
                 script = r"""
-import os, pathlib, socket, stat, sys
+import os, pathlib, socket, stat, subprocess, sys
 workspace = pathlib.Path("/workspace")
 committed = workspace / "committed.txt"
+executable = workspace / "executable.sh"
 assert os.getgroups() == [int(sys.argv[4])]
 assert committed.read_bytes() == b"committed\n"
 assert stat.S_IMODE(committed.stat().st_mode) == 0o600
+assert stat.S_IMODE(executable.stat().st_mode) == 0o700
+execution = subprocess.run(
+    [str(executable)],
+    stdin=subprocess.DEVNULL,
+    capture_output=True,
+    check=False,
+)
+assert execution.returncode == 0, execution.stderr
+assert execution.stdout == b"workspace-exec-ok\n"
 assert not (workspace / ".git").exists()
 assert not pathlib.Path("/var/run/docker.sock").exists()
-assert not pathlib.Path("/root/.docker/config.json").exists()
-assert not pathlib.Path("/root/.ssh").exists()
+try:
+    pathlib.Path("/root/.docker/config.json").read_bytes()
+except (FileNotFoundError, PermissionError):
+    pass
+else:
+    raise AssertionError("root Docker credentials are unexpectedly readable")
+try:
+    tuple(pathlib.Path("/root/.ssh").iterdir())
+except (FileNotFoundError, PermissionError):
+    pass
+else:
+    raise AssertionError("root SSH credentials are unexpectedly accessible")
 assert "ZEUS_AUDIT_HOST_SENTINEL" not in os.environ
 host_sentinel = pathlib.Path(sys.argv[1])
 assert not host_sentinel.exists()
@@ -231,6 +251,10 @@ else:
         source = snapshot_root / "committed.txt"
         source.write_bytes(content)
         source.chmod(0o600)
+        executable_content = b"#!/bin/sh\nprintf 'workspace-exec-ok\\n'\n"
+        executable = snapshot_root / "executable.sh"
+        executable.write_bytes(executable_content)
+        executable.chmod(0o700)
         result = snapshot_root.lstat()
         identity = audit_workspace._PathIdentity(
             device=result.st_dev,
@@ -251,10 +275,18 @@ else:
                     size=len(content),
                     sha256=hashlib.sha256(content).hexdigest(),
                 ),
+                SnapshotManifestEntry(
+                    path="executable.sh",
+                    object_id="b" * 40,
+                    git_mode="100755",
+                    mode=0o700,
+                    size=len(executable_content),
+                    sha256=hashlib.sha256(executable_content).hexdigest(),
+                ),
             ),
             skipped_content=(),
-            source_entry_count=1,
-            source_blob_bytes=len(content),
+            source_entry_count=2,
+            source_blob_bytes=len(content) + len(executable_content),
             excluded_paths=(),
             _root_identity=identity,
         )

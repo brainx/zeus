@@ -193,7 +193,8 @@ class AuditContainerTests(unittest.TestCase):
                 "PortBindings": {},
                 "Tmpfs": {
                     "/workspace": (
-                        f"rw,nosuid,nodev,size=2147483648,uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
+                        f"rw,exec,nosuid,nodev,size=2147483648,uid={AUDIT_UID},"
+                        f"gid={AUDIT_GID},mode=0700"
                     ),
                     "/tmp": (
                         f"rw,noexec,nosuid,nodev,size=536870912,uid={AUDIT_UID},"
@@ -201,10 +202,7 @@ class AuditContainerTests(unittest.TestCase):
                     ),
                 },
             },
-            "Mounts": [
-                {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
-                {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
-            ],
+            "Mounts": [],
             "NetworkSettings": {
                 "Ports": {},
                 "Networks": {
@@ -226,9 +224,6 @@ class AuditContainerTests(unittest.TestCase):
                         "NetworkID": "network-id",
                     }
                 },
-                "IPAddress": "",
-                "Gateway": "",
-                "MacAddress": "",
             },
             "State": {"Running": True},
         }
@@ -309,7 +304,14 @@ class AuditContainerTests(unittest.TestCase):
         )
 
     def test_prepare_uses_exact_commands_minimal_environment_and_archive(self) -> None:
-        _runtime, runner, prepared = self._prepare()
+        _runtime, runner, prepared = self._prepare(
+            self._inspect(
+                Mounts=[
+                    {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+                    {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+                ]
+            )
+        )
         docker = "/usr/bin/docker"
         name = f"zeus-audit-{RUN_ID}"
         profile = f"audit-{RUN_ID}"
@@ -342,7 +344,7 @@ class AuditContainerTests(unittest.TestCase):
                 "--memory=4294967296",
                 "--memory-swap=4294967296",
                 (
-                    f"--tmpfs=/workspace:rw,nosuid,nodev,size=2147483648,"
+                    f"--tmpfs=/workspace:rw,exec,nosuid,nodev,size=2147483648,"
                     f"uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
                 ),
                 (
@@ -410,7 +412,12 @@ class AuditContainerTests(unittest.TestCase):
                 str(AUDIT_GID),
                 f"[{AUDIT_GID}]",
                 "/proc/self/status",
+                "/proc/self/mountinfo",
                 ".",
+                "/workspace",
+                "/tmp",
+                str(HARD_LIMITS.workspace_bytes),
+                str(HARD_LIMITS.temp_bytes),
             ),
             runner.calls[4][0],
         )
@@ -742,8 +749,28 @@ class AuditContainerTests(unittest.TestCase):
             )
 
     def test_rejects_mount_volume_port_device_privilege_and_namespace_drift(self) -> None:
+        legacy_tmpfs_mounts = [
+            {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+            {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+        ]
         mutations = {
             "mount": ("Mounts", [{"Type": "bind", "Source": "/", "Destination": "/host"}]),
+            "mount-extra": (
+                "Mounts",
+                [
+                    *legacy_tmpfs_mounts,
+                    {"Type": "bind", "Source": "/", "Destination": "/host", "RW": False},
+                ],
+            ),
+            "mount-duplicate": ("Mounts", [*legacy_tmpfs_mounts, legacy_tmpfs_mounts[0]]),
+            "mount-partial": ("Mounts", legacy_tmpfs_mounts[:1]),
+            "mount-malformed": (
+                "Mounts",
+                [
+                    {"Type": "tmpfs", "Destination": "/workspace", "RW": "true"},
+                    legacy_tmpfs_mounts[1],
+                ],
+            ),
             "host-mount": (
                 "HostConfig.Mounts",
                 [{"Type": "bind", "Source": "/", "Target": "/host"}],
@@ -779,6 +806,24 @@ class AuditContainerTests(unittest.TestCase):
                         limits=HARD_LIMITS,
                         deadline=_deadline(),
                     )
+
+    def test_accepts_empty_or_exact_legacy_tmpfs_mount_summary(self) -> None:
+        summaries = (
+            [],
+            [
+                {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+                {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+            ],
+            [
+                {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+                {"Type": "tmpfs", "Destination": "/workspace", "RW": True},
+            ],
+        )
+        for mounts in summaries:
+            with self.subTest(mounts=mounts):
+                runtime, _runner, prepared = self._prepare(self._inspect(Mounts=mounts))
+                self.assertEqual(CONTAINER_ID, prepared.container_id)
+                runtime.cleanup(prepared)
 
     def test_rejects_network_security_user_resource_and_identity_drift(self) -> None:
         mutations = {
@@ -817,6 +862,7 @@ class AuditContainerTests(unittest.TestCase):
                 },
             ),
             "effective-ip": ("NetworkSettings.IPAddress", "172.17.0.2"),
+            "effective-ip-null": ("NetworkSettings.IPAddress", None),
             "effective-gateway": ("NetworkSettings.Gateway", "172.17.0.1"),
             "effective-mac": ("NetworkSettings.MacAddress", "02:42:ac:11:00:02"),
             "none-network-ip": (
@@ -846,6 +892,23 @@ class AuditContainerTests(unittest.TestCase):
                         limits=HARD_LIMITS,
                         deadline=_deadline(),
                     )
+
+    def test_accepts_current_or_legacy_empty_top_level_network_summary(self) -> None:
+        summaries = (
+            {},
+            {"IPAddress": "", "Gateway": "", "MacAddress": ""},
+        )
+        for summary in summaries:
+            with self.subTest(summary=summary):
+                value = self._inspect()
+                network = value["NetworkSettings"]
+                self.assertIsInstance(network, dict)
+                for field in ("IPAddress", "Gateway", "MacAddress"):
+                    network.pop(field, None)  # type: ignore[union-attr]
+                network.update(summary)  # type: ignore[union-attr]
+                runtime, _runner, prepared = self._prepare(value)
+                self.assertEqual(CONTAINER_ID, prepared.container_id)
+                runtime.cleanup(prepared)
 
     def test_cleanup_removes_only_exact_reinspected_owned_identity(self) -> None:
         runtime, runner, prepared = self._prepare()
@@ -935,6 +998,34 @@ class AuditContainerTests(unittest.TestCase):
         ]
         return workspace, manifest
 
+    @staticmethod
+    def _mountinfo_entry(
+        identifier: int,
+        path: Path,
+        mount_options: str,
+        *,
+        filesystem_type: str = "tmpfs",
+        source: str = "tmpfs",
+        super_options: str = "rw",
+    ) -> str:
+        result = path.stat()
+        device = f"{os.major(result.st_dev)}:{os.minor(result.st_dev)}"
+        return (
+            f"{identifier} 1 {device} / {path} {mount_options} - "
+            f"{filesystem_type} {source} {super_options}\n"
+        )
+
+    def _validation_mountinfo(self, workspace: Path, temp_root: Path) -> str:
+        return self._mountinfo_entry(
+            100,
+            workspace,
+            "rw,nosuid,nodev,relatime",
+        ) + self._mountinfo_entry(
+            101,
+            temp_root,
+            "rw,nosuid,nodev,noexec,relatime",
+        )
+
     def _run_validation(
         self,
         workspace: Path,
@@ -947,9 +1038,24 @@ class AuditContainerTests(unittest.TestCase):
         expected_groups: list[int] | None = None,
         process_status: str = "NoNewPrivs:\t1\nSeccomp:\t2\nCapEff:\t0000000000000000\n",
         probe_root: Path | None = None,
+        mountinfo: str | None = None,
+        temp_root: Path | None = None,
+        expected_workspace_bytes: int | None = None,
+        expected_temp_bytes: int | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         status_path = workspace.parent / "process-status"
         status_path.write_text(process_status, encoding="ascii")
+        effective_temp_root = workspace.parent / "temp" if temp_root is None else temp_root
+        effective_temp_root.mkdir(mode=0o700, exist_ok=True)
+        mountinfo_path = workspace.parent / "mountinfo"
+        mountinfo_path.write_text(
+            self._validation_mountinfo(workspace, effective_temp_root)
+            if mountinfo is None
+            else mountinfo,
+            encoding="ascii",
+        )
+        workspace_filesystem = os.statvfs(workspace)
+        temp_filesystem = os.statvfs(effective_temp_root)
         return subprocess.run(
             [
                 sys.executable,
@@ -962,7 +1068,20 @@ class AuditContainerTests(unittest.TestCase):
                 str(os.getgid() if expected_entry_gid is None else expected_entry_gid),
                 json.dumps(os.getgroups() if expected_groups is None else expected_groups),
                 str(status_path),
+                str(mountinfo_path),
                 str(workspace if probe_root is None else probe_root),
+                str(workspace),
+                str(effective_temp_root),
+                str(
+                    workspace_filesystem.f_blocks * workspace_filesystem.f_frsize
+                    if expected_workspace_bytes is None
+                    else expected_workspace_bytes
+                ),
+                str(
+                    temp_filesystem.f_blocks * temp_filesystem.f_frsize
+                    if expected_temp_bytes is None
+                    else expected_temp_bytes
+                ),
             ],
             cwd=workspace,
             input=json.dumps(manifest, separators=(",", ":")).encode(),
@@ -1048,6 +1167,123 @@ class AuditContainerTests(unittest.TestCase):
             )
 
             self.assertNotEqual(0, completed.returncode)
+
+    def test_workspace_validation_rejects_effective_mount_drift(self) -> None:
+        mutations = {
+            "workspace-noexec": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "rw,nosuid,nodev,noexec,relatime",
+                1,
+            ),
+            "workspace-suid": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "rw,nodev,relatime",
+                1,
+            ),
+            "workspace-device-enabled": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "rw,nosuid,relatime",
+                1,
+            ),
+            "workspace-read-only": lambda value: value.replace(
+                "rw,nosuid,nodev,relatime",
+                "ro,nosuid,nodev,relatime",
+                1,
+            ),
+            "workspace-wrong-filesystem": lambda value: value.replace(
+                "- tmpfs tmpfs rw",
+                "- ext4 /dev/root rw",
+                1,
+            ),
+            "workspace-wrong-source": lambda value: value.replace(
+                "- tmpfs tmpfs rw",
+                "- tmpfs other rw",
+                1,
+            ),
+            "workspace-wrong-device": lambda value: value.replace(
+                value.split(" ", 3)[2],
+                "0:0",
+                1,
+            ),
+            "workspace-wrong-root": lambda value: value.replace(" / ", " /nested ", 1),
+            "workspace-escaped-near-match": lambda value: value.replace(
+                value.split(" ")[4],
+                value.split(" ")[4] + r"\040near",
+                1,
+            ),
+            "temp-executable": lambda value: value.replace(
+                "rw,nosuid,nodev,noexec,relatime",
+                "rw,nosuid,nodev,relatime",
+                1,
+            ),
+            "missing-temp": lambda value: value.splitlines(keepends=True)[0],
+            "duplicate-workspace": lambda value: value.splitlines(keepends=True)[0] + value,
+            "malformed-separator": lambda value: value.replace(" - tmpfs", " tmpfs", 1),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                workspace, manifest = self._validation_fixture(base)
+                temp_root = base / "temp"
+                temp_root.mkdir(mode=0o700)
+                mountinfo = mutate(self._validation_mountinfo(workspace, temp_root))
+                self.assertNotEqual(
+                    0,
+                    self._run_validation(
+                        workspace,
+                        manifest,
+                        mountinfo=mountinfo,
+                        temp_root=temp_root,
+                    ).returncode,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace, manifest = self._validation_fixture(base)
+            filesystem = os.statvfs(workspace)
+            self.assertNotEqual(
+                0,
+                self._run_validation(
+                    workspace,
+                    manifest,
+                    expected_workspace_bytes=(
+                        filesystem.f_blocks * filesystem.f_frsize + filesystem.f_frsize
+                    ),
+                ).returncode,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace, manifest = self._validation_fixture(base)
+            temp_root = base / "temp"
+            temp_root.mkdir(mode=0o700)
+            filesystem = os.statvfs(temp_root)
+            self.assertNotEqual(
+                0,
+                self._run_validation(
+                    workspace,
+                    manifest,
+                    temp_root=temp_root,
+                    expected_temp_bytes=(
+                        filesystem.f_blocks * filesystem.f_frsize + filesystem.f_frsize
+                    ),
+                ).returncode,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            workspace, manifest = self._validation_fixture(base)
+            temp_root = base / "temp"
+            temp_root.mkdir(mode=0o700)
+            temp_root.chmod(0o755)
+            self.assertNotEqual(
+                0,
+                self._run_validation(
+                    workspace,
+                    manifest,
+                    temp_root=temp_root,
+                ).returncode,
+            )
 
     def test_archive_enforces_limits_deadline_and_private_spool(self) -> None:
         private_spool = self.root / "spool"

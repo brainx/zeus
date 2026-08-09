@@ -22,6 +22,7 @@ from typing import BinaryIO, NoReturn, Protocol, cast
 
 from zeus.audit_config import AuditConfigError, parse_audit_config
 from zeus.audit_container_seed import SEED_SCRIPT as _SEED_SCRIPT
+from zeus.audit_container_validate import VALIDATION_SCRIPT as _VALIDATION_SCRIPT
 from zeus.audit_models import HARD_LIMITS, AuditLimits
 from zeus.audit_process import AuditProcessError, stop_process_group, wait_process_exit
 from zeus.audit_workspace import MaterializedSnapshot, SnapshotManifestEntry
@@ -41,142 +42,13 @@ _ENTRYPOINT = ("/bin/sh",)
 _COMMAND = ("-c", "trap : TERM INT; sleep infinity & wait")
 _TEMP_PATH = "/t" + "mp"
 _WORKSPACE_TMPFS = (
-    f"rw,nosuid,nodev,size={HARD_LIMITS.workspace_bytes},uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
+    f"rw,exec,nosuid,nodev,size={HARD_LIMITS.workspace_bytes},"
+    f"uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
 )
 _TEMP_TMPFS = (
     f"rw,noexec,nosuid,nodev,size={HARD_LIMITS.temp_bytes},"
     f"uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
 )
-_VALIDATION_SCRIPT = r"""
-import hashlib, json, os, stat, sys
-if len(sys.argv) != 8:
-    raise RuntimeError("workspace validation arguments are invalid")
-expected_uid = int(sys.argv[1])
-expected_gid = int(sys.argv[2])
-expected_entry_uid = int(sys.argv[3])
-expected_entry_gid = int(sys.argv[4])
-expected_groups = json.loads(sys.argv[5])
-status_path = sys.argv[6]
-probe_root = sys.argv[7]
-if (
-    not isinstance(expected_groups, list)
-    or any(
-        isinstance(group, bool) or not isinstance(group, int)
-        for group in expected_groups
-    )
-):
-    raise RuntimeError("workspace validation supplementary groups are invalid")
-if os.getuid() != expected_uid or os.getgid() != expected_gid:
-    raise RuntimeError("workspace validation process identity mismatch")
-if os.getgroups() != expected_groups:
-    raise RuntimeError("workspace validation supplementary groups mismatch")
-expected = {item["path"]: item for item in json.load(sys.stdin)}
-expected_dirs = set()
-for path in expected:
-    parts = path.split("/")
-    expected_dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
-actual = set()
-root = os.stat(".", follow_symlinks=False)
-if (
-    not stat.S_ISDIR(root.st_mode)
-    or stat.S_IMODE(root.st_mode) != 0o700
-    or root.st_uid != expected_entry_uid
-    or root.st_gid != expected_entry_gid
-):
-    raise RuntimeError("workspace root metadata mismatch")
-with open(status_path, encoding="ascii") as source:
-    process_status = dict(
-        line.rstrip("\n").split(":\t", 1)
-        for line in source
-        if ":\t" in line
-    )
-if process_status.get("NoNewPrivs") != "1":
-    raise RuntimeError("no-new-privileges is not effective")
-if process_status.get("Seccomp") != "2":
-    raise RuntimeError("the Docker seccomp filter is not effective")
-if int(process_status.get("CapEff", "-1"), 16) != 0:
-    raise RuntimeError("effective Linux capabilities were not fully dropped")
-pending = [("", os.open(".", os.O_RDONLY | os.O_DIRECTORY))]
-try:
-    while pending:
-        prefix, descriptor = pending.pop()
-        try:
-            for name in os.listdir(descriptor):
-                path = name if not prefix else prefix + "/" + name
-                item = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                actual.add(path)
-                if stat.S_ISDIR(item.st_mode):
-                    if path in expected:
-                        raise RuntimeError("workspace entry type mismatch")
-                    if (
-                        stat.S_IMODE(item.st_mode) != 0o700
-                        or item.st_uid != expected_entry_uid
-                        or item.st_gid != expected_entry_gid
-                    ):
-                        raise RuntimeError("workspace directory metadata mismatch")
-                    child = os.open(
-                        name,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                        dir_fd=descriptor,
-                    )
-                    pending.append((path, child))
-                    continue
-                wanted = expected.get(path)
-                if wanted is None:
-                    raise RuntimeError("unexpected workspace entry")
-                if item.st_uid != expected_entry_uid or item.st_gid != expected_entry_gid:
-                    raise RuntimeError("workspace entry ownership mismatch")
-                if wanted["type"] == "symlink":
-                    if not stat.S_ISLNK(item.st_mode):
-                        raise RuntimeError("workspace entry type mismatch")
-                    if os.readlink(name, dir_fd=descriptor) != wanted["target"]:
-                        raise RuntimeError("workspace symlink target mismatch")
-                    continue
-                if not stat.S_ISREG(item.st_mode):
-                    raise RuntimeError("workspace entry type mismatch")
-                if stat.S_IMODE(item.st_mode) != wanted["mode"] or item.st_size != wanted["size"]:
-                    raise RuntimeError("workspace file metadata mismatch")
-                opened = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
-                try:
-                    digest = hashlib.sha256()
-                    while True:
-                        chunk = os.read(opened, 65536)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                finally:
-                    os.close(opened)
-                if digest.hexdigest() != wanted["sha256"]:
-                    raise RuntimeError("workspace file digest mismatch")
-        finally:
-            os.close(descriptor)
-finally:
-    while pending:
-        os.close(pending.pop()[1])
-if actual != set(expected) | expected_dirs:
-    raise RuntimeError("workspace path set mismatch")
-probe = os.path.join(probe_root, ".zeus-audit-write-probe")
-descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-try:
-    probe_stat = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(probe_stat.st_mode)
-        or stat.S_IMODE(probe_stat.st_mode) != 0o600
-        or probe_stat.st_uid != expected_entry_uid
-        or probe_stat.st_gid != expected_entry_gid
-    ):
-        raise RuntimeError("workspace write probe metadata mismatch")
-    os.write(descriptor, b"probe")
-finally:
-    os.close(descriptor)
-os.unlink(probe)
-try:
-    os.lstat(probe)
-except FileNotFoundError:
-    pass
-else:
-    raise RuntimeError("workspace write probe could not be deleted")
-""".strip()
 
 
 class AuditContainerError(RuntimeError):
@@ -1005,7 +877,12 @@ class AuditContainerRuntime:
                     str(AUDIT_GID),
                     f"[{AUDIT_GID}]",
                     "/proc/self/status",
+                    "/proc/self/mountinfo",
                     ".",
+                    "/workspace",
+                    _TEMP_PATH,
+                    str(limits.workspace_bytes),
+                    str(limits.temp_bytes),
                 ),
                 limits=limits,
                 deadline=active_deadline,
@@ -1059,17 +936,17 @@ class AuditContainerRuntime:
         if not isinstance(network, dict):
             _error("Docker container inspection omitted network controls")
         expected_tmpfs = {"/workspace": _WORKSPACE_TMPFS, _TEMP_PATH: _TEMP_TMPFS}
-        expected_mounts = {
+        expected_mounts = (
             ("/workspace", "tmpfs", True),
             (_TEMP_PATH, "tmpfs", True),
-        }
+        )
         if not isinstance(mounts, list):
             _error("Docker container inspection omitted mount controls")
-        observed_mounts: set[tuple[object, object, object]] = set()
+        observed_mounts: list[tuple[object, object, object]] = []
         for mount in mounts:
             if not isinstance(mount, dict):
                 _error("Docker container inspection returned an invalid mount")
-            observed_mounts.add((mount.get("Destination"), mount.get("Type"), mount.get("RW")))
+            observed_mounts.append((mount.get("Destination"), mount.get("Type"), mount.get("RW")))
         checks = (
             (item.get("Id") == prepared.container_id, "container identity"),
             (item.get("Name") == f"/{prepared.container_name}", "container name"),
@@ -1127,15 +1004,31 @@ class AuditContainerRuntime:
             ),
             (host.get("PortBindings") in (None, {}), "container port bindings"),
             (host.get("Tmpfs") == expected_tmpfs, "container tmpfs controls"),
-            (observed_mounts == expected_mounts, "container effective mounts"),
+            (
+                not observed_mounts
+                or (
+                    len(observed_mounts) == len(expected_mounts)
+                    and set(observed_mounts) == set(expected_mounts)
+                ),
+                "container effective mounts",
+            ),
             (network.get("Ports") in (None, {}), "container effective ports"),
             (
                 _has_isolated_none_network(network.get("Networks")),
                 "container effective network attachments",
             ),
-            (network.get("IPAddress") == "", "container effective IP address"),
-            (network.get("Gateway") == "", "container effective gateway"),
-            (network.get("MacAddress") == "", "container effective MAC address"),
+            (
+                "IPAddress" not in network or network.get("IPAddress") == "",
+                "container effective IP address",
+            ),
+            (
+                "Gateway" not in network or network.get("Gateway") == "",
+                "container effective gateway",
+            ),
+            (
+                "MacAddress" not in network or network.get("MacAddress") == "",
+                "container effective MAC address",
+            ),
         )
         for accepted, description in checks:
             if not accepted:
