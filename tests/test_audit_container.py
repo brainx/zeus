@@ -285,14 +285,19 @@ class AuditContainerTests(unittest.TestCase):
         return member, None
 
     @staticmethod
-    def _run_seed(workspace: Path, archive: bytes) -> subprocess.CompletedProcess[bytes]:
+    def _run_seed(
+        workspace: Path,
+        archive: bytes,
+        *,
+        expected_entries: int,
+    ) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             [
                 sys.executable,
                 "-I",
                 "-c",
                 getattr(audit_container, "_SEED_SCRIPT", ""),
-                str(HARD_LIMITS.snapshot_entries),
+                str(expected_entries),
                 str(HARD_LIMITS.snapshot_blob_bytes),
             ],
             cwd=workspace,
@@ -365,7 +370,7 @@ class AuditContainerTests(unittest.TestCase):
                 "-I",
                 "-c",
                 getattr(audit_container, "_SEED_SCRIPT", "<missing seed script>"),
-                str(HARD_LIMITS.snapshot_entries),
+                "4",
                 str(HARD_LIMITS.snapshot_blob_bytes),
             ),
             runner.calls[3][0],
@@ -439,7 +444,7 @@ class AuditContainerTests(unittest.TestCase):
         workspace = self.root / "seed-workspace"
         workspace.mkdir(mode=0o700)
 
-        result = self._run_seed(workspace, archive)
+        result = self._run_seed(workspace, archive, expected_entries=4)
 
         self.assertEqual(b"", result.stderr)
         self.assertEqual(0, result.returncode)
@@ -449,6 +454,33 @@ class AuditContainerTests(unittest.TestCase):
         self.assertEqual(0o700, stat.S_IMODE((workspace / "pkg").lstat().st_mode))
         self.assertEqual(0o755, stat.S_IMODE((workspace / "pkg/tool.sh").lstat().st_mode))
         self.assertEqual("../README.md", os.readlink(workspace / "pkg/readme-link"))
+
+    def test_seed_script_counts_directories_against_the_entry_limit(self) -> None:
+        workspace = self.root / "directory-limit-workspace"
+        workspace.mkdir(mode=0o700)
+        archive = self._seed_archive(
+            [
+                self._seed_member("first", tarfile.DIRTYPE, mode=0o700),
+                self._seed_member("second", tarfile.DIRTYPE, mode=0o700),
+            ]
+        )
+
+        result = self._run_seed(workspace, archive, expected_entries=1)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(b"workspace seed entry limit exceeded", result.stderr)
+        self.assertTrue((workspace / "first").is_dir())
+        self.assertFalse((workspace / "second").exists())
+
+    def test_seed_script_rejects_missing_expected_archive_members(self) -> None:
+        workspace = self.root / "missing-member-workspace"
+        workspace.mkdir(mode=0o700)
+        archive = self._seed_archive([self._seed_member("only", tarfile.DIRTYPE, mode=0o700)])
+
+        result = self._run_seed(workspace, archive, expected_entries=2)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(b"workspace seed entry count mismatch", result.stderr)
 
     def test_seed_script_rejects_unsafe_paths_types_and_symlinks_without_outside_writes(
         self,
@@ -478,7 +510,11 @@ class AuditContainerTests(unittest.TestCase):
                 workspace.mkdir(mode=0o700)
                 before = sentinel.stat()
 
-                result = self._run_seed(workspace, self._seed_archive([member]))
+                result = self._run_seed(
+                    workspace,
+                    self._seed_archive([member]),
+                    expected_entries=1,
+                )
 
                 after = sentinel.stat()
                 self.assertNotEqual(0, result.returncode)
@@ -500,7 +536,7 @@ class AuditContainerTests(unittest.TestCase):
             [self._seed_member("pkg/escape", tarfile.REGTYPE, content=b"escape")]
         )
 
-        result = self._run_seed(workspace, archive)
+        result = self._run_seed(workspace, archive, expected_entries=1)
 
         self.assertNotEqual(0, result.returncode)
         self.assertEqual(b"preserve", sentinel.read_bytes())
