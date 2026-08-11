@@ -15,10 +15,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import NoReturn, Protocol, TypeGuard
+from typing import NoReturn, TypeGuard
 
 from zeus.audit_container import PreparedAuditContainer
-from zeus.audit_models import HARD_LIMITS, AuditLimits
+from zeus.audit_docker_broker_types import AuditDockerBrokerError as AuditDockerBrokerError
+from zeus.audit_docker_broker_types import AuditDockerBrokerState as AuditDockerBrokerState
+from zeus.audit_docker_broker_types import BrokerCommandResult as BrokerCommandResult
+from zeus.audit_docker_broker_types import (
+    Decision,
+    DockerExecutionError,
+)
+from zeus.audit_docker_broker_types import DockerExecutionRunner as DockerExecutionRunner
+from zeus.audit_models import HARD_LIMITS, AuditCommandReceipt, AuditLimits
+from zeus.audit_receipts import trusted_command_tag
 from zeus.private_io import (
     UnsafeFileError,
     pin_private_directory,
@@ -27,7 +36,11 @@ from zeus.private_io import (
 
 HERMES_VERSION = "0.20.0"
 
-_STATE_SCHEMA_VERSION = 1
+_Decision = Decision
+_DockerExecutionError = DockerExecutionError
+
+_STATE_SCHEMA_VERSION = 2
+_LEGACY_STATE_SCHEMA_VERSION = 1
 _STATE_FILE_NAME = "state.json"
 _LOCK_FILE_NAME = "state.lock"
 _BROKER_FILE_NAME = "docker"
@@ -48,6 +61,11 @@ _SESSION_ID_RE = re.compile(r"[0-9a-f]{12}\Z")
 _CLEANUP_OWNER_RE = re.compile(r"[0-9a-f]{32}\Z")
 _PROFILE_RE = re.compile(r"audit-([0-9a-f]{32})\Z")
 _CONTAINER_NAME_RE = re.compile(r"zeus-audit-([0-9a-f]{32})\Z")
+_TRUSTED_CONTAINER_NAME_RE = re.compile(r"zeus-audit-trusted-([0-9a-f]{32})\Z")
+_TARGET_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_RECEIPT_ID_RE = re.compile(r"terminal-[0-9]{6}\Z")
+_COMMAND_TAG_RE = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
 
 _PHASES = frozenset(
     {
@@ -68,7 +86,7 @@ _PHASES = frozenset(
     }
 )
 _CLEANUP_STATES = frozenset({"not_requested", "requested", "running", "complete", "failed"})
-_STATE_KEYS = frozenset(
+_LEGACY_STATE_KEYS = frozenset(
     {
         "schema_version",
         "hermes_version",
@@ -100,72 +118,24 @@ _STATE_KEYS = frozenset(
         "cleanup_lease_deadline",
     }
 )
-
-
-class AuditDockerBrokerError(RuntimeError):
-    """Raised when broker state or execution cannot be proven safe."""
-
-
-class _DockerExecutionError(AuditDockerBrokerError):
-    pass
-
-
-@dataclass(frozen=True)
-class BrokerCommandResult:
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-
-
-@dataclass(frozen=True)
-class AuditDockerBrokerState:
-    schema_version: int
-    hermes_version: str
-    docker_executable: str
-    container_id: str
-    container_name: str
-    profile_name: str
-    image_ref: str
-    image_id: str
-    container_labels: dict[str, str]
-    hermes_labels: dict[str, str]
-    phase: str
-    deadline: float
-    docker_control_seconds: int
-    terminal_command_seconds: int
-    terminal_call_limit: int
-    per_call_reserved_output_bytes: int
-    total_output_limit_bytes: int
-    terminal_calls: int
-    terminal_output_bytes: int
-    aggregate_reserved_output_bytes: int
-    active_terminal_calls: int
-    bootstrap_complete: bool
-    session_id: str | None
-    limit_breach: bool
-    breach_reason: str | None
-    cleanup_state: str
-    cleanup_owner: str | None
-    cleanup_lease_deadline: float | None
-
-
-class DockerExecutionRunner(Protocol):
-    def run(
-        self,
-        argv: tuple[str, ...],
-        *,
-        deadline: float,
-        output_limit: int,
-        env: dict[str, str],
-    ) -> BrokerCommandResult: ...
-
-
-@dataclass(frozen=True)
-class _Decision:
-    kind: str
-    state: AuditDockerBrokerState
-    stdout: bytes = b""
-    session_id: str | None = None
+_STATE_KEYS = _LEGACY_STATE_KEYS | {
+    "target_commit",
+    "snapshot_digest",
+    "receipt_hmac_key",
+    "terminal_receipts",
+    "trusted_container_id",
+    "trusted_container_name",
+    "trusted_snapshot_path",
+    "trusted_snapshot_device",
+    "trusted_snapshot_inode",
+    "trusted_snapshot_owner",
+    "trusted_snapshot_mode",
+    "trusted_execution_uid",
+    "trusted_execution_gid",
+    "trusted_command_tags",
+    "active_trusted_receipt_id",
+}
+_RECEIPT_STATES = frozenset({"inflight", "exited", "execution_failed", "orphaned"})
 
 
 @dataclass(frozen=True)
@@ -253,6 +223,57 @@ def _validate_prepared(prepared: PreparedAuditContainer) -> str:
     run_id = name_match.group(1)
     if profile_match.group(1) != run_id:
         _error("audit Docker broker run identity is inconsistent")
+    if (prepared.trusted_container_id is None) != (prepared.trusted_container_name is None):
+        _error("audit Docker broker trusted container binding is incomplete")
+    if prepared.trusted_container_id is not None:
+        trusted_name_match = _TRUSTED_CONTAINER_NAME_RE.fullmatch(
+            prepared.trusted_container_name or ""
+        )
+        if (
+            _CONTAINER_ID_RE.fullmatch(prepared.trusted_container_id) is None
+            or prepared.trusted_container_id == prepared.container_id
+            or trusted_name_match is None
+            or trusted_name_match.group(1) != run_id
+        ):
+            _error("audit Docker broker trusted container binding is invalid")
+    trusted_snapshot_values = (
+        prepared.trusted_snapshot_path,
+        prepared.trusted_snapshot_device,
+        prepared.trusted_snapshot_inode,
+        prepared.trusted_snapshot_owner,
+        prepared.trusted_snapshot_mode,
+        prepared.trusted_execution_uid,
+        prepared.trusted_execution_gid,
+    )
+    if len({value is None for value in trusted_snapshot_values}) != 1 or (
+        (prepared.trusted_container_id is None) != (prepared.trusted_snapshot_path is None)
+    ):
+        _error("audit Docker broker trusted snapshot binding is incomplete")
+    if prepared.trusted_snapshot_path is not None:
+        trusted_path = Path(prepared.trusted_snapshot_path)
+        try:
+            trusted_result = trusted_path.lstat()
+            trusted_resolved = trusted_path.resolve(strict=True)
+        except OSError as exc:
+            raise AuditDockerBrokerError(
+                "audit Docker broker trusted snapshot is unavailable"
+            ) from exc
+        if (
+            not trusted_path.is_absolute()
+            or trusted_resolved != trusted_path
+            or not stat.S_ISDIR(trusted_result.st_mode)
+            or trusted_result.st_dev != prepared.trusted_snapshot_device
+            or trusted_result.st_ino != prepared.trusted_snapshot_inode
+            or trusted_result.st_uid != prepared.trusted_snapshot_owner
+            or trusted_result.st_gid != prepared.trusted_execution_gid
+            or stat.S_IMODE(trusted_result.st_mode) != prepared.trusted_snapshot_mode
+            or prepared.trusted_snapshot_mode != 0o700
+            or prepared.trusted_execution_uid != prepared.trusted_snapshot_owner
+            or prepared.trusted_execution_uid != os.geteuid()
+            or prepared.trusted_execution_gid != os.getegid()
+            or prepared.trusted_execution_uid == 0
+        ):
+            _error("audit Docker broker trusted snapshot binding is invalid")
     if not isinstance(prepared.broker_dir, Path) or not prepared.broker_dir.is_absolute():
         _error("audit Docker broker directory must be absolute")
     if (
@@ -292,9 +313,29 @@ def _validate_deadline(deadline: float, limits: AuditLimits, now: float) -> floa
 
 
 def _state_bytes(state: AuditDockerBrokerState) -> bytes:
+    value = asdict(state)
+    if state.schema_version == _LEGACY_STATE_SCHEMA_VERSION:
+        for field in (
+            "target_commit",
+            "snapshot_digest",
+            "receipt_hmac_key",
+            "terminal_receipts",
+            "trusted_container_id",
+            "trusted_container_name",
+            "trusted_snapshot_path",
+            "trusted_snapshot_device",
+            "trusted_snapshot_inode",
+            "trusted_snapshot_owner",
+            "trusted_snapshot_mode",
+            "trusted_execution_uid",
+            "trusted_execution_gid",
+            "trusted_command_tags",
+            "active_trusted_receipt_id",
+        ):
+            value.pop(field)
     data = (
         json.dumps(
-            asdict(state),
+            value,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
@@ -334,10 +375,24 @@ def _decode_state(data: bytes) -> AuditDockerBrokerState:
         value = json.loads(data.decode("ascii", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AuditDockerBrokerError("audit Docker broker state is invalid") from exc
-    if not isinstance(value, dict) or frozenset(value) != _STATE_KEYS:
+    if not isinstance(value, dict):
         _error("audit Docker broker state schema is invalid")
 
-    schema_version = value["schema_version"]
+    schema_version = value.get("schema_version")
+    if not _is_int(schema_version) or schema_version not in {
+        _LEGACY_STATE_SCHEMA_VERSION,
+        _STATE_SCHEMA_VERSION,
+    }:
+        _error("audit Docker broker state version is unsupported")
+    expected_keys = (
+        _STATE_KEYS
+        if schema_version == _STATE_SCHEMA_VERSION
+        else _LEGACY_STATE_KEYS
+        if schema_version == _LEGACY_STATE_SCHEMA_VERSION
+        else frozenset()
+    )
+    if frozenset(value) != expected_keys:
+        _error("audit Docker broker state schema is invalid")
     hermes_version = value["hermes_version"]
     docker_executable = value["docker_executable"]
     container_id = value["container_id"]
@@ -355,7 +410,7 @@ def _decode_state(data: bytes) -> AuditDockerBrokerState:
     cleanup_owner = value["cleanup_owner"]
     cleanup_lease_deadline = value["cleanup_lease_deadline"]
 
-    if schema_version != _STATE_SCHEMA_VERSION or hermes_version != HERMES_VERSION:
+    if hermes_version != HERMES_VERSION:
         _error("audit Docker broker state version is unsupported")
     if (
         not isinstance(docker_executable, str)
@@ -473,8 +528,210 @@ def _decode_state(data: bytes) -> AuditDockerBrokerState:
     if phase == "closed" and (cleanup_state != "complete" or active or reserved):
         _error("audit Docker broker closed state is inconsistent")
 
+    target_commit: str | None = None
+    snapshot_digest: str | None = None
+    receipt_hmac_key: str | None = None
+    terminal_receipts: tuple[AuditCommandReceipt, ...] = ()
+    trusted_container_id: str | None = None
+    trusted_container_name: str | None = None
+    trusted_snapshot_path: str | None = None
+    trusted_snapshot_device: int | None = None
+    trusted_snapshot_inode: int | None = None
+    trusted_snapshot_owner: int | None = None
+    trusted_snapshot_mode: int | None = None
+    trusted_execution_uid: int | None = None
+    trusted_execution_gid: int | None = None
+    trusted_command_tags: tuple[str, ...] = ()
+    active_trusted_receipt_id: str | None = None
+    if schema_version == _STATE_SCHEMA_VERSION:
+        target_value = value["target_commit"]
+        snapshot_value = value["snapshot_digest"]
+        key_value = value["receipt_hmac_key"]
+        receipt_values = value["terminal_receipts"]
+        trusted_container_value = value["trusted_container_id"]
+        trusted_name_value = value["trusted_container_name"]
+        trusted_path_value = value["trusted_snapshot_path"]
+        trusted_device_value = value["trusted_snapshot_device"]
+        trusted_inode_value = value["trusted_snapshot_inode"]
+        trusted_owner_value = value["trusted_snapshot_owner"]
+        trusted_mode_value = value["trusted_snapshot_mode"]
+        trusted_uid_value = value["trusted_execution_uid"]
+        trusted_gid_value = value["trusted_execution_gid"]
+        trusted_tag_values = value["trusted_command_tags"]
+        active_trusted_value = value["active_trusted_receipt_id"]
+        trusted_name_match = (
+            _TRUSTED_CONTAINER_NAME_RE.fullmatch(trusted_name_value)
+            if isinstance(trusted_name_value, str)
+            else None
+        )
+        if (
+            not isinstance(target_value, str)
+            or _TARGET_COMMIT_RE.fullmatch(target_value) is None
+            or not isinstance(snapshot_value, str)
+            or _SHA256_RE.fullmatch(snapshot_value) is None
+            or not isinstance(key_value, str)
+            or _SHA256_RE.fullmatch(key_value) is None
+            or not isinstance(receipt_values, list)
+            or (
+                trusted_container_value is not None
+                and (
+                    not isinstance(trusted_container_value, str)
+                    or _CONTAINER_ID_RE.fullmatch(trusted_container_value) is None
+                    or trusted_container_value == container_id
+                )
+            )
+            or (
+                trusted_name_value is not None
+                and (trusted_name_match is None or trusted_name_match.group(1) != run_id)
+            )
+            or not isinstance(trusted_tag_values, list)
+            or len(trusted_tag_values) > HARD_LIMITS.terminal_calls
+            or any(
+                not isinstance(tag, str) or _COMMAND_TAG_RE.fullmatch(tag) is None
+                for tag in trusted_tag_values
+            )
+            or len(set(trusted_tag_values)) != len(trusted_tag_values)
+            or bool(trusted_tag_values) != (trusted_container_value is not None)
+            or (trusted_container_value is None) != (trusted_name_value is None)
+            or (
+                trusted_path_value is not None
+                and (
+                    not isinstance(trusted_path_value, str)
+                    or not Path(trusted_path_value).is_absolute()
+                    or len(trusted_path_value) > 4096
+                    or any(character in trusted_path_value for character in ("\0", "\n", "\r"))
+                )
+            )
+            or any(
+                value is not None and (not _is_int(value) or value < 0)
+                for value in (
+                    trusted_device_value,
+                    trusted_inode_value,
+                    trusted_owner_value,
+                    trusted_uid_value,
+                    trusted_gid_value,
+                )
+            )
+            or trusted_mode_value not in (None, 0o700)
+            or len(
+                {
+                    item is None
+                    for item in (
+                        trusted_container_value,
+                        trusted_path_value,
+                        trusted_device_value,
+                        trusted_inode_value,
+                        trusted_owner_value,
+                        trusted_mode_value,
+                        trusted_uid_value,
+                        trusted_gid_value,
+                    )
+                }
+            )
+            != 1
+            or (
+                active_trusted_value is not None
+                and (
+                    not isinstance(active_trusted_value, str)
+                    or _RECEIPT_ID_RE.fullmatch(active_trusted_value) is None
+                )
+            )
+        ):
+            _error("audit Docker broker receipt binding is invalid")
+        parsed_receipts: list[AuditCommandReceipt] = []
+        for sequence, raw_receipt in enumerate(receipt_values, start=1):
+            if not isinstance(raw_receipt, dict) or frozenset(raw_receipt) != frozenset(
+                {
+                    "receipt_id",
+                    "sequence",
+                    "command_tag",
+                    "state",
+                    "returncode",
+                    "duration_ms",
+                    "stdout_bytes",
+                    "stderr_bytes",
+                }
+            ):
+                _error("audit Docker broker receipt schema is invalid")
+            receipt_id = raw_receipt["receipt_id"]
+            receipt_sequence = raw_receipt["sequence"]
+            command_tag = raw_receipt["command_tag"]
+            receipt_state = raw_receipt["state"]
+            returncode = raw_receipt["returncode"]
+            duration_ms = raw_receipt["duration_ms"]
+            stdout_bytes = raw_receipt["stdout_bytes"]
+            stderr_bytes = raw_receipt["stderr_bytes"]
+            if (
+                not isinstance(receipt_id, str)
+                or _RECEIPT_ID_RE.fullmatch(receipt_id) is None
+                or receipt_id != f"terminal-{sequence:06d}"
+                or not _is_int(receipt_sequence)
+                or receipt_sequence != sequence
+                or not isinstance(command_tag, str)
+                or _COMMAND_TAG_RE.fullmatch(command_tag) is None
+                or receipt_state not in _RECEIPT_STATES
+            ):
+                _error("audit Docker broker receipt identity is invalid")
+            optional_values = (returncode, duration_ms, stdout_bytes, stderr_bytes)
+            if receipt_state == "inflight":
+                if any(item is not None for item in optional_values):
+                    _error("audit Docker broker inflight receipt is invalid")
+            elif receipt_state == "exited":
+                if (
+                    not _is_int(returncode)
+                    or not -255 <= returncode <= 255
+                    or not _is_int(duration_ms)
+                    or duration_ms < 0
+                    or not _is_int(stdout_bytes)
+                    or stdout_bytes < 0
+                    or not _is_int(stderr_bytes)
+                    or stderr_bytes < 0
+                    or stdout_bytes + stderr_bytes > HARD_LIMITS.terminal_output_per_call_bytes
+                ):
+                    _error("audit Docker broker exited receipt is invalid")
+            elif any(item is not None for item in optional_values):
+                _error("audit Docker broker incomplete receipt is invalid")
+            parsed_receipts.append(
+                AuditCommandReceipt(
+                    receipt_id=receipt_id,
+                    sequence=receipt_sequence,
+                    command_tag=command_tag,
+                    state=receipt_state,
+                    returncode=returncode,
+                    duration_ms=duration_ms,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                )
+            )
+        inflight = sum(receipt.state == "inflight" for receipt in parsed_receipts)
+        if len(parsed_receipts) != terminal_calls or inflight != active:
+            _error("audit Docker broker receipt ledger is inconsistent")
+        if active_trusted_value is not None and not any(
+            receipt.receipt_id == active_trusted_value and receipt.state == "inflight"
+            for receipt in parsed_receipts
+        ):
+            _error("audit Docker broker trusted receipt ledger is inconsistent")
+        target_commit = target_value
+        snapshot_digest = snapshot_value
+        receipt_hmac_key = key_value
+        terminal_receipts = tuple(parsed_receipts)
+        trusted_container_id = trusted_container_value
+        trusted_container_name = trusted_name_value
+        trusted_snapshot_path = trusted_path_value
+        trusted_snapshot_device = trusted_device_value
+        trusted_snapshot_inode = trusted_inode_value
+        trusted_snapshot_owner = trusted_owner_value
+        trusted_snapshot_mode = trusted_mode_value
+        trusted_execution_uid = trusted_uid_value
+        trusted_execution_gid = trusted_gid_value
+        trusted_command_tags = tuple(trusted_tag_values)
+        active_trusted_receipt_id = active_trusted_value
+
+    if phase == "closed" and any(receipt.state == "inflight" for receipt in terminal_receipts):
+        _error("audit Docker broker closed state is inconsistent")
+
     return AuditDockerBrokerState(
-        schema_version=_STATE_SCHEMA_VERSION,
+        schema_version=schema_version,
         hermes_version=HERMES_VERSION,
         docker_executable=docker_executable,
         container_id=container_id,
@@ -504,6 +761,21 @@ def _decode_state(data: bytes) -> AuditDockerBrokerState:
         cleanup_lease_deadline=(
             float(cleanup_lease_deadline) if cleanup_lease_deadline is not None else None
         ),
+        target_commit=target_commit,
+        snapshot_digest=snapshot_digest,
+        receipt_hmac_key=receipt_hmac_key,
+        terminal_receipts=terminal_receipts,
+        trusted_container_id=trusted_container_id,
+        trusted_container_name=trusted_container_name,
+        trusted_snapshot_path=trusted_snapshot_path,
+        trusted_snapshot_device=trusted_snapshot_device,
+        trusted_snapshot_inode=trusted_snapshot_inode,
+        trusted_snapshot_owner=trusted_snapshot_owner,
+        trusted_snapshot_mode=trusted_snapshot_mode,
+        trusted_execution_uid=trusted_execution_uid,
+        trusted_execution_gid=trusted_execution_gid,
+        trusted_command_tags=trusted_command_tags,
+        active_trusted_receipt_id=active_trusted_receipt_id,
     )
 
 
@@ -748,6 +1020,9 @@ def _wrapper_bytes(python_executable: Path) -> bytes:
     if any(character in executable for character in ("\n", "\r")):
         _error("audit Docker broker Python executable is invalid")
     try:
+        # The hermes environment handed to this shim is fully synthesized by the
+        # runner (pinned PATH, no PYTHONPATH), so interpreter-startup overrides
+        # cannot ride in through env vars.
         return (
             f"#!{executable}\n"
             "from zeus.audit_docker_broker_main import main\n"
@@ -764,14 +1039,50 @@ def install_audit_docker_broker(
     limits: AuditLimits,
     deadline: float,
     python_executable: Path,
+    target_commit: str,
+    snapshot_digest: str,
+    trusted_command_scripts: tuple[str, ...] = (),
 ) -> Path:
     run_id = _validate_prepared(prepared)
     _validate_limits(limits)
     docker = _validate_executable(docker_executable, "Docker executable")
+    if (
+        not isinstance(target_commit, str)
+        or _TARGET_COMMIT_RE.fullmatch(target_commit) is None
+        or not isinstance(snapshot_digest, str)
+        or _SHA256_RE.fullmatch(snapshot_digest) is None
+    ):
+        _error("audit Docker broker snapshot binding is invalid")
+    if (
+        not isinstance(trusted_command_scripts, tuple)
+        or len(trusted_command_scripts) > limits.terminal_calls
+        or any(
+            not isinstance(script, str)
+            or not script
+            or "\0" in script
+            or len(script.encode("utf-8", errors="strict")) > _MAX_ARGV_BYTES
+            for script in trusted_command_scripts
+        )
+        or len(set(trusted_command_scripts)) != len(trusted_command_scripts)
+        or bool(trusted_command_scripts) != (prepared.trusted_container_id is not None)
+    ):
+        _error("audit Docker broker trusted command binding is invalid")
     python = _validate_executable(python_executable, "Python executable")
     now = time.monotonic()
     sealed_deadline = _validate_deadline(deadline, limits, now)
     broker_executable = prepared.broker_dir / _BROKER_FILE_NAME
+    receipt_hmac_key = secrets.token_hex(32)
+    trusted_command_tags = tuple(
+        trusted_command_tag(
+            key_hex=receipt_hmac_key,
+            run_id=run_id,
+            target_commit=target_commit,
+            snapshot_digest=snapshot_digest,
+            image_id=prepared.image_id,
+            command_script=script,
+        )
+        for script in trusted_command_scripts
+    )
     state = AuditDockerBrokerState(
         schema_version=_STATE_SCHEMA_VERSION,
         hermes_version=HERMES_VERSION,
@@ -810,6 +1121,21 @@ def install_audit_docker_broker(
         cleanup_state="not_requested",
         cleanup_owner=None,
         cleanup_lease_deadline=None,
+        target_commit=target_commit,
+        snapshot_digest=snapshot_digest,
+        receipt_hmac_key=receipt_hmac_key,
+        terminal_receipts=(),
+        trusted_container_id=prepared.trusted_container_id,
+        trusted_container_name=prepared.trusted_container_name,
+        trusted_snapshot_path=prepared.trusted_snapshot_path,
+        trusted_snapshot_device=prepared.trusted_snapshot_device,
+        trusted_snapshot_inode=prepared.trusted_snapshot_inode,
+        trusted_snapshot_owner=prepared.trusted_snapshot_owner,
+        trusted_snapshot_mode=prepared.trusted_snapshot_mode,
+        trusted_execution_uid=prepared.trusted_execution_uid,
+        trusted_execution_gid=prepared.trusted_execution_gid,
+        trusted_command_tags=trusted_command_tags,
+        active_trusted_receipt_id=None,
     )
     with _locked_state(prepared.state_path) as locked:
         existing_state = _read_control_file_at(

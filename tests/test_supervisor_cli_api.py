@@ -402,7 +402,7 @@ class SupervisorCliApiTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                [sys.executable, "-m", "zeus.gateway_launcher", "7", "8"],
+                [sys.executable, "-I", "-m", "zeus.gateway_launcher", "7", "8"],
                 command,
             )
             self.assertNotIn("private-launch-secret", "\0".join(command))

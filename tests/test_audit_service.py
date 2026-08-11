@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from contextlib import ExitStack, suppress
+from dataclasses import replace
 from pathlib import Path
 from subprocess import DEVNULL, run
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ class AuditServiceContractTests(unittest.TestCase):
                 "provider": "test-provider",
                 "model": "test-model",
                 "provider_env": ["TEST_PROVIDER_API_KEY"],
+                "categories": ["correctness"],
             }
         )
         return mock.patch("zeus.audit.load_audit_config", return_value=config)
@@ -87,7 +89,21 @@ class AuditServiceContractTests(unittest.TestCase):
         *,
         runner_side_effect,
         cleanup_side_effect=None,
+        broker_receipts=(),
     ):
+        broker_binding: dict[str, object] = {}
+
+        def install_broker(prepared, **kwargs):
+            broker_binding.update(kwargs)
+            return prepared.broker_dir / "docker"
+
+        def read_broker_state(_state_path):
+            return SimpleNamespace(
+                target_commit=broker_binding["target_commit"],
+                snapshot_digest=broker_binding["snapshot_digest"],
+                terminal_receipts=tuple(broker_receipts),
+            )
+
         patches = [
             self._configured_service(service),
             mock.patch("zeus.audit._executable", return_value=tool),
@@ -105,7 +121,11 @@ class AuditServiceContractTests(unittest.TestCase):
             ),
             mock.patch(
                 "zeus.audit.install_audit_docker_broker",
-                side_effect=lambda prepared, **_kwargs: prepared.broker_dir / "docker",
+                side_effect=install_broker,
+            ),
+            mock.patch(
+                "zeus.audit.read_audit_docker_broker_state",
+                side_effect=read_broker_state,
             ),
             mock.patch(
                 "zeus.audit.AuditRunner.run",
@@ -130,7 +150,15 @@ class AuditServiceContractTests(unittest.TestCase):
         from zeus.audit import AuditService
 
         self.assertTrue(callable(AuditService.from_cwd))
-        for name in ("initialize", "doctor", "run", "list_reports", "show", "show_markdown"):
+        for name in (
+            "initialize",
+            "doctor",
+            "run",
+            "list_reports",
+            "show",
+            "show_markdown",
+            "gate",
+        ):
             self.assertTrue(callable(getattr(AuditService, name, None)))
 
     def test_initialize_creates_kimi_config_without_audit_run(self) -> None:
@@ -341,6 +369,120 @@ class AuditServiceContractTests(unittest.TestCase):
             self.assertFalse(checks["state_repository"].ok)
             self.assertIn("ignored and untracked", checks["state_repository"].observation)
             self.assertFalse((root / ".zeus" / "audits").exists())
+
+    def test_gate_rejects_tracked_in_repository_state_before_loading_report(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root, ignored_state=False)
+            state_dir = root / ".zeus"
+            state_dir.mkdir()
+            (state_dir / "tracked").write_text("tracked\n", encoding="utf-8")
+            run(
+                ("git", "-C", str(root), "add", ".zeus/tracked"),
+                check=True,
+                stdin=DEVNULL,
+            )
+            run(
+                ("git", "-C", str(root), "commit", "-qm", "track state"),
+                check=True,
+                stdin=DEVNULL,
+            )
+            service = AuditService.from_cwd(cwd=root, env={})
+
+            with (
+                mock.patch.object(service, "show") as show,
+                self.assertRaisesRegex(
+                    AuditServiceError,
+                    "repository changed before the audit policy gate",
+                ) as raised,
+            ):
+                service.gate("a" * 32)
+
+            show.assert_not_called()
+            self.assertIsInstance(raised.exception.__cause__, AuditServiceError)
+            self.assertIn("state path is tracked", str(raised.exception.__cause__))
+
+    def test_gate_rejects_repository_head_change_before_loading_report(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            service = AuditService.from_cwd(cwd=root, env={})
+            (root / "README").write_text("changed\n", encoding="utf-8")
+            run(("git", "-C", str(root), "add", "README"), check=True, stdin=DEVNULL)
+            run(
+                ("git", "-C", str(root), "commit", "-qm", "move head"),
+                check=True,
+                stdin=DEVNULL,
+            )
+
+            with (
+                mock.patch.object(service, "show") as show,
+                self.assertRaisesRegex(
+                    AuditServiceError,
+                    "repository changed before the audit policy gate",
+                ),
+            ):
+                service.gate("b" * 32)
+
+            show.assert_not_called()
+
+    def test_gate_binds_report_to_discovered_repository_and_commit(self) -> None:
+        from zeus.audit import AuditService
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            service = AuditService.from_cwd(cwd=root, env={})
+            report = SimpleNamespace()
+            evaluation = SimpleNamespace(allowed=True)
+
+            with (
+                mock.patch.object(service, "show", return_value=report),
+                mock.patch(
+                    "zeus.audit.evaluate_audit_policy",
+                    return_value=evaluation,
+                ) as evaluate,
+            ):
+                result = service.gate("c" * 32)
+
+            self.assertIs(evaluation, result)
+            evaluate.assert_called_once_with(
+                report,
+                policy_id="release-v1",
+                expected_target_commit=service.location.head,
+                expected_repository_id=service.location.repository_id,
+            )
+
+    def test_gate_rechecks_repository_after_loading_report(self) -> None:
+        from zeus.audit import AuditService, AuditServiceError
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            service = AuditService.from_cwd(cwd=root, env={})
+
+            def move_head(_run_id):
+                (root / "README").write_text("changed during gate\n", encoding="utf-8")
+                run(("git", "-C", str(root), "add", "README"), check=True, stdin=DEVNULL)
+                run(
+                    ("git", "-C", str(root), "commit", "-qm", "move head during gate"),
+                    check=True,
+                    stdin=DEVNULL,
+                )
+                return SimpleNamespace()
+
+            with (
+                mock.patch.object(service, "show", side_effect=move_head),
+                mock.patch("zeus.audit.evaluate_audit_policy") as evaluate,
+                self.assertRaisesRegex(AuditServiceError, "changed during"),
+            ):
+                service.gate("d" * 32)
+
+            evaluate.assert_not_called()
 
     def test_service_rejects_immediate_repository_lock_contention(self) -> None:
         from zeus.audit import AuditService, AuditServiceError
@@ -764,9 +906,23 @@ class AuditServiceContractTests(unittest.TestCase):
         )
         from zeus.audit_config import parse_audit_config
         from zeus.audit_container import PreparedAuditContainer
-        from zeus.audit_models import AuditStatus
+        from zeus.audit_models import AuditCommandReceipt, AuditStatus
+        from zeus.audit_receipts import (
+            TRUSTED_EXECUTION_BOUNDARY,
+            expected_command_receipt_tag,
+        )
         from zeus.audit_runner import AuditRunnerOutcome, AuditRunnerResult
 
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="exited",
+            returncode=0,
+            duration_ms=17,
+            stdout_bytes=8,
+            stderr_bytes=0,
+        )
         payload = json.dumps(
             {
                 "summary": "verified",
@@ -787,10 +943,26 @@ class AuditServiceContractTests(unittest.TestCase):
                         "impact": "impact",
                         "recommendation": "recommendation",
                         "verification": "verification",
+                        "control_id": "SEC-REPO",
                     }
                 ],
-                "checks": [],
+                "checks": [
+                    {
+                        "name": "repository_review",
+                        "disposition": "passed",
+                        "observation": "committed repository was inspected",
+                        "receipt_id": receipt.receipt_id,
+                    }
+                ],
                 "skipped_checks": [],
+                "coverage": [
+                    {
+                        "control_id": "SEC-REPO",
+                        "disposition": "checked",
+                        "check_names": ["repository_review"],
+                        "reason": None,
+                    }
+                ],
             },
             separators=(",", ":"),
         ).encode()
@@ -807,6 +979,12 @@ class AuditServiceContractTests(unittest.TestCase):
                     "provider": "test-provider",
                     "model": "test-model",
                     "provider_env": ["TEST_PROVIDER_API_KEY"],
+                    "suggested_commands": {
+                        "repository_review": {
+                            "argv": ["true"],
+                            "control_ids": ["SEC-REPO"],
+                        }
+                    },
                 }
             )
             service = AuditService.from_cwd(
@@ -818,6 +996,8 @@ class AuditServiceContractTests(unittest.TestCase):
             profile_paths: list[Path] = []
             profile_modes: list[int] = []
             control_paths: list[Path] = []
+            broker_install_arguments: list[dict[str, object]] = []
+            bound_receipts: list[AuditCommandReceipt] = []
 
             def prepare(runtime, **kwargs):
                 nonlocal prepared_snapshot
@@ -832,12 +1012,43 @@ class AuditServiceContractTests(unittest.TestCase):
                     "sha256:" + "2" * 64,
                     broker_dir,
                     broker_dir / "state.json",
+                    trusted_container_id="3" * 64,
+                    trusted_container_name=f"zeus-audit-trusted-{run_id}",
                 )
 
             def line_counts(snapshot, *, deadline=None):
                 nonlocal line_count_calls
                 line_count_calls += 1
                 return real_line_counts(snapshot, deadline=deadline)
+
+            def install_broker(prepared, **kwargs):
+                broker_install_arguments.append(kwargs)
+                return prepared.broker_dir / "docker"
+
+            def read_broker_state(state_path):
+                arguments = broker_install_arguments[-1]
+                key = "d" * 64
+                bound = replace(
+                    receipt,
+                    command_tag=expected_command_receipt_tag(
+                        key_hex=key,
+                        run_id=state_path.parent.parent.name,
+                        target_commit=arguments["target_commit"],
+                        snapshot_digest=arguments["snapshot_digest"],
+                        image_id="sha256:" + "2" * 64,
+                        command_script="true",
+                        receipt=receipt,
+                        isolated_workspace=True,
+                    ),
+                )
+                bound_receipts.append(bound)
+                return SimpleNamespace(
+                    target_commit=arguments["target_commit"],
+                    snapshot_digest=arguments["snapshot_digest"],
+                    receipt_hmac_key=key,
+                    image_id="sha256:" + "2" * 64,
+                    terminal_receipts=(bound,),
+                )
 
             def run_hermes(_runner, **kwargs):
                 self.assertEqual(1, line_count_calls)
@@ -884,7 +1095,12 @@ class AuditServiceContractTests(unittest.TestCase):
                 ),
                 mock.patch(
                     "zeus.audit.install_audit_docker_broker",
-                    side_effect=lambda prepared, **_kwargs: prepared.broker_dir / "docker",
+                    side_effect=install_broker,
+                ),
+                mock.patch(
+                    "zeus.audit.read_audit_docker_broker_state",
+                    create=True,
+                    side_effect=read_broker_state,
                 ),
                 mock.patch(
                     "zeus.audit.snapshot_source_line_counts",
@@ -902,6 +1118,24 @@ class AuditServiceContractTests(unittest.TestCase):
             self.assertEqual(AuditStatus.completed, report.status)
             self.assertTrue(report.completeness.complete)
             self.assertEqual(1, len(report.findings))
+            self.assertIsNotNone(report.surface)
+            assert report.surface is not None
+            self.assertEqual(("SEC-REPO",), report.surface.required_control_ids)
+            self.assertTrue(bound_receipts)
+            self.assertEqual((bound_receipts[-1],), report.command_receipts)
+            self.assertEqual(
+                report.surface.snapshot_digest,
+                broker_install_arguments[0]["snapshot_digest"],
+            )
+            self.assertEqual(
+                report.metadata.target_commit, broker_install_arguments[0]["target_commit"]
+            )
+            self.assertEqual(
+                TRUSTED_EXECUTION_BOUNDARY,
+                report.metadata.trusted_execution_boundary,
+            )
+            source = report.findings[0].evidence[0]
+            self.assertEqual(hashlib.sha256(b"test\n").hexdigest(), source.blob_sha256)
             self.assertEqual(1, line_count_calls)
             self.assertEqual(1, len(profile_paths))
             self.assertEqual([0o600], profile_modes)
@@ -950,6 +1184,46 @@ class AuditServiceContractTests(unittest.TestCase):
             self.assertFalse(control_paths[0].exists())
             cleanup = {check.name: check for check in report.checks}["control_cleanup"]
             self.assertEqual("passed", cleanup.disposition.value)
+
+    def test_process_failure_preserves_terminal_receipts_for_forensics(self) -> None:
+        from zeus.audit import AuditService
+        from zeus.audit_models import AuditCommandReceipt, AuditStatus
+        from zeus.audit_runner import AuditRunnerOutcome, AuditRunnerResult
+
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="execution_failed",
+            returncode=None,
+            duration_ms=None,
+            stdout_bytes=None,
+            stderr_bytes=None,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            tool = root / "audit-tool"
+            tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            tool.chmod(0o700)
+            service = AuditService.from_cwd(cwd=root, env={})
+
+            report = self._run_with_external_audit_boundaries(
+                service,
+                tool,
+                runner_side_effect=lambda _runner, **_kwargs: AuditRunnerResult(
+                    AuditRunnerOutcome.process_failed,
+                    None,
+                    "process exited before valid model output",
+                    1,
+                    True,
+                    True,
+                ),
+                broker_receipts=(receipt,),
+            )
+
+            self.assertEqual(AuditStatus.failed, report.status)
+            self.assertEqual((receipt,), report.command_receipts)
 
     def test_control_cleanup_symlink_failure_is_partial_and_does_not_follow_target(self) -> None:
         from zeus.audit import AuditService
@@ -1223,6 +1497,48 @@ class AuditServiceContractTests(unittest.TestCase):
             cleanup = {check.name: check for check in report.checks}["control_cleanup"]
             self.assertEqual("failed", cleanup.disposition.value)
             self.assertIn("process/container cleanup", cleanup.observation)
+
+    def test_runner_cleanup_failed_uses_authoritative_runtime_cleanup(self) -> None:
+        from zeus.audit import AuditService
+        from zeus.audit_container import CleanupResult
+        from zeus.audit_runner import AuditRunnerOutcome, AuditRunnerResult
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._repository(root)
+            tool = root / "audit-tool"
+            tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            tool.chmod(0o700)
+            service = AuditService.from_cwd(cwd=root, env={})
+            control_paths: list[Path] = []
+            cleanup_ids: list[str] = []
+
+            def run_runner(_runner, **kwargs):
+                control_paths.append(kwargs["control_dir"])
+                return AuditRunnerResult(
+                    AuditRunnerOutcome.cleanup_failed,
+                    None,
+                    "broker cleanup did not complete",
+                    0,
+                    False,
+                    False,
+                )
+
+            def cleanup_container(_runtime, prepared):
+                cleanup_ids.append(prepared.container_id)
+                return CleanupResult(True, False, "exact containers removed")
+
+            report = self._run_with_external_audit_boundaries(
+                service,
+                tool,
+                runner_side_effect=run_runner,
+                cleanup_side_effect=cleanup_container,
+            )
+
+            self.assertEqual(["1" * 64], cleanup_ids)
+            self.assertFalse(control_paths[0].exists())
+            cleanup = {check.name: check for check in report.checks}["control_cleanup"]
+            self.assertEqual("passed", cleanup.disposition.value, cleanup.observation)
 
     def test_interrupt_before_external_setup_removes_control_and_persists_cancelled_report(
         self,

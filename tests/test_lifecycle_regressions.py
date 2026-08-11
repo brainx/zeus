@@ -44,7 +44,7 @@ class _FakePopen:
 
 
 def _emulate_launcher_handshake(argv: list[str], pid: int) -> None:
-    if len(argv) < 5 or argv[1:3] != ["-m", "zeus.gateway_launcher"]:
+    if len(argv) < 6 or argv[1:4] != ["-I", "-m", "zeus.gateway_launcher"]:
         return
     payload_fd = os.dup(int(argv[-2]))
     ack_fd = os.dup(int(argv[-1]))
@@ -819,7 +819,7 @@ class LifecycleRegressionTests(unittest.TestCase):
                 store,
                 str(hermes),
                 root / "hermes",
-                startup_grace_seconds=0,
+                startup_grace_seconds=1,
                 stop_grace_seconds=1,
                 cmdline_reader=lambda pid: self._gateway_argv(str(hermes.resolve())),
             )

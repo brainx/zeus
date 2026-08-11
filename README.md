@@ -59,7 +59,7 @@ It never reads dirty or untracked worktree content, and it does not edit,
 remediate, commit, push, schedule, deploy, notify, or coordinate across hosts.
 Cross-host policy remains outside Zeus.
 
-All five audit commands first discover the containing Git repository and its
+All six audit commands first discover the containing Git repository and its
 Zeus state context.
 
 ### Initialize Kimi K3
@@ -111,10 +111,32 @@ zeus audit run
 An audit sends
 the prompt, selected committed-source excerpts, and bounded terminal output to
 that provider; it does not claim provider-side retention or network isolation.
-Repository commands run only in a prevalidated Docker container with network
-disabled, while Hermes remains a host process for the selected provider.
+Repository commands run only in prevalidated Docker containers with network
+disabled: a writable primary container for ordinary calls and a read-only
+trusted-snapshot container for configured coverage commands. Hermes remains a
+host process for the selected provider.
 Configured snapshot exclusions and unresolved external content are listed in
 the report; `completed` means complete within that selected scope.
+
+Schema-v2 reports add an authoritative inventory of the committed snapshot,
+explicit security-control coverage, source-blob SHA-256 digests, stable finding
+fingerprints, and terminal receipts bound to the target commit and snapshot.
+Schema-v2 metadata also declares the versioned Zeus-owned
+`isolated-read-only-snapshot-v1` execution boundary used to create trusted
+receipts.
+
+Receipts contain an opaque keyed command tag, result metadata, and byte counts;
+every tag binds the run, commit, snapshot, image, sequence, exact command
+digest, and result metadata without storing raw commands or command output.
+Isolated trusted-receipt tags additionally bind the versioned execution
+boundary. Security coverage can cite only operator-configured commands whose
+exact invocation and control mapping Zeus verifies against an isolated receipt.
+Zeus runs those commands in a separately pre-created container over a read-only,
+in-container-attested committed snapshot, force-resets the container before
+accepting the receipt, and permits writable caches/output only under `/tmp`.
+Ad-hoc model commands remain forensic evidence only. The fixed
+scanner-adapter registry is a non-executable integration seam. Zeus does not
+yet bundle or run deterministic SAST or dependency-advisory engines.
 
 `audit run` prints status, run ID, target commit, severity counts, and the
 relative Markdown-report path; completed is the only successful audit status.
@@ -132,6 +154,34 @@ credential, or image readiness checks. Reports are stored as `report.json` and
 `report.md` under `$ZEUS_STATE_DIR/audits/<run-id>/`. See
 [the audit contract](docs/AUDIT.md) for configuration, ceilings, cleanup, and
 compatibility constraints.
+
+### Apply the local release gate
+
+```bash
+zeus audit gate <run-id>
+zeus audit gate <run-id> --json
+```
+
+The deterministic `release-v1` policy reads an existing report and fails closed
+unless it is a completed, complete schema-v2 report with an authoritative
+surface using the current control catalog and audit skill, a matching repository
+and current commit, the current trusted-receipt execution boundary, no skipped
+committed content, one valid trusted coverage record for every required
+control, no skipped, unsupported, or not-applicable
+required controls, and no critical or high findings. The state directory must
+also remain outside the repository or ignored and untracked. The command does
+not rerun the audit or invoke Docker, Hermes, provider credentials, or the
+configured image. It exits zero only when the policy passes. Legacy schema-v1
+reports remain readable by `audit list` and `audit show`, but cannot pass this
+gate because they do not contain the v2 evidence contract.
+
+The default `audit init` configuration authorizes no security check commands,
+so it cannot pass `release-v1` by itself. Add structured private
+`suggested_commands` entries with exact `argv` and explicit `control_ids` for
+the controls your chosen tools enforce; generic tests and ad-hoc model commands
+do not count as security coverage. Commands carrying `control_ids` run with the
+committed snapshot read-only; configure those tools to place caches and build
+output under `/tmp`.
 
 ## Quick Start
 

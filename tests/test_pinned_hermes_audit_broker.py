@@ -25,6 +25,8 @@ PROFILE = f"audit-{RUN_ID}"
 IMAGE_REF = "registry.example.invalid/audit@sha256:" + "a" * 64
 IMAGE_ID = "sha256:" + "b" * 64
 CONTAINER_ID = "c" * 64
+TARGET_COMMIT = "d" * 40
+SNAPSHOT_DIGEST = "e" * 64
 
 
 def _installed_pinned_hermes() -> bool:
@@ -112,6 +114,8 @@ class PinnedHermesAuditBrokerTests(unittest.TestCase):
                 limits=HARD_LIMITS,
                 deadline=time.monotonic() + 120,
                 python_executable=broker_python,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
             )
             self.assertEqual(0o500, stat.S_IMODE(broker_executable.lstat().st_mode))
 

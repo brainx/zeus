@@ -50,7 +50,7 @@ class HermesAdapter:
         self.hermes_root = Path(hermes_root)
 
     def command(self, bot_id: str, *args: str) -> tuple[list[str], dict[str, str]]:
-        if not ID_RE.match(bot_id):
+        if not ID_RE.fullmatch(bot_id):
             raise ValueError(f"invalid bot id: {bot_id}")
         profile_path = self.hermes_root / "profiles" / bot_id
         env = _base_env()
@@ -75,6 +75,7 @@ class HermesAdapter:
             raise ValueError("launcher file descriptors must be distinct inherited descriptors")
         return [
             sys.executable,
+            "-I",
             "-m",
             "zeus.gateway_launcher",
             str(payload_fd),
@@ -115,11 +116,16 @@ class HermesAdapter:
         }
 
     def _resolved_hermes_bin(self, env: dict[str, str]) -> str:
-        candidate = (
-            self.hermes_bin
-            if os.path.isabs(self.hermes_bin)
-            else shutil.which(self.hermes_bin, path=env.get("PATH"))
-        )
+        # Resolve relative binary names against the base environment PATH only.
+        # `env` may contain profile dotenv values, which must never steer which
+        # executable Zeus launches (profile dotenv PATH is also rejected at load
+        # time, this is defense in depth).
+        candidate: str | None
+        if os.path.isabs(self.hermes_bin):
+            candidate = self.hermes_bin
+        else:
+            base_path = _base_env().get("PATH", env.get("PATH"))
+            candidate = shutil.which(self.hermes_bin, path=base_path)
         if candidate is None:
             raise FileNotFoundError(f"Hermes executable not found: {self.hermes_bin}")
         return str(Path(candidate).expanduser().resolve(strict=True))

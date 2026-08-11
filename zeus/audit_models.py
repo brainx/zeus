@@ -60,6 +60,13 @@ class CheckDisposition(StrEnum):
     skipped = "skipped"
 
 
+class CoverageDisposition(StrEnum):
+    checked = "checked"
+    not_applicable = "not_applicable"
+    skipped = "skipped"
+    unsupported = "unsupported"
+
+
 @dataclass(frozen=True)
 class AuditLimits:
     overall_seconds: int
@@ -121,6 +128,26 @@ HARD_LIMITS = AuditHardLimits(
 class SuggestedCommand:
     name: str
     argv: tuple[str, ...]
+    control_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TrustedCheckBinding:
+    name: str
+    receipt_tags: tuple[tuple[str, str], ...]
+    control_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AuditCommandReceipt:
+    receipt_id: str
+    sequence: int
+    command_tag: str
+    state: str
+    returncode: int | None
+    duration_ms: int | None
+    stdout_bytes: int | None
+    stderr_bytes: int | None
 
 
 @dataclass(frozen=True)
@@ -142,6 +169,24 @@ class AuditCheck:
     disposition: CheckDisposition
     duration_seconds: float
     observation: str
+    receipt_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AuditControlSpec:
+    control_id: str
+    category: AuditCategory
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class AuditControlCoverage:
+    control_id: str
+    category: AuditCategory
+    required: bool
+    disposition: CoverageDisposition
+    check_names: tuple[str, ...]
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -156,6 +201,7 @@ class SourceEvidence:
     start_line: int
     end_line: int | None
     observation: str
+    blob_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +230,8 @@ class AuditFinding:
     impact: str
     recommendation: str
     verification: str
+    control_id: str | None = None
+    fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +247,7 @@ class AuditMetadata:
     provider: str | None
     model: str | None
     worktree_changes_excluded: bool
+    trusted_execution_boundary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +274,7 @@ class ModelAuditResult:
     skipped_checks: tuple[str, ...]
     checks: tuple[AuditCheck, ...]
     completeness: AuditCompleteness
+    coverage: tuple[AuditControlCoverage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -240,3 +290,22 @@ class AuditReport:
     findings: tuple[AuditFinding, ...]
     severity_counts: SeverityCounts
     completeness: AuditCompleteness
+    surface: AuditSurface | None = None
+    coverage: tuple[AuditControlCoverage, ...] = ()
+    command_receipts: tuple[AuditCommandReceipt, ...] = ()
+
+
+@dataclass(frozen=True)
+class AuditSurface:
+    catalog_version: str
+    snapshot_digest: str
+    ecosystems: tuple[str, ...]
+    dependency_manifests: tuple[str, ...]
+    dependency_manifest_count: int
+    ci_paths: tuple[str, ...]
+    ci_path_count: int
+    iac_paths: tuple[str, ...]
+    iac_path_count: int
+    web_paths: tuple[str, ...]
+    web_path_count: int
+    required_control_ids: tuple[str, ...]

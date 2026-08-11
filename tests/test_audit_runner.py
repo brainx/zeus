@@ -23,6 +23,7 @@ from zeus.audit_runner import (
     AuditRunner,
     AuditRunnerError,
     AuditRunnerOutcome,
+    _validate_hermes_executable,
 )
 
 PROFILE = "audit-" + "1" * 32
@@ -95,6 +96,28 @@ class _ProcessWithInterruptingClose:
 
     def __getattr__(self, name: str):
         return getattr(self._process, name)
+
+
+class HermesExecutableOwnershipTests(unittest.TestCase):
+    def _fake_executable(self, root: Path) -> Path:
+        path = root / "hermes"
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_executable_owned_by_euid_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._fake_executable(Path(tmp))
+            self.assertEqual(path, _validate_hermes_executable(path))
+
+    def test_executable_owned_by_another_user_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._fake_executable(Path(tmp))
+            with (
+                mock.patch("zeus.audit_runner.os.geteuid", return_value=os.geteuid() + 1),
+                self.assertRaises(AuditRunnerError),
+            ):
+                _validate_hermes_executable(path)
 
 
 class AuditRunnerTests(unittest.TestCase):
