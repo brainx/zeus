@@ -53,7 +53,7 @@ def _container_presence(
             (
                 state.docker_executable,
                 "ps",
-                "-aq",
+                "--all",
                 "--no-trunc",
                 "--filter",
                 f"id={container_id}",

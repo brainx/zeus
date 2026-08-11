@@ -394,7 +394,7 @@ class AuditContainerRuntime:
         result = self._run(
             (
                 "ps",
-                "-aq",
+                "--all",
                 "--no-trunc",
                 "--filter",
                 f"name=^/{trusted_name}$",
@@ -1117,7 +1117,7 @@ class AuditContainerRuntime:
                 presence = self._run(
                     (
                         "ps",
-                        "-aq",
+                        "--all",
                         "--no-trunc",
                         "--filter",
                         f"id={container_id}",

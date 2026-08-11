@@ -310,7 +310,7 @@ class MutatingWorkspaceDockerRunner(FakeDockerRunner):
                 stdout=f"{TRUSTED_CONTAINER_ID}\n".encode("ascii"),
                 stderr=b"",
             )
-        if argv[1:3] == ("ps", "-aq") and f"id={TRUSTED_CONTAINER_ID}" in argv:
+        if argv[1:3] == ("ps", "--all") and f"id={TRUSTED_CONTAINER_ID}" in argv:
             self.calls.append((argv, deadline, output_limit, env))
             return BrokerCommandResult(
                 returncode=0,
@@ -424,7 +424,7 @@ class TimedOutTrustedContainerRunner(FakeDockerRunner):
                 stdout=f"{self.trusted_id}\n".encode("ascii"),
                 stderr=b"",
             )
-        if argv[1:3] == ("ps", "-aq") and f"id={self.trusted_id}" in argv:
+        if argv[1:3] == ("ps", "--all") and f"id={self.trusted_id}" in argv:
             self.calls.append((argv, deadline, output_limit, env))
             return BrokerCommandResult(
                 returncode=0,
@@ -443,7 +443,7 @@ class MissingTrustedContainerRunner(FakeDockerRunner):
         output_limit: int,
         env: dict[str, str],
     ) -> BrokerCommandResult:
-        if argv[1:3] == ("ps", "-aq") and f"id={TRUSTED_CONTAINER_ID}" in argv:
+        if argv[1:3] == ("ps", "--all") and f"id={TRUSTED_CONTAINER_ID}" in argv:
             self.calls.append((argv, deadline, output_limit, env))
             return BrokerCommandResult(returncode=0, stdout=b"", stderr=b"")
         return super().run(argv, deadline=deadline, output_limit=output_limit, env=env)
@@ -1069,6 +1069,18 @@ class AuditDockerBrokerTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode)
         real_arguments = [call[0][1:] for call in runner.calls]
+        self.assertIn(
+            (
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"id={TRUSTED_CONTAINER_ID}",
+                "--format",
+                "{{.ID}}",
+            ),
+            real_arguments,
+        )
         self.assertIn(("rm", "-f", CONTAINER_ID), real_arguments)
         self.assertNotIn(("rm", "-f", TRUSTED_CONTAINER_ID), real_arguments)
         state = read_audit_docker_broker_state(self.prepared.state_path)

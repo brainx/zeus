@@ -83,7 +83,7 @@ class FakeDockerRunner:
                 stdout=json.dumps([self.inspect_value], separators=(",", ":")).encode() + b"\n",
                 stderr=b"",
             )
-        if argv[1:3] == ("ps", "-aq"):
+        if argv[1:3] == ("ps", "--all"):
             return DockerCommandResult(
                 stdout=(CONTAINER_ID.encode() + b"\n") if self.container_present else b"",
                 stderr=b"",
@@ -159,7 +159,7 @@ class TrustedDockerRunner(FakeDockerRunner):
                 stdout=json.dumps([value], separators=(",", ":")).encode() + b"\n",
                 stderr=b"",
             )
-        if argv[1:3] == ("ps", "-aq"):
+        if argv[1:3] == ("ps", "--all"):
             filter_value = argv[argv.index("--filter") + 1]
             if filter_value.startswith("name="):
                 if self.trusted_name_visibility_delay:
@@ -741,6 +741,30 @@ class AuditContainerTests(unittest.TestCase):
 
         self.assertTrue(cleanup.removed, cleanup.observation)
         self.assertFalse(runner.main_present)
+        presence_calls = [call[0][1:] for call in runner.calls if call[0][1] == "ps"]
+        self.assertEqual(
+            [
+                (
+                    "ps",
+                    "--all",
+                    "--no-trunc",
+                    "--filter",
+                    f"id={TRUSTED_CONTAINER_ID}",
+                    "--format",
+                    "{{.ID}}",
+                ),
+                (
+                    "ps",
+                    "--all",
+                    "--no-trunc",
+                    "--filter",
+                    f"id={CONTAINER_ID}",
+                    "--format",
+                    "{{.ID}}",
+                ),
+            ],
+            presence_calls,
+        )
         removals = [call[0][3] for call in runner.calls if call[0][1:3] == ("rm", "-f")]
         self.assertEqual([CONTAINER_ID], removals)
 
@@ -772,7 +796,8 @@ class AuditContainerTests(unittest.TestCase):
         self.assertEqual([TRUSTED_CONTAINER_ID, CONTAINER_ID], removals)
         self.assertGreaterEqual(
             sum(
-                call[0][1:3] == ("ps", "-aq") and f"name=^/zeus-audit-trusted-{RUN_ID}$" in call[0]
+                call[0][1:3] == ("ps", "--all")
+                and f"name=^/zeus-audit-trusted-{RUN_ID}$" in call[0]
                 for call in runner.calls
             ),
             2,
@@ -816,7 +841,8 @@ class AuditContainerTests(unittest.TestCase):
         self.assertEqual([TRUSTED_CONTAINER_ID, CONTAINER_ID], removals)
         self.assertFalse(
             any(
-                call[0][1:3] == ("ps", "-aq") and f"name=^/zeus-audit-trusted-{RUN_ID}$" in call[0]
+                call[0][1:3] == ("ps", "--all")
+                and f"name=^/zeus-audit-trusted-{RUN_ID}$" in call[0]
                 for call in runner.calls
             ),
             "a parsed exact ID must not fall back to ambiguous name polling",
