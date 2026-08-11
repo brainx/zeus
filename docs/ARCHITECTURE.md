@@ -63,29 +63,57 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.audit_*`: Native, report-only audit components for committed `HEAD`
   snapshots, bounded report storage, an ephemeral Hermes profile, and the
   prevalidated Docker broker. Workspace discovery/materialization/validation,
-  broker protocol/control/execution, report parsing/rendering, and run-control
-  cleanup are separate internal modules. They do not use `StateStore`,
-  lifecycle APIs, SQLite migrations, scheduling, remediation, or cross-host
-  coordination.
+  deterministic surface mapping, broker protocol/control/execution, report
+  parsing/rendering, release-policy evaluation, and run-control cleanup are
+  separate internal modules. A fixed scanner-adapter registry is a
+  non-executable future integration seam; no deterministic SAST or advisory
+  scanner is bundled or run. Audit modules do not use `StateStore`, lifecycle
+  APIs, SQLite migrations, scheduling, remediation, or cross-host coordination.
 
 ## Repository Audit Boundary
 
-Repository audit is a host-local command path with five actions: init, doctor,
-run, list, and show. `init` explicitly selects Kimi K3 by atomically creating a
-private configuration; it does not contact a provider or create a run. The run
-path materializes the exact committed `HEAD`, never a dirty or untracked
-worktree. `AuditService` starts before normal service construction, loads
-settings without repository `.env`, and stores only private configuration and
-report artifacts. The packaged `zeus.bundled_skills.audit` instruction is the
-sole audit skill; general skill loading remains unavailable.
+Repository audit is a host-local command path with six actions: init, doctor,
+run, list, show, and gate. `init` explicitly selects Kimi K3 by atomically
+creating a private configuration; it does not contact a provider or create a
+run. The run path materializes the exact committed `HEAD`, never a dirty or
+untracked worktree. `AuditService` starts before normal service construction,
+loads settings without repository `.env`, and stores only private configuration
+and report artifacts. The packaged `zeus.bundled_skills.audit` instruction is
+the sole audit skill; general skill loading remains unavailable.
 
 The audit path accepts only Hermes Agent 0.20.0 and an already preloaded,
-digest-qualified Docker image. A broker seals one Docker container with network
-mode `none`, no host mounts, fixed resource ceilings, and an unprivileged
-command identity before Hermes can execute repository commands. Hermes is a
-host process solely for the selected provider, so provider and model are
-reported and selected committed-source excerpts can leave the host. Audit does
-not remediate, schedule, or coordinate across hosts.
+digest-qualified Docker image. A broker seals a writable primary command
+container and, when configured controls exist, a second trusted container over
+the committed snapshot mounted read-only. Both use network mode `none`, fixed
+resource ceilings, and an unprivileged command identity, and both exact IDs are
+known before Hermes can execute repository commands. Before every
+coverage-bearing command, Zeus validates the trusted container's effective
+isolation and recomputes the mounted snapshot digest inside it; afterward Zeus
+force-resets the container and proves it stopped before accepting the receipt.
+Private state binds receipts to the target commit and canonical snapshot
+digest. Every receipt tag also binds the run, image, sequence, exact command
+digest, and result metadata; isolated trusted tags additionally bind the
+versioned execution boundary. Receipts expose the opaque keyed tag and output
+byte counts, not raw commands or output. Before model coverage is accepted,
+Zeus requires any cited configured check to match the operator-approved exact
+isolated command tag and control mapping. Ad-hoc model commands are forensic
+only.
+
+Schema-v2 reports add the deterministic surface inventory, explicit required
+control coverage, committed source-blob digests, stable finding fingerprints,
+the terminal receipts, and the explicit versioned Zeus-owned trusted-receipt
+execution boundary. The reader keeps schema-v1 report compatibility, but the
+deterministic `release-v1` gate fails closed unless a stored schema-v2
+report is completed and complete, all required controls are accounted for
+without skipped, unsupported, or not-applicable coverage, no committed content
+was skipped, the catalog, skill, trusted execution boundary, repository, and
+commit bindings match, and no critical or high finding is present. Gate
+evaluation reads stored artifacts only and does not invoke the runtime audit
+boundary.
+
+Hermes is a host process solely for the selected provider, so provider and
+model are reported and selected committed-source excerpts can leave the host.
+Audit does not remediate, schedule, or coordinate across hosts.
 - `zeus.doctor`: Readiness diagnostics.
 
 ## SQLite Durability
@@ -144,8 +172,8 @@ operation ID.
 Hermes child processes receive a minimal host environment plus profile `.env`
 values. Operators can allow specific host variables with `ZEUS_ENV_PASSTHROUGH`.
 Profile `.env` can never override executable-resolution or interpreter-startup
-variables (`PATH`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`, TLS trust stores,
-shell startup hooks); such assignments are rejected at load time, and the
+variables (`PATH`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`, selected TLS trust
+overrides, and shell startup hooks); such assignments are rejected at load time, and the
 configured `hermes` binary is resolved against the daemon's base environment
 only. The short-lived gateway launcher itself starts with a minimal environment
 so daemon secrets never reach it.

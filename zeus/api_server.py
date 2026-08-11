@@ -56,8 +56,8 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
 
     def process_request(self, request: Any, client_address: Any) -> None:
         # Slots are acquired before the request is parsed or authenticated, so a
-        # single client could otherwise hold every slot open (slow-loris). Cap
-        # concurrent connections per client address to keep slots available.
+        # single peer could otherwise hold every slot open (slow-loris). Cap
+        # concurrent connections per immediate peer address to keep slots available.
         client_key = (
             str(client_address[0]) if isinstance(client_address, tuple) else str(client_address)
         )
@@ -70,7 +70,7 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
             ):
                 rejection = (
                     "client_connection_limited",
-                    "per-client connection limit exceeded",
+                    "per-peer connection limit exceeded",
                 )
             elif not self._request_slots.acquire(blocking=False):
                 rejection = ("server_busy", "API request capacity is exhausted")

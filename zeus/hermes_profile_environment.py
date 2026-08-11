@@ -45,7 +45,7 @@ _BLOCKED_PROFILE_KEYS = frozenset(
         "RUBYLIB",
     }
 )
-_BLOCKED_PROFILE_KEY_PREFIXES = ("LD_", "DYLD_", "GIT_")
+_BLOCKED_PROFILE_KEY_PREFIXES = ("LD_", "DYLD_", "GIT_", "PYTHON")
 
 
 def _is_blocked_profile_key(key: str) -> bool:

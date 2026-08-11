@@ -438,6 +438,15 @@ class _GatewayRuntimeCore:
         cleanup_errors: list[str],
     ) -> SignalResult:
         if self.cleanup_process_group:
+            # Once the Popen leader has exited, its numeric pid can be reused by
+            # an unrelated session leader.  A same-valued pgid is therefore no
+            # longer sufficient authorization to signal the group.
+            if process.poll() is not None:
+                cleanup_errors.append(
+                    "killpg: spawned process already exited; process group ownership "
+                    "cannot be verified"
+                )
+                return SignalResult.denied
             if self._spawned_group_reissued(process, "killpg", cleanup_errors):
                 return SignalResult.denied
             try:

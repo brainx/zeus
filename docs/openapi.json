@@ -82,6 +82,7 @@
                   "idempotency_store_unavailable",
                   "idempotency_response_too_large",
                   "server_busy",
+                  "client_connection_limited",
                   "server_draining",
                   "not_ready",
                   "internal_error"

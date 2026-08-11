@@ -75,6 +75,7 @@ class HermesAdapter:
             raise ValueError("launcher file descriptors must be distinct inherited descriptors")
         return [
             sys.executable,
+            "-I",
             "-m",
             "zeus.gateway_launcher",
             str(payload_fd),

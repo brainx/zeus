@@ -194,7 +194,6 @@ class _SupervisorRegistry(_SupervisorStatus):
                 profile_removed=remove_profile,
                 cleanup_pending=cleanup_pending,
             )
-            self._discard_bot_lock(safe_bot_id)
             return BotStatusResponse(
                 bot_id=safe_bot_id,
                 status=BotStatus.stopped,
@@ -261,7 +260,6 @@ class _SupervisorRegistry(_SupervisorStatus):
                 bot_id=safe_bot_id,
                 archive_path=str(archive_path) if archive_path else None,
             )
-            self._discard_bot_lock(safe_bot_id)
             return {
                 "bot_id": safe_bot_id,
                 "status": BotStatus.stopped.value,

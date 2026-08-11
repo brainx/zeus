@@ -8,26 +8,39 @@
   resolution (`PATH`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`, `HOME`,
   `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, shell startup variables), closing a
   binary-substitution path through a writable profile `.env`.
-- Security: launched the gateway launcher under a minimal environment so daemon
-  secrets (e.g. `ZEUS_API_KEY`) and interpreter-influencing variables are never
-  exposed to the short-lived launcher process.
+- Security: launched the gateway launcher in Python isolated mode under a
+  minimal environment so daemon secrets (e.g. `ZEUS_API_KEY`) and
+  interpreter-influencing variables are never exposed to the short-lived
+  launcher process.
 - Security: routed non-ASCII `x-zeus-api-key` headers through the ordinary
   rate-limited `401` path instead of raising an unbudgeted `500`.
-- Security: capped concurrent connections per client address
+- Security: capped concurrent connections per immediate TCP peer address
   (`ZEUS_API_MAX_CONNECTIONS_PER_CLIENT`, default 16) so a single source cannot
   occupy every API request slot (slow-loris).
 - Security: stopped creating in-memory and on-disk lock state for nonexistent
-  bot identities on status, logs, and inspect paths, and dropped per-bot lock
-  entries on delete and archive.
+  bot identities on status, logs, and inspect paths.
 - Security: rotated `api.jsonl` at 8 MiB instead of allowing unauthenticated
   requests to grow the access log without bound.
-- Security: escaped C0/C1 control characters in sanitized event text, API log
-  tails, and committed-tree path validation, closing terminal escape-sequence
-  channels via hostile LLM output or repository filenames.
-- Security: verified the process-group identity still belongs to the spawned
-  pid before `killpg`, added owner validation for the audit Hermes executable,
-  capped snapshot path depth, and anchored bot-id matching with `fullmatch` to
-  reject trailing-newline identities.
+- Security: escaped C0/C1 control characters in sanitized event text and API
+  log tails, closing terminal escape-sequence channels via hostile LLM output.
+- Security: refused `killpg` when the spawned leader has exited or its live pid
+  no longer belongs to the expected process group, and anchored bot-id matching
+  with `fullmatch` to reject trailing-newline identities.
+- Audit: executed configured security-coverage commands in a pre-created,
+  read-only snapshot sandbox; attested the mounted digest and effective process
+  controls before each command; force-reset temporary state before accepting a
+  versioned isolated receipt; and added exact-ID outer fallback cleanup when
+  broker cleanup cannot prove removal.
+- Security: added owner validation for the audit Hermes executable, rejected
+  C0/C1 control characters in committed-tree paths, and capped committed
+  snapshot path depth.
+- Hardened repository audits with schema-v2 committed-surface inventory,
+  commit/snapshot/image/result-bound terminal receipts, exact operator-command
+  and control provenance for security coverage, source-blob digests, stable
+  finding fingerprints, schema-v1 read compatibility, and a fail-closed
+  `release-v1` local gate. Added a fixed, non-executable scanner-adapter registry
+  for future integrations; external deterministic SAST and advisory engines are
+  not bundled or executed.
 
 ## 0.5.0
 

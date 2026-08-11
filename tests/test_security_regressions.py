@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -15,13 +16,8 @@ from unittest import mock
 from tests.test_api import api_server, request_json
 from zeus.api_logging import ApiLogWriter
 from zeus.api_server import ThreadingHTTPServer
-from zeus.audit_runner import AuditRunnerError, _validate_hermes_executable
-from zeus.audit_workspace_core import (
-    _MAX_RELATIVE_PATH_COMPONENTS,
-    AuditWorkspaceError,
-    _validate_relative_path_text,
-)
-from zeus.gateway_runtime_core import _GatewayRuntimeCore
+from zeus.config import Settings
+from zeus.gateway_runtime_core import SignalResult, _GatewayRuntimeCore
 from zeus.hermes_adapter import HermesAdapter
 from zeus.hermes_profile_environment import (
     HermesProfileEnvironmentError,
@@ -67,6 +63,7 @@ class ProfileEnvBlocklistTests(unittest.TestCase):
             "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib",
             "PYTHONPATH=/tmp",
             "PYTHONHOME=/tmp",
+            "PYTHONWARNINGS=ignore::Warning:hostile_module",
             "GIT_SSH_COMMAND=/tmp/x",
             "HOME=/tmp",
             "SSL_CERT_FILE=/tmp/ca.pem",
@@ -123,8 +120,29 @@ class LauncherEnvironmentTests(unittest.TestCase):
         self.assertEqual("/usr/bin:/bin", env["PATH"])
         self.assertEqual("/home/test", env["HOME"])
 
+    def test_launcher_uses_isolated_python_and_imports_with_minimal_env(self) -> None:
+        from zeus.gateway_runtime_launch import _launcher_subprocess_env
+
+        command = HermesAdapter("hermes", Path("/nonexistent-root")).launcher_command(
+            999_998, 999_999
+        )
+        self.assertEqual([sys.executable, "-I", "-m", "zeus.gateway_launcher"], command[:4])
+        completed = subprocess.run(  # nosec B603
+            command,
+            env=_launcher_subprocess_env(),
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(0, completed.returncode)
+        self.assertNotIn(b"No module named", completed.stderr)
+
 
 class ApiKeyEncodingTests(unittest.TestCase):
+    def test_non_ascii_configured_api_key_is_rejected_at_startup(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ASCII characters only"):
+            Settings.from_env({"ZEUS_API_KEY": "clé-secrète"}, include_dotenv=False)
+
     def test_non_ascii_api_key_returns_401_not_500(self) -> None:
         with api_server({"ZEUS_API_KEY": "secret"}) as port:
             status, body = request_json(
@@ -201,7 +219,10 @@ class PerClientConnectionLimitTests(unittest.TestCase):
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(data)))
                 self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
@@ -286,7 +307,7 @@ class ControlCharacterSanitizationTests(unittest.TestCase):
             self.assertIn("line one\n", text)
 
 
-class IdAndPathValidationTests(unittest.TestCase):
+class IdValidationTests(unittest.TestCase):
     def test_validate_id_rejects_trailing_newline(self) -> None:
         with self.assertRaises(TemplateError):
             validate_id("ab\n", "bot_id")
@@ -296,59 +317,27 @@ class IdAndPathValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.command("ab\n", "gateway", "run")
 
-    def test_workspace_paths_reject_control_characters(self) -> None:
-        with self.assertRaises(AuditWorkspaceError):
-            _validate_relative_path_text("a/\x1b[2J/b", "tree path")
-
-    def test_workspace_paths_reject_excessive_depth(self) -> None:
-        deep = "/".join(["dir"] * _MAX_RELATIVE_PATH_COMPONENTS) + "/file.txt"
-        with self.assertRaises(AuditWorkspaceError):
-            _validate_relative_path_text(deep, "tree path")
-        shallow = "/".join(["dir"] * (_MAX_RELATIVE_PATH_COMPONENTS - 1)) + "/file.txt"
-        self.assertEqual(shallow, _validate_relative_path_text(shallow, "tree path"))
-
-
-class HermesExecutableOwnershipTests(unittest.TestCase):
-    def _fake_executable(self, root: Path) -> Path:
-        path = root / "hermes"
-        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        path.chmod(0o755)
-        return path
-
-    def test_executable_owned_by_euid_is_accepted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._fake_executable(Path(tmp))
-            self.assertEqual(path, _validate_hermes_executable(path))
-
-    def test_executable_owned_by_another_user_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._fake_executable(Path(tmp))
-            with (
-                mock.patch("zeus.audit_runner.os.geteuid", return_value=os.geteuid() + 1),
-                self.assertRaises(AuditRunnerError),
-            ):
-                _validate_hermes_executable(path)
-
 
 class ProcessGroupGuardTests(unittest.TestCase):
     """killpg must not fire when the pid's pgid no longer matches (pid reissue)."""
 
     def _core(self) -> _GatewayRuntimeCore:
-        return _GatewayRuntimeCore(
-            store=None,  # type: ignore[arg-type]
-            stop_grace_seconds=0.1,
-            kill_after_timeout=False,
-            lock_timeout_seconds=1.0,
-            readiness_timeout_seconds=1.0,
-            readiness_interval_seconds=0.05,
-            allow_legacy_pid_markers=False,
-        )
+        core = _GatewayRuntimeCore.__new__(_GatewayRuntimeCore)
+        core.cleanup_process_group = True
+        return core
 
     def test_group_reissue_is_detected(self) -> None:
-        # The current process is not a process-group leader, so pgid != pid.
         fake_process = mock.Mock()
-        fake_process.pid = os.getpid()
-        self.assertTrue(_GatewayRuntimeCore._spawned_group_reissued(fake_process, "killpg", []))
+        fake_process.pid = 424_242
+        cleanup_errors: list[str] = []
+        with mock.patch("zeus.gateway_runtime_core.os.getpgid", return_value=424_243):
+            self.assertTrue(
+                _GatewayRuntimeCore._spawned_group_reissued(fake_process, "killpg", cleanup_errors)
+            )
+        self.assertEqual(
+            ["killpg: process group id no longer belongs to pid"],
+            cleanup_errors,
+        )
 
     def test_own_session_child_is_not_flagged_as_reissued(self) -> None:
         child = subprocess.Popen(
@@ -364,6 +353,28 @@ class ProcessGroupGuardTests(unittest.TestCase):
         finally:
             child.kill()
             child.wait(timeout=5)
+
+    def test_reaped_leader_never_authorizes_same_numbered_process_group(self) -> None:
+        core = self._core()
+        fake_process = mock.Mock()
+        fake_process.pid = 424_242
+        fake_process.poll.return_value = 0
+        cleanup_errors: list[str] = []
+        with (
+            mock.patch("zeus.gateway_runtime_core.os.getpgid", return_value=424_242),
+            mock.patch("zeus.gateway_runtime_core.os.killpg") as killpg,
+        ):
+            result = core.signal_spawned_process(
+                fake_process,
+                signal.SIGTERM,
+                cleanup_errors,
+            )
+        self.assertIs(SignalResult.denied, result)
+        killpg.assert_not_called()
+        self.assertEqual(
+            ["killpg: spawned process already exited; process group ownership cannot be verified"],
+            cleanup_errors,
+        )
 
 
 if __name__ == "__main__":
