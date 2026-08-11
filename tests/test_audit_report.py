@@ -10,7 +10,9 @@ from zeus.audit_models import (
     HARD_LIMITS,
     AuditCategory,
     AuditCheck,
+    AuditCommandReceipt,
     AuditCompleteness,
+    AuditControlSpec,
     AuditLimits,
     AuditMetadata,
     AuditReport,
@@ -21,6 +23,13 @@ from zeus.audit_models import (
     RepositoryEvidence,
     SkippedContent,
     SourceEvidence,
+    TrustedCheckBinding,
+)
+from zeus.audit_receipts import (
+    TRUSTED_EXECUTION_BOUNDARY,
+    command_identity_tag,
+    expected_command_receipt_tag,
+    finalize_command_tag,
 )
 from zeus.audit_report import (
     MAX_REPORT_TEXT_BYTES,
@@ -59,6 +68,7 @@ def _metadata() -> AuditMetadata:
         provider="provider",
         model="model",
         worktree_changes_excluded=True,
+        trusted_execution_boundary=TRUSTED_EXECUTION_BOUNDARY,
     )
 
 
@@ -110,11 +120,36 @@ def _model_bytes(
     ).encode()
 
 
+def _v2_model_bytes(
+    findings: Sequence[object],
+    *,
+    checks: Sequence[object],
+    coverage: Sequence[object],
+    summary: str = "Audit complete",
+) -> bytes:
+    return json.dumps(
+        {
+            "summary": summary,
+            "findings": findings,
+            "checks": checks,
+            "skipped_checks": [
+                check["name"]
+                for check in checks
+                if isinstance(check, dict) and check.get("disposition") == "skipped"
+            ],
+            "coverage": coverage,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+
+
 def _validate(data: bytes, **changes: object) -> ModelAuditResult:
     arguments = {
         "run_id": "run-123",
         "allowed_categories": frozenset(AuditCategory),
         "source_line_counts": {"zeus/example.py": 12, "README.md": 4},
+        "source_digests": {"zeus/example.py": "c" * 64, "README.md": "d" * 64},
         "checks": _checks(),
         "limits": HARD_LIMITS,
     }
@@ -123,6 +158,463 @@ def _validate(data: bytes, **changes: object) -> ModelAuditResult:
 
 
 class ModelOutputValidationTests(unittest.TestCase):
+    def test_configured_security_check_rejects_a_relabelled_wrong_command_tag(self) -> None:
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "b" * 64,
+            state="exited",
+            returncode=0,
+            duration_ms=1,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+        data = _v2_model_bytes(
+            [],
+            checks=[
+                {
+                    "name": "repository-policy",
+                    "disposition": "passed",
+                    "observation": "true was relabelled as the configured check",
+                    "receipt_id": receipt.receipt_id,
+                }
+            ],
+            coverage=[],
+        )
+
+        with self.assertRaisesRegex(AuditReportError, "trusted command tag"):
+            _validate(
+                data,
+                configured_check_names=("repository-policy",),
+                trusted_checks=(
+                    TrustedCheckBinding(
+                        name="repository-policy",
+                        receipt_tags=(("terminal-000001", "hmac-sha256:" + "a" * 64),),
+                        control_ids=("SEC-REPO",),
+                    ),
+                ),
+                required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+                command_receipts=(receipt,),
+            )
+
+    def test_ad_hoc_successful_receipt_cannot_satisfy_security_coverage(self) -> None:
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="exited",
+            returncode=0,
+            duration_ms=1,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+        data = _v2_model_bytes(
+            [],
+            checks=[
+                {
+                    "name": "ad-hoc true",
+                    "disposition": "passed",
+                    "observation": "forensic command completed",
+                    "receipt_id": receipt.receipt_id,
+                }
+            ],
+            coverage=[
+                {
+                    "control_id": "SEC-REPO",
+                    "disposition": "checked",
+                    "check_names": ["ad-hoc true"],
+                    "reason": None,
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(AuditReportError, "authorized trusted checks"):
+            _validate(
+                data,
+                required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+                command_receipts=(receipt,),
+            )
+
+    def test_exactly_bound_configured_command_can_satisfy_security_coverage(self) -> None:
+        command_tag = "hmac-sha256:" + "a" * 64
+        ad_hoc_receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "b" * 64,
+            state="exited",
+            returncode=0,
+            duration_ms=1,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+        configured_receipt = AuditCommandReceipt(
+            receipt_id="terminal-000002",
+            sequence=2,
+            command_tag=command_tag,
+            state="exited",
+            returncode=0,
+            duration_ms=1,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+        result = _validate(
+            _v2_model_bytes(
+                [],
+                checks=[
+                    {
+                        "name": "ad-hoc inspection",
+                        "disposition": "passed",
+                        "observation": "forensic command completed first",
+                        "receipt_id": ad_hoc_receipt.receipt_id,
+                    },
+                    {
+                        "name": "repository-policy",
+                        "disposition": "passed",
+                        "observation": "configured policy completed",
+                        "receipt_id": configured_receipt.receipt_id,
+                    },
+                ],
+                coverage=[
+                    {
+                        "control_id": "SEC-REPO",
+                        "disposition": "checked",
+                        "check_names": ["repository-policy"],
+                        "reason": None,
+                    }
+                ],
+            ),
+            configured_check_names=("repository-policy",),
+            trusted_checks=(
+                TrustedCheckBinding(
+                    name="repository-policy",
+                    receipt_tags=(
+                        ("terminal-000001", command_tag),
+                        ("terminal-000002", command_tag),
+                    ),
+                    control_ids=("SEC-REPO",),
+                ),
+            ),
+            required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+            command_receipts=(ad_hoc_receipt, configured_receipt),
+        )
+
+        self.assertTrue(result.completeness.complete)
+        self.assertEqual(("repository-policy",), result.coverage[0].check_names)
+
+    def test_shared_workspace_receipt_cannot_satisfy_release_v1_coverage(self) -> None:
+        key = "1" * 64
+        run_id = "run-123"
+        target_commit = "2" * 40
+        snapshot_digest = "3" * 64
+        image_id = "sha256:" + "4" * 64
+        command_script = "python -m unittest"
+        mutation_script = "printf mutated > zeus/example.py"
+        mutation_identity_tag = command_identity_tag(
+            key_hex=key,
+            run_id=run_id,
+            target_commit=target_commit,
+            snapshot_digest=snapshot_digest,
+            image_id=image_id,
+            sequence=1,
+            command_script=mutation_script,
+        )
+        mutation_receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag=finalize_command_tag(
+                key_hex=key,
+                identity_tag=mutation_identity_tag,
+                state="exited",
+                returncode=0,
+                duration_ms=1,
+                stdout_bytes=0,
+                stderr_bytes=0,
+            ),
+            state="exited",
+            returncode=0,
+            duration_ms=1,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+        identity_tag = command_identity_tag(
+            key_hex=key,
+            run_id=run_id,
+            target_commit=target_commit,
+            snapshot_digest=snapshot_digest,
+            image_id=image_id,
+            sequence=2,
+            command_script=command_script,
+        )
+        shared_receipt = AuditCommandReceipt(
+            receipt_id="terminal-000002",
+            sequence=2,
+            command_tag=finalize_command_tag(
+                key_hex=key,
+                identity_tag=identity_tag,
+                state="exited",
+                returncode=0,
+                duration_ms=1,
+                stdout_bytes=0,
+                stderr_bytes=0,
+            ),
+            state="exited",
+            returncode=0,
+            duration_ms=1,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+        isolated_tag = expected_command_receipt_tag(
+            key_hex=key,
+            run_id=run_id,
+            target_commit=target_commit,
+            snapshot_digest=snapshot_digest,
+            image_id=image_id,
+            command_script=command_script,
+            receipt=shared_receipt,
+            isolated_workspace=True,
+        )
+
+        with self.assertRaisesRegex(AuditReportError, "trusted command tag"):
+            _validate(
+                _v2_model_bytes(
+                    [],
+                    checks=[
+                        {
+                            "name": "ad-hoc mutation",
+                            "disposition": "passed",
+                            "observation": "tracked source was changed in the shared workspace",
+                            "receipt_id": mutation_receipt.receipt_id,
+                        },
+                        {
+                            "name": "repository-policy",
+                            "disposition": "passed",
+                            "observation": "shared workspace command completed after mutation",
+                            "receipt_id": shared_receipt.receipt_id,
+                        },
+                    ],
+                    coverage=[
+                        {
+                            "control_id": "SEC-REPO",
+                            "disposition": "checked",
+                            "check_names": ["repository-policy"],
+                            "reason": None,
+                        }
+                    ],
+                ),
+                configured_check_names=("repository-policy",),
+                trusted_checks=(
+                    TrustedCheckBinding(
+                        name="repository-policy",
+                        receipt_tags=((shared_receipt.receipt_id, isolated_tag),),
+                        control_ids=("SEC-REPO",),
+                    ),
+                ),
+                required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+                command_receipts=(mutation_receipt, shared_receipt),
+            )
+
+    def test_empty_security_result_is_incomplete_and_materializes_missing_coverage(self) -> None:
+        result = validate_model_output(
+            _model_bytes([]),
+            run_id="run-empty",
+            allowed_categories=frozenset({AuditCategory.security}),
+            source_line_counts={"zeus/example.py": 12},
+            checks=(),
+            limits=HARD_LIMITS,
+            required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+        )
+
+        self.assertFalse(result.completeness.complete)
+        self.assertEqual(1, len(result.coverage))
+        self.assertEqual("SEC-REPO", result.coverage[0].control_id)
+        self.assertEqual("skipped", result.coverage[0].disposition.value)
+        self.assertIn(
+            "required security control SEC-REPO was not reported", result.completeness.reasons
+        )
+
+    def test_receipts_bind_checks_coverage_source_digest_and_stable_fingerprint(self) -> None:
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="exited",
+            returncode=0,
+            duration_ms=25,
+            stdout_bytes=12,
+            stderr_bytes=0,
+        )
+        finding = {**_finding(), "control_id": "SEC-REPO"}
+        data = _v2_model_bytes(
+            [finding],
+            checks=[
+                {
+                    "name": "repository review",
+                    "disposition": "passed",
+                    "observation": "review completed",
+                    "receipt_id": "terminal-000001",
+                }
+            ],
+            coverage=[
+                {
+                    "control_id": "SEC-REPO",
+                    "disposition": "checked",
+                    "check_names": ["repository review"],
+                    "reason": None,
+                }
+            ],
+        )
+        arguments = {
+            "allowed_categories": frozenset({AuditCategory.security}),
+            "source_line_counts": {"zeus/example.py": 12},
+            "source_digests": {"zeus/example.py": "b" * 64},
+            "checks": (),
+            "limits": HARD_LIMITS,
+            "required_controls": (AuditControlSpec("SEC-REPO", AuditCategory.security),),
+            "command_receipts": (receipt,),
+            "trusted_checks": (
+                TrustedCheckBinding(
+                    name="repository review",
+                    receipt_tags=((receipt.receipt_id, receipt.command_tag),),
+                    control_ids=("SEC-REPO",),
+                ),
+            ),
+        }
+
+        first = validate_model_output(data, run_id="run-one", **arguments)
+        second = validate_model_output(data, run_id="run-two", **arguments)
+
+        self.assertTrue(first.completeness.complete)
+        self.assertEqual(0.025, first.checks[0].duration_seconds)
+        self.assertEqual("terminal-000001", first.checks[0].receipt_id)
+        source = first.findings[0].evidence[0]
+        self.assertIsInstance(source, SourceEvidence)
+        assert isinstance(source, SourceEvidence)
+        self.assertEqual("b" * 64, source.blob_sha256)
+        self.assertNotEqual(first.findings[0].finding_id, second.findings[0].finding_id)
+        self.assertEqual(first.findings[0].fingerprint, second.findings[0].fingerprint)
+        self.assertRegex(first.findings[0].fingerprint or "", r"^finding-fingerprint-[0-9a-f]{32}$")
+
+    def test_model_check_cannot_claim_an_unknown_or_mismatched_receipt(self) -> None:
+        data = _v2_model_bytes(
+            [],
+            checks=[
+                {
+                    "name": "repository review",
+                    "disposition": "passed",
+                    "observation": "claimed",
+                    "receipt_id": "terminal-000001",
+                }
+            ],
+            coverage=[],
+        )
+
+        with self.assertRaisesRegex(AuditReportError, "receipt"):
+            validate_model_output(
+                data,
+                run_id="run-receipt",
+                allowed_categories=frozenset({AuditCategory.security}),
+                source_line_counts={},
+                checks=(),
+                limits=HARD_LIMITS,
+                required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+                command_receipts=(),
+            )
+
+    def test_failed_receipt_backed_security_check_keeps_report_incomplete(self) -> None:
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="exited",
+            returncode=2,
+            duration_ms=10,
+            stdout_bytes=0,
+            stderr_bytes=12,
+        )
+        result = validate_model_output(
+            _v2_model_bytes(
+                [],
+                checks=[
+                    {
+                        "name": "repository review",
+                        "disposition": "failed",
+                        "observation": "scanner failed",
+                        "receipt_id": receipt.receipt_id,
+                    }
+                ],
+                coverage=[
+                    {
+                        "control_id": "SEC-REPO",
+                        "disposition": "checked",
+                        "check_names": ["repository review"],
+                        "reason": None,
+                    }
+                ],
+            ),
+            run_id="run-failed-check",
+            allowed_categories=frozenset({AuditCategory.security}),
+            source_line_counts={},
+            checks=(),
+            limits=HARD_LIMITS,
+            required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+            command_receipts=(receipt,),
+            trusted_checks=(
+                TrustedCheckBinding(
+                    name="repository review",
+                    receipt_tags=((receipt.receipt_id, receipt.command_tag),),
+                    control_ids=("SEC-REPO",),
+                ),
+            ),
+        )
+
+        self.assertFalse(result.completeness.complete)
+        self.assertIn(
+            "receipt-backed audit check repository review failed with exit code 2",
+            result.completeness.reasons,
+        )
+
+    def test_required_applicable_control_rejects_not_applicable_disposition(self) -> None:
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="exited",
+            returncode=0,
+            duration_ms=10,
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
+
+        with self.assertRaisesRegex(AuditReportError, "not_applicable"):
+            validate_model_output(
+                _v2_model_bytes(
+                    [],
+                    checks=[
+                        {
+                            "name": "repository review",
+                            "disposition": "passed",
+                            "observation": "reviewed",
+                            "receipt_id": receipt.receipt_id,
+                        }
+                    ],
+                    coverage=[
+                        {
+                            "control_id": "SEC-REPO",
+                            "disposition": "not_applicable",
+                            "check_names": ["repository review"],
+                            "reason": None,
+                        }
+                    ],
+                ),
+                run_id="run-not-applicable",
+                allowed_categories=frozenset({AuditCategory.security}),
+                source_line_counts={},
+                checks=(),
+                limits=HARD_LIMITS,
+                required_controls=(AuditControlSpec("SEC-REPO", AuditCategory.security),),
+                command_receipts=(receipt,),
+            )
+
     def test_validates_all_evidence_variants_and_assigns_stable_ids(self) -> None:
         findings: list[object] = [
             _finding(),
@@ -316,6 +808,7 @@ class ModelOutputValidationTests(unittest.TestCase):
         result = _validate(
             _model_bytes([finding]),
             source_line_counts={secret_path: 2},
+            source_digests={secret_path: "e" * 64},
         )
 
         self.assertEqual((), result.findings)
@@ -472,6 +965,12 @@ class ModelOutputValidationTests(unittest.TestCase):
 
 
 class AuditReportTests(unittest.TestCase):
+    def test_schema_v2_metadata_declares_trusted_execution_boundary(self) -> None:
+        self.assertIn(
+            "trusted_execution_boundary",
+            AuditMetadata.__dataclass_fields__,
+        )
+
     def _model_result(
         self,
         findings: Sequence[object] | None = None,
@@ -619,7 +1118,7 @@ class AuditReportTests(unittest.TestCase):
         self.assertNotIn(secret, serialized.decode())
         self.assertNotIn(secret, markdown)
         self.assertIn("[redacted]", serialized.decode())
-        self.assertIn("[redacted]", markdown)
+        self.assertIn(r"\[redacted\]", markdown)
 
     def test_json_is_canonical_and_stored_envelope_round_trips(self) -> None:
         report = self._report()
@@ -628,6 +1127,10 @@ class AuditReportTests(unittest.TestCase):
         decoded = json.loads(serialized)
 
         self.assertEqual(REPORT_SCHEMA_VERSION, decoded["schema_version"])
+        self.assertEqual(
+            TRUSTED_EXECUTION_BOUNDARY,
+            decoded["metadata"]["trusted_execution_boundary"],
+        )
         self.assertEqual(
             serialized,
             json.dumps(
@@ -639,6 +1142,109 @@ class AuditReportTests(unittest.TestCase):
             ).encode(),
         )
         self.assertEqual(report, parse_audit_report(serialized, max_bytes=len(serialized)))
+
+    def test_schema_v2_parser_requires_explicit_trusted_execution_boundary(self) -> None:
+        decoded = json.loads(serialize_audit_report(self._report()))
+        decoded["metadata"].pop("trusted_execution_boundary")
+
+        with self.assertRaisesRegex(
+            AuditReportError,
+            "missing fields: trusted_execution_boundary",
+        ):
+            parse_audit_report(
+                json.dumps(decoded).encode(),
+                max_bytes=HARD_LIMITS.artifact_bytes,
+            )
+
+    def test_incomplete_report_preserves_non_exited_command_receipts(self) -> None:
+        incomplete = ModelAuditResult(
+            summary="execution failed after terminal activity",
+            findings=(),
+            skipped_checks=(),
+            checks=(),
+            completeness=AuditCompleteness(
+                complete=False,
+                reasons=("audit execution failed",),
+            ),
+        )
+        receipts = tuple(
+            AuditCommandReceipt(
+                receipt_id=f"terminal-{sequence:06d}",
+                sequence=sequence,
+                command_tag="hmac-sha256:" + f"{sequence:x}" * 64,
+                state=state,
+                returncode=None,
+                duration_ms=None,
+                stdout_bytes=None,
+                stderr_bytes=None,
+            )
+            for sequence, state in enumerate(("execution_failed", "orphaned"), start=1)
+        )
+        report = build_audit_report(
+            run_id="run-failed-receipts",
+            repository_id="repo-456",
+            status=AuditStatus.failed,
+            metadata=replace(_metadata(), termination_reason="execution failed"),
+            checks=(AuditCheck("execution", CheckDisposition.failed, 0.0, "failed"),),
+            skipped_content=(),
+            model_result=incomplete,
+            command_receipts=receipts,
+        )
+
+        serialized = serialize_audit_report(report)
+
+        self.assertEqual(
+            ("execution_failed", "orphaned"),
+            tuple(receipt.state for receipt in report.command_receipts),
+        )
+        self.assertEqual(report, parse_audit_report(serialized, max_bytes=len(serialized)))
+
+    def test_complete_report_rejects_non_exited_command_receipt(self) -> None:
+        report = self._report()
+        receipt = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="orphaned",
+            returncode=None,
+            duration_ms=None,
+            stdout_bytes=None,
+            stderr_bytes=None,
+        )
+
+        with self.assertRaises(AuditReportError):
+            serialize_audit_report(replace(report, command_receipts=(receipt,)))
+
+    def test_schema_v1_report_round_trips_without_implicit_upgrade(self) -> None:
+        current = json.loads(serialize_audit_report(self._report()))
+        current["schema_version"] = 1
+        current["metadata"].pop("trusted_execution_boundary")
+        current.pop("surface")
+        current.pop("coverage")
+        current.pop("command_receipts")
+        for check in current["checks"]:
+            check.pop("receipt_id")
+        for finding in current["findings"]:
+            finding.pop("control_id")
+            finding.pop("fingerprint")
+            for evidence in finding["evidence"]:
+                if evidence["type"] == "source":
+                    evidence.pop("blob_sha256")
+        legacy = json.dumps(
+            current,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+        parsed = parse_audit_report(legacy, max_bytes=len(legacy))
+
+        self.assertEqual(1, parsed.schema_version)
+        self.assertIsNone(parsed.surface)
+        self.assertIsNone(parsed.metadata.trusted_execution_boundary)
+        self.assertEqual(legacy, serialize_audit_report(parsed))
+        self.assertNotIn("## Security coverage", render_audit_markdown(parsed))
 
     def test_stored_envelope_rejects_size_duplicates_nonfinite_and_schema_drift(self) -> None:
         serialized = serialize_audit_report(self._report())

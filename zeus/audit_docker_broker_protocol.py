@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import secrets
 from dataclasses import replace
 
@@ -11,6 +12,8 @@ from zeus.audit_docker_broker_core import (
     AuditDockerBrokerState,
     _Decision,
 )
+from zeus.audit_models import AuditCommandReceipt
+from zeus.audit_receipts import command_identity_tag, trusted_command_tag
 
 
 def _expected_bootstrap_script(session_id: str) -> str:
@@ -160,7 +163,11 @@ def _decide(
     if (
         state.phase == "terminal"
         and arguments == _expected_removal(state)
-        and (state.active_terminal_calls or state.aggregate_reserved_output_bytes)
+        and (
+            state.active_terminal_calls
+            or state.aggregate_reserved_output_bytes
+            or any(receipt.state == "inflight" for receipt in state.terminal_receipts)
+        )
     ):
         return _Decision("refuse", state)
     if now >= state.deadline:
@@ -219,5 +226,84 @@ def _decide(
                 ),
                 active_terminal_calls=state.active_terminal_calls + 1,
             )
-            return _Decision("terminal", updated)
+            receipt_id: str | None = None
+            isolated_workspace = False
+            if state.schema_version >= 2:
+                if state.receipt_hmac_key is None:
+                    return _Decision("breach", _breached(state, "receipt binding drift"))
+                sequence = state.terminal_calls + 1
+                receipt_id = f"terminal-{sequence:06d}"
+                if (
+                    state.target_commit is None
+                    or state.snapshot_digest is None
+                    or not state.profile_name.startswith("audit-")
+                ):
+                    return _Decision("breach", _breached(state, "receipt binding drift"))
+                command_tag = command_identity_tag(
+                    key_hex=state.receipt_hmac_key,
+                    run_id=state.profile_name.removeprefix("audit-"),
+                    target_commit=state.target_commit,
+                    snapshot_digest=state.snapshot_digest,
+                    image_id=state.image_id,
+                    sequence=sequence,
+                    command_script=arguments[4],
+                    isolated_workspace=False,
+                )
+                if state.trusted_command_tags:
+                    selector = trusted_command_tag(
+                        key_hex=state.receipt_hmac_key,
+                        run_id=state.profile_name.removeprefix("audit-"),
+                        target_commit=state.target_commit,
+                        snapshot_digest=state.snapshot_digest,
+                        image_id=state.image_id,
+                        command_script=arguments[4],
+                    )
+                    isolated_workspace = any(
+                        hmac.compare_digest(selector, trusted_tag)
+                        for trusted_tag in state.trusted_command_tags
+                    )
+                    if isolated_workspace:
+                        if (
+                            state.trusted_container_id is None
+                            or state.trusted_container_name is None
+                        ):
+                            return _Decision("breach", _breached(state, "trusted container drift"))
+                        if state.active_trusted_receipt_id is not None:
+                            return _Decision("refuse", state)
+                        command_tag = command_identity_tag(
+                            key_hex=state.receipt_hmac_key,
+                            run_id=state.profile_name.removeprefix("audit-"),
+                            target_commit=state.target_commit,
+                            snapshot_digest=state.snapshot_digest,
+                            image_id=state.image_id,
+                            sequence=sequence,
+                            command_script=arguments[4],
+                            isolated_workspace=True,
+                        )
+                updated = replace(
+                    updated,
+                    active_trusted_receipt_id=(
+                        receipt_id if isolated_workspace else state.active_trusted_receipt_id
+                    ),
+                    terminal_receipts=(
+                        *state.terminal_receipts,
+                        AuditCommandReceipt(
+                            receipt_id=receipt_id,
+                            sequence=sequence,
+                            command_tag=command_tag,
+                            state="inflight",
+                            returncode=None,
+                            duration_ms=None,
+                            stdout_bytes=None,
+                            stderr_bytes=None,
+                        ),
+                    ),
+                )
+            return _Decision(
+                "terminal",
+                updated,
+                receipt_id=receipt_id,
+                started_at=now,
+                isolated_workspace=isolated_workspace,
+            )
     return _Decision("breach", _breached(state, "protocol drift"))

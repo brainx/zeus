@@ -6,7 +6,7 @@ address the same endpoint.
 
 The machine-readable OpenAPI contract is maintained in `docs/openapi.json`.
 
-All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated low-risk `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose runtime state or logs, including `GET /bots/<bot-id>/logs`, `GET /bots/<bot-id>/inspect`, and `GET /bots/<bot-id>/history`, always require `x-zeus-api-key`.
+All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. API keys must contain ASCII characters only; Zeus rejects a non-ASCII configured key at startup. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated low-risk `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose runtime state or logs, including `GET /bots/<bot-id>/logs`, `GET /bots/<bot-id>/inspect`, and `GET /bots/<bot-id>/history`, always require `x-zeus-api-key`.
 
 At startup Zeus rejects a non-loopback bind without an API key of at least 16
 characters, and rejects `ZEUS_ALLOW_UNAUTH_READS=1` on every non-loopback bind.
@@ -38,7 +38,8 @@ Known error codes are `invalid_request`, `invalid_bot_id`, `unknown_bot`,
 `idempotency_key_conflict`, `idempotency_in_progress`,
 `idempotency_indeterminate`, `idempotency_response_too_large`,
 `idempotency_store_unavailable`,
-`server_busy`, `server_draining`, `not_ready`, and `internal_error`.
+`server_busy`, `client_connection_limited`, `server_draining`, `not_ready`, and
+`internal_error`.
 
 JSON responses include `cache-control: no-store`. Mutating endpoints that accept
 request bodies require an `application/json` content type and reject missing or invalid media
@@ -55,9 +56,14 @@ Request parsing is bounded and explicit:
 - Request targets containing URL fragments are rejected rather than normalized silently.
 - Unsupported `OPTIONS`, `PUT`, `PATCH`, and `DELETE` requests return JSON `405` errors with
   `Allow: GET, POST`.
-- Zeus serves at most `ZEUS_API_MAX_CONCURRENT_REQUESTS` active requests and disconnects clients
+- Zeus serves at most `ZEUS_API_MAX_CONCURRENT_REQUESTS` active requests, at most
+  `ZEUS_API_MAX_CONNECTIONS_PER_CLIENT` connections per immediate TCP peer address, and disconnects clients
   that do not complete a request within `ZEUS_API_REQUEST_TIMEOUT_SECONDS`. Saturated servers
-  return `503` with `error.code=server_busy` and `Retry-After: 1`.
+  return `503` with `error.code=server_busy` (or `client_connection_limited` when one peer
+  exceeds its share) and `Retry-After: 1`.
+- Zeus does not trust forwarded client-address headers. When a reverse proxy connects over
+  loopback, all proxied callers share the proxy peer's connection bucket. Enforce source-specific
+  limits at the trusted proxy and, when necessary, raise Zeus's peer limit up to the global limit.
 - During orderly shutdown, Zeus rejects new work with `503`,
   `error.code=server_draining`, and `Retry-After: 1`, while active requests receive up to
   `ZEUS_API_SHUTDOWN_DRAIN_SECONDS` to finish.

@@ -100,14 +100,30 @@ def redact_secrets(text: str) -> str:
     )
 
 
+def _escape_control_characters(value: str) -> str:
+    """Neutralize C0/C1 control characters so untrusted text cannot drive a
+    terminal (CSI/OSC/DCS sequences) when reported through JSON or diagnostic
+    sinks. Tab and newline are common in legitimate text and are kept."""
+
+    result: list[str] = []
+    for character in value:
+        code = ord(character)
+        if character in "\t\n" or (0x20 <= code < 0x7F) or code > 0x9F:
+            result.append(character)
+        else:
+            result.append(f"\\u{code:04x}")
+    return "".join(result)
+
+
 def sanitize_text(value: str, *, max_length: int = MAX_EVENT_TEXT_LENGTH) -> str:
-    """Return bounded, redacted text without coercing non-string objects."""
+    """Return bounded, redacted, control-character-free text."""
 
     if type(value) is not str:
         return UNSUPPORTED_VALUE
     if type(max_length) is not int or max_length < 0:
         raise ValueError("max_length must be a non-negative integer")
-    return redact_secrets(value[:max_length])[:max_length]
+    escaped = _escape_control_characters(value[:max_length])
+    return redact_secrets(escaped)[:max_length]
 
 
 def _normalize_detail_name(key: str) -> str:

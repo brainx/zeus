@@ -236,11 +236,18 @@ consume an unbounded number of worker threads:
 
 ```dotenv
 ZEUS_API_MAX_CONCURRENT_REQUESTS=32
+ZEUS_API_MAX_CONNECTIONS_PER_CLIENT=16
 ZEUS_API_REQUEST_TIMEOUT_SECONDS=10
 ZEUS_API_SHUTDOWN_DRAIN_SECONDS=20
 ```
 
-The concurrency limit accepts values from 1 to 256. The request timeout accepts 0.1 to 300
+The concurrency limit accepts values from 1 to 256. The per-client limit accepts values from 1
+to 256 and caps how many connections a single immediate TCP peer address may hold open; excess
+connections from that peer are closed after a JSON `503 client_connection_limited` response with
+`Retry-After: 1`. Zeus does not trust forwarded client-address headers. If a reverse proxy
+connects over loopback, all proxied callers share its bucket: enforce source-specific limits at
+the trusted proxy and, when necessary, set Zeus's peer limit equal to the global limit. The
+request timeout accepts 0.1 to 300
 seconds. When every request slot is occupied, Zeus closes the excess connection after returning a
 JSON `503 server_busy` response with `Retry-After: 1`. Timeouts release their slot automatically.
 On orderly shutdown, Zeus keeps the listener available only to reject new work with
@@ -429,6 +436,16 @@ ZEUS_ENV_PASSTHROUGH=HTTP_PROXY,HTTPS_PROXY,NO_PROXY
 
 Keep the allowlist empty unless the Hermes process needs those values.
 
+A profile `.env` may only carry bot configuration and secrets. Assignments that
+would steer executable, library, interpreter, or TLS-trust resolution fail
+closed at load time: `PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`,
+`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, and shell startup variables
+(`BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PROMPT_COMMAND`, `IFS`, `CDPATH`,
+`GLOBIGNORE`, `TERMINFO`, `TERMINFO_DIRS`, `NODE_OPTIONS`, `PERL5OPT`,
+`PERL5LIB`, `RUBYOPT`, `RUBYLIB`) are rejected. Relative `hermes` binary names
+are only ever resolved against the daemon's base environment, so profile
+content cannot substitute the executable Zeus launches.
+
 ### Feishu connection mode
 
 Hermes Agent 0.20.0 must use Feishu WebSocket mode under Zeus. Do not configure
@@ -540,16 +557,36 @@ committed-source excerpts and bounded terminal output to be sent to that
 provider; provider-side retention and the host Hermes process are not isolated
 by the repository-command container.
 
+The current report schema is version 2. Before analysis Zeus derives an
+authoritative inventory and canonical digest from the committed snapshot. The
+private Docker-broker state binds terminal receipts to that digest and target
+commit. Schema-v2 metadata declares the versioned Zeus-owned
+`isolated-read-only-snapshot-v1` execution boundary. Each receipt contains a
+monotonic ID, opaque keyed command tag, return
+metadata, and output byte counts; its tag also binds the run, image, sequence,
+and exact command digest, while the receipt contains neither the raw command nor
+raw output. Report coverage uses explicit `checked`, `not_applicable`,
+`skipped`, or `unsupported` dispositions for every required security control.
+Only an exact operator-configured command explicitly mapped to that control may
+satisfy coverage; ad-hoc terminal commands are forensic only. Zeus attaches the
+committed blob SHA-256 to source evidence and a stable fingerprint to each
+finding.
+
+The fixed scanner-adapter registry only describes future, non-executable
+integration contracts. Zeus does not currently bundle or run external
+deterministic SAST, dependency-advisory, CI, IaC, native, or web scanners.
+
 `audit run` reports status, run ID, target commit, severity counts, and the
 relative report path. Only `completed` exits successfully; `partial`,
 `blocked`, `failed`, and `cancelled` exit nonzero. Reports are installed as
 `$ZEUS_STATE_DIR/audits/<run-id>/report.json` and `report.md`, under a mode
 `0700` run directory with mode `0600` files. One concurrent audit is permitted
 per repository. Cleanup attempts to stop run-owned processes, remove the exact
-labelled container, and remove disposable snapshot, control, and Hermes-home
-state. Any cleanup failure is recorded and makes an otherwise complete report
-partial. Reports list configured snapshot exclusions and unresolved external
-content; `completed` means complete within that selected snapshot scope.
+labelled primary and optional trusted containers, and then remove disposable
+snapshot, control, and Hermes-home state. Any cleanup failure is recorded and
+makes an otherwise complete report partial. Reports list configured snapshot
+exclusions and unresolved external content; `completed` means complete within
+that selected snapshot scope.
 
 Read stored reports with:
 
@@ -561,8 +598,40 @@ zeus audit show <run-id>
 These commands retain repository and state discovery but do not invoke Docker,
 Hermes, provider credential, or image readiness checks.
 
-The Docker command container has network mode `none`, no host bind mounts, an
-unprivileged identity, read-only root, and fixed CPU, memory, PID, tmpfs,
-output, and deadline ceilings. The feature does not remediate findings,
-schedule audits, alter lifecycle state, or coordinate cross-host work. See
-[AUDIT.md](AUDIT.md) for its complete configuration and resource contract.
+Apply the local release policy to a stored run with:
+
+```bash
+zeus audit gate <run-id>
+zeus audit gate <run-id> --json
+```
+
+The fixed `release-v1` policy is fail closed. It passes only a completed,
+complete schema-v2 report with an authoritative surface, exactly one valid
+coverage record for every required control, no skipped, unsupported, or
+not-applicable required controls, no skipped committed content, matching current
+catalog, skill, trusted execution boundary, repository, and commit bindings,
+and no critical or high findings. The state path must still be outside the
+repository or ignored and untracked. Human output prints a pass line or one
+fail line per reason; `--json` emits the policy ID, pass boolean, and ordered
+reason objects. The exit status is zero only for a pass. Gate evaluation reads
+the stored report and does not rerun analysis or invoke Docker, Hermes,
+credentials, or image readiness.
+Schema-v1 reports remain readable through `audit list` and `audit show`, but
+fail `release-v1` because they lack v2 surface and coverage evidence.
+
+`audit init` does not guess or authorize security tools. Before expecting a
+gate pass, add private structured `suggested_commands` records with exact
+`argv` and explicit `control_ids`. Use only commands whose exit semantics
+actually enforce the mapped control; mapping a generic success command weakens
+the operator-authored policy even though Zeus still verifies that exact command
+ran. Commands with `control_ids` execute over the committed snapshot mounted
+read-only in a separately reset sandbox, so configure tool caches and build
+output under `/tmp`.
+
+The primary Docker command container has network mode `none`, no host bind
+mounts, an unprivileged identity, read-only root, and fixed CPU, memory, PID,
+tmpfs, output, and deadline ceilings. Coverage-bearing configured commands run
+in the separate read-only trusted container described above. The feature does
+not remediate findings, schedule audits, alter lifecycle state, or coordinate
+cross-host work. See [AUDIT.md](AUDIT.md) for its complete configuration and
+resource contract.

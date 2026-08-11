@@ -438,6 +438,17 @@ class _GatewayRuntimeCore:
         cleanup_errors: list[str],
     ) -> SignalResult:
         if self.cleanup_process_group:
+            # Once the Popen leader has exited, its numeric pid can be reused by
+            # an unrelated session leader.  A same-valued pgid is therefore no
+            # longer sufficient authorization to signal the group.
+            if process.poll() is not None:
+                cleanup_errors.append(
+                    "killpg: spawned process already exited; process group ownership "
+                    "cannot be verified"
+                )
+                return SignalResult.denied
+            if self._spawned_group_reissued(process, "killpg", cleanup_errors):
+                return SignalResult.denied
             try:
                 os.killpg(process.pid, sig)
             except ProcessLookupError:
@@ -494,12 +505,34 @@ class _GatewayRuntimeCore:
             or self.pid_state(process.pid) is process_identity.PidState.dead
         )
 
+    @staticmethod
+    def _spawned_group_reissued(
+        process: PopenLike,
+        operation: str,
+        cleanup_errors: list[str],
+    ) -> bool:
+        """The child starts a new session, so while it lives pgid == pid. After
+        the pid is reaped the OS can reissue it to an unrelated process; only a
+        *mismatch* proves reissue (a gone pid says nothing about the group)."""
+        try:
+            pgid = os.getpgid(process.pid)
+        except OSError:
+            return False
+        if pgid == process.pid:
+            return False
+        cleanup_errors.append(f"{operation}: process group id no longer belongs to pid")
+        return True
+
     def spawned_tree_stopped(self, process: PopenLike, *, timeout: float) -> bool:
         if not self.cleanup_process_group:
             return (
                 process.poll() is not None
                 or self.pid_state(process.pid) is process_identity.PidState.dead
             )
+        if self._spawned_group_reissued(process, "killpg probe", []):
+            # The new pid owner says nothing about descendants that may remain
+            # in the original process group, so cleanup cannot be proven.
+            return False
         deadline = time.monotonic() + timeout
         while True:
             try:

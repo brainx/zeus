@@ -24,6 +24,10 @@ from zeus.audit_workspace import (
     RepositoryInspection,
     _parse_tree,
 )
+from zeus.audit_workspace_core import (
+    _MAX_RELATIVE_PATH_COMPONENTS,
+    _validate_relative_path_text,
+)
 
 
 def _deadline(seconds: float = 10.0) -> float:
@@ -32,6 +36,19 @@ def _deadline(seconds: float = 10.0) -> float:
 
 def _limits(**overrides: int) -> AuditLimits:
     return replace(HARD_LIMITS, **overrides)
+
+
+class AuditWorkspacePathValidationTests(unittest.TestCase):
+    def test_workspace_paths_reject_control_characters(self) -> None:
+        with self.assertRaises(AuditWorkspaceError):
+            _validate_relative_path_text("a/\x1b[2J/b", "tree path")
+
+    def test_workspace_paths_reject_excessive_depth(self) -> None:
+        deep = "/".join(["dir"] * _MAX_RELATIVE_PATH_COMPONENTS) + "/file.txt"
+        with self.assertRaises(AuditWorkspaceError):
+            _validate_relative_path_text(deep, "tree path")
+        shallow = "/".join(["dir"] * (_MAX_RELATIVE_PATH_COMPONENTS - 1)) + "/file.txt"
+        self.assertEqual(shallow, _validate_relative_path_text(shallow, "tree path"))
 
 
 class TemporaryGitRepository(unittest.TestCase):

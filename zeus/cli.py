@@ -85,6 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
     audit_show.add_argument(
         "--json", action="store_true", dest="as_json", help="emit machine-readable JSON"
     )
+    audit_gate = audit_sub.add_parser(
+        "gate",
+        help="Evaluate the fail-closed release policy for a stored report.",
+    )
+    audit_gate.add_argument("run_id", help="32-character lowercase hexadecimal audit run ID")
+    audit_gate.add_argument(
+        "--json", action="store_true", dest="as_json", help="emit machine-readable JSON"
+    )
 
     template_description = "Inspect available Hermes bot templates."
     template = sub.add_parser(
@@ -887,6 +895,32 @@ def _run_audit(args: argparse.Namespace) -> int:
             else:
                 print(service.show_markdown(args.run_id), end="")
             return 0
+        if args.action == "gate":
+            evaluation = service.gate(args.run_id)
+            if args.as_json:
+                print(
+                    json.dumps(
+                        {
+                            "passed": evaluation.passed,
+                            "policy_id": evaluation.policy_id,
+                            "reasons": [
+                                {
+                                    "code": reason.code,
+                                    "control_ids": list(reason.control_ids),
+                                    "observation": reason.observation,
+                                }
+                                for reason in evaluation.reasons
+                            ],
+                        },
+                        sort_keys=True,
+                    )
+                )
+            elif evaluation.passed:
+                print(f"pass\t{evaluation.policy_id}")
+            else:
+                for reason in evaluation.reasons:
+                    print(f"fail\t{reason.code}\t{reason.observation}")
+            return 0 if evaluation.passed else 1
     except (AuditServiceError, AuditStoreError, KeyError, ValueError, OSError) as exc:
         return _print_cli_error("audit_error", str(exc), as_json=args.as_json)
     raise AssertionError(f"unhandled audit command: {args}")
