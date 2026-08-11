@@ -530,7 +530,9 @@ class _GatewayRuntimeCore:
                 or self.pid_state(process.pid) is process_identity.PidState.dead
             )
         if self._spawned_group_reissued(process, "killpg probe", []):
-            return True
+            # The new pid owner says nothing about descendants that may remain
+            # in the original process group, so cleanup cannot be proven.
+            return False
         deadline = time.monotonic() + timeout
         while True:
             try:

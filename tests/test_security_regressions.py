@@ -339,6 +339,14 @@ class ProcessGroupGuardTests(unittest.TestCase):
             cleanup_errors,
         )
 
+    def test_reissued_leader_does_not_prove_spawned_tree_stopped(self) -> None:
+        core = self._core()
+        fake_process = mock.Mock()
+        fake_process.pid = 424_242
+
+        with mock.patch("zeus.gateway_runtime_core.os.getpgid", return_value=424_243):
+            self.assertFalse(core.spawned_tree_stopped(fake_process, timeout=0))
+
     def test_own_session_child_is_not_flagged_as_reissued(self) -> None:
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(5)"],
