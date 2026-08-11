@@ -169,7 +169,12 @@ def _validate_hermes_executable(path: Path) -> Path:
         result = path.lstat()
     except OSError as exc:
         raise AuditRunnerError("Hermes executable is unavailable") from exc
-    if not stat.S_ISREG(result.st_mode) or result.st_mode & 0o111 == 0 or result.st_mode & 0o022:
+    if (
+        not stat.S_ISREG(result.st_mode)
+        or result.st_mode & 0o111 == 0
+        or result.st_mode & 0o022
+        or result.st_uid not in (0, os.geteuid())
+    ):
         _error("Hermes executable metadata is unsafe")
     return path
 

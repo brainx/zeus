@@ -114,15 +114,21 @@ Every audit command discovers a Git repository and its Zeus state context.
 Docker, configured provider credentials, and a preloaded digest-qualified audit
 image. `zeus audit doctor` checks that readiness and reports the selected
 provider and model. `zeus audit list` and `zeus audit show` read stored reports
-without invoking those runtime checks. A run may send selected committed
-`HEAD` source excerpts and bounded terminal output to the provider; it does not
-establish provider retention guarantees or network isolation for the host
-Hermes process.
+without invoking those runtime checks. `zeus audit gate` also reads a stored
+report only; it evaluates the fixed `release-v1` policy and does not invoke
+Docker, Hermes, provider credentials, or image readiness. A run may send
+selected committed `HEAD` source excerpts and bounded terminal output to the
+provider; it does not establish provider retention guarantees or network
+isolation for the host Hermes process.
 
-The repository-command container is admitted only after Zeus validates network
-mode `none`, no host bind mounts, an unprivileged UID, dropped capabilities,
-read-only root, bounded tmpfs, and the pinned image. CI runs the real Linux
-Docker isolation gate on Ubuntu 24.04 with the exact default image digest
+The primary repository-command container is admitted only after Zeus validates
+network mode `none`, no host bind mounts, an unprivileged UID, dropped
+capabilities, read-only root, bounded tmpfs, and the pinned image. Configured
+coverage commands use a second pre-created container whose committed snapshot
+bind is read-only and whose effective controls and mounted digest are attested
+inside the container before each command. Its processes and writable `/tmp`
+state are force-reset before an isolated receipt is accepted. CI runs the real
+Linux Docker isolation gate on Ubuntu 24.04 with the exact default image digest
 preloaded. Local runs remain deliberately opt-in: set
 `ZEUS_RUN_DOCKER_ISOLATION=1` and `ZEUS_AUDIT_TEST_IMAGE` on a Linux Docker host
 to execute it. A skipped local gate, including when Docker is unavailable,
@@ -131,6 +137,26 @@ does not establish runtime isolation.
 Audit always examines the exact committed `HEAD`, not dirty or untracked
 content. It is report-only: it does not remediate, schedule work, or coordinate
 cross-host work.
+
+New reports use schema version 2. They include a deterministic committed-surface
+inventory and digest, explicit required-control coverage, terminal receipts
+bound in private broker state to the target commit and snapshot digest, source
+blob SHA-256 values, stable finding fingerprints, and the explicit versioned
+`isolated-read-only-snapshot-v1` trusted-receipt execution boundary. Receipt
+command tags are opaque and also bind the run, image, sequence, exact command
+digest, and result metadata; receipt objects contain neither raw commands nor
+raw command output.
+Legacy suggested-command arrays remain accepted, while the structured
+`{"argv": [...], "control_ids": [...]}` form adds explicit security-control
+authorization. A legacy or ad-hoc command cannot satisfy security coverage.
+The report reader retains exact schema-v1 JSON/Markdown compatibility, but
+`release-v1` requires schema v2 and the current trusted-receipt execution
+boundary, and therefore rejects legacy reports.
+
+The fixed scanner-adapter registry is a compatibility seam, not a runtime
+claim. Its entries are non-executable and dynamically loaded plugins are not
+supported. External deterministic SAST and advisory engines are not bundled or
+executed by this release.
 
 ## Updating this policy
 
