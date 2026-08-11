@@ -55,9 +55,11 @@ Request parsing is bounded and explicit:
 - Request targets containing URL fragments are rejected rather than normalized silently.
 - Unsupported `OPTIONS`, `PUT`, `PATCH`, and `DELETE` requests return JSON `405` errors with
   `Allow: GET, POST`.
-- Zeus serves at most `ZEUS_API_MAX_CONCURRENT_REQUESTS` active requests and disconnects clients
+- Zeus serves at most `ZEUS_API_MAX_CONCURRENT_REQUESTS` active requests, at most
+  `ZEUS_API_MAX_CONNECTIONS_PER_CLIENT` connections per client address, and disconnects clients
   that do not complete a request within `ZEUS_API_REQUEST_TIMEOUT_SECONDS`. Saturated servers
-  return `503` with `error.code=server_busy` and `Retry-After: 1`.
+  return `503` with `error.code=server_busy` (or `client_connection_limited` when a single
+  client exceeds its share) and `Retry-After: 1`.
 - During orderly shutdown, Zeus rejects new work with `503`,
   `error.code=server_draining`, and `Retry-After: 1`, while active requests receive up to
   `ZEUS_API_SHUTDOWN_DRAIN_SECONDS` to finish.

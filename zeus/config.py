@@ -46,6 +46,7 @@ class Settings:
     allow_legacy_pid_markers: bool
     api_idempotency_retention_seconds: int
     api_idempotency_max_records: int
+    api_max_connections_per_client: int = 16
     api_log_enabled: bool = True
     sqlite_synchronous: SQLiteSynchronous = SQLiteSynchronous.NORMAL
 
@@ -151,6 +152,13 @@ class Settings:
                 default=10_000,
                 minimum=100,
                 maximum=1_000_000,
+            ),
+            api_max_connections_per_client=_int_env(
+                merged,
+                "ZEUS_API_MAX_CONNECTIONS_PER_CLIENT",
+                default=16,
+                minimum=1,
+                maximum=256,
             ),
             api_log_enabled=merged.get("ZEUS_API_LOG_ENABLED", "1") == "1",
             sqlite_synchronous=sqlite_synchronous,

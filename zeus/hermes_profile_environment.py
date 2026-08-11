@@ -12,6 +12,47 @@ _FEISHU_MODE = "FEISHU_CONNECTION_MODE"
 _INVALID_ENV_MESSAGE = "Hermes profile environment could not be validated safely"
 _UNQUOTED_MODE_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 _RESERVED_PROFILE_KEYS = frozenset({"HERMES_HOME"})
+# Profile dotenv files carry bot secrets (API keys). They must never steer
+# executable/library resolution or interpreter startup of Zeus or its child
+# processes, otherwise a writable profile .env could substitute binaries or
+# inject code into Zeus-spawned processes.
+_BLOCKED_PROFILE_KEYS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONEXECUTABLE",
+        "PYTHONBREAKPOINT",
+        "PYTHONINSPECT",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PROMPT_COMMAND",
+        "IFS",
+        "CDPATH",
+        "GLOBIGNORE",
+        "TERMINFO",
+        "TERMINFO_DIRS",
+        "NODE_OPTIONS",
+        "PERL5OPT",
+        "PERL5LIB",
+        "RUBYOPT",
+        "RUBYLIB",
+    }
+)
+_BLOCKED_PROFILE_KEY_PREFIXES = ("LD_", "DYLD_", "GIT_")
+
+
+def _is_blocked_profile_key(key: str) -> bool:
+    normalized = key.upper()
+    return normalized in _BLOCKED_PROFILE_KEYS or normalized.startswith(
+        _BLOCKED_PROFILE_KEY_PREFIXES
+    )
 
 
 class HermesProfileEnvironmentError(ValueError):
@@ -111,7 +152,9 @@ def _reject_reserved_assignments(text: str) -> None:
                 continue
             key = key_match.group(1)
             remainder = line[key_match.end() :]
-        if key in _RESERVED_PROFILE_KEYS and re.match(r"\s*=", remainder):
+        if (key in _RESERVED_PROFILE_KEYS or _is_blocked_profile_key(key)) and re.match(
+            r"\s*=", remainder
+        ):
             raise _UnsupportedDotenvError
 
 

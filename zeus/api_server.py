@@ -38,9 +38,14 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
         self.api_request_timeout_seconds = float(
             getattr(RequestHandlerClass, "api_request_timeout_seconds", 10.0)
         )
+        self.api_max_connections_per_client = int(
+            getattr(RequestHandlerClass, "api_max_connections_per_client", 16)
+        )
         self._request_slots = threading.BoundedSemaphore(self.api_max_concurrent_requests)
         self._request_state = threading.Condition()
         self._active_requests: set[int] = set()
+        self._active_request_clients: dict[int, str] = {}
+        self._client_connection_counts: dict[str, int] = {}
         self._draining = False
         self._drain_started = threading.Event()
         self._graceful_shutdown_requested = False
@@ -50,13 +55,31 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
 
     def process_request(self, request: Any, client_address: Any) -> None:
+        # Slots are acquired before the request is parsed or authenticated, so a
+        # single client could otherwise hold every slot open (slow-loris). Cap
+        # concurrent connections per client address to keep slots available.
+        client_key = (
+            str(client_address[0]) if isinstance(client_address, tuple) else str(client_address)
+        )
         with self._request_state:
             if self._draining:
                 rejection = ("server_draining", "API server is draining")
+            elif (
+                self._client_connection_counts.get(client_key, 0)
+                >= self.api_max_connections_per_client
+            ):
+                rejection = (
+                    "client_connection_limited",
+                    "per-client connection limit exceeded",
+                )
             elif not self._request_slots.acquire(blocking=False):
                 rejection = ("server_busy", "API request capacity is exhausted")
             else:
                 self._active_requests.add(id(request))
+                self._active_request_clients[id(request)] = client_key
+                self._client_connection_counts[client_key] = (
+                    self._client_connection_counts.get(client_key, 0) + 1
+                )
                 rejection = None
 
         if rejection is not None:
@@ -120,6 +143,13 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
             if request_id not in self._active_requests:
                 return
             self._active_requests.remove(request_id)
+            client_key = self._active_request_clients.pop(request_id, None)
+            if client_key is not None:
+                remaining = self._client_connection_counts.get(client_key, 0) - 1
+                if remaining > 0:
+                    self._client_connection_counts[client_key] = remaining
+                else:
+                    self._client_connection_counts.pop(client_key, None)
             self._request_slots.release()
             if not self._active_requests:
                 self._request_state.notify_all()

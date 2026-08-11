@@ -748,6 +748,9 @@ def _wrapper_bytes(python_executable: Path) -> bytes:
     if any(character in executable for character in ("\n", "\r")):
         _error("audit Docker broker Python executable is invalid")
     try:
+        # The hermes environment handed to this shim is fully synthesized by the
+        # runner (pinned PATH, no PYTHONPATH), so interpreter-startup overrides
+        # cannot ride in through env vars.
         return (
             f"#!{executable}\n"
             "from zeus.audit_docker_broker_main import main\n"

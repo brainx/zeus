@@ -19,6 +19,7 @@ from zeus.models import (
     BotStatus,
     BotStatusResponse,
     DesiredState,
+    validate_id,
 )
 from zeus.supervisor_core import (
     _LifecycleContext,
@@ -50,8 +51,13 @@ class _SupervisorStatus(_SupervisorReconcile):
         request_id: str | None = None,
     ) -> BotStatusResponse:
         context = self._lifecycle_context(source, request_id)
-        with self.bot_lock(bot_id), self._bot_process_lock(bot_id):
-            return self._status_locked(bot_id, context=context)
+        # Reject unknown bots before allocating any lock state so that requests
+        # for nonexistent ids cannot grow the in-memory lock table or the
+        # on-disk lock directory.
+        safe_bot_id = validate_id(bot_id, "bot_id")
+        self._require_bot(safe_bot_id)
+        with self.bot_lock(safe_bot_id), self._bot_process_lock(safe_bot_id):
+            return self._status_locked(safe_bot_id, context=context)
 
     def _status_locked(self, bot_id: str, *, context: _LifecycleContext) -> BotStatusResponse:
         record = self._require_bot(bot_id)
@@ -172,11 +178,13 @@ class _SupervisorStatus(_SupervisorReconcile):
         )
 
     def logs(self, bot_id: str, max_bytes: int = 20_000) -> str:
+        self._require_bot(bot_id)
         with self.bot_lock(bot_id):
             record = self._require_bot(bot_id)
             return tail_file(self.log_path(record.profile_path), max_bytes=max_bytes)
 
     def inspect(self, bot_id: str, max_log_bytes: int = 20_000) -> dict[str, object]:
+        self._require_bot(bot_id)
         with self.bot_lock(bot_id):
             record = self._require_bot(bot_id)
             profile_path = Path(record.profile_path)

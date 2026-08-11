@@ -471,6 +471,10 @@ class _SupervisorCore:
                 self._bot_locks[bot_id] = lock
             return lock
 
+    def _discard_bot_lock(self, bot_id: str) -> None:
+        with self._locks_guard:
+            self._bot_locks.pop(bot_id, None)
+
     def _bot_process_lock(self, bot_id: str) -> BotProcessLock:
         safe_bot_id = validate_id(bot_id, "bot_id")
         return BotProcessLock(
