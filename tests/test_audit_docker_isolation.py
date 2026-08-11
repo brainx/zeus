@@ -197,7 +197,15 @@ class RealDockerAuditIsolationTests(unittest.TestCase):
         if image is None:
             self.skipTest("ZEUS_AUDIT_TEST_IMAGE is not configured")
         docker = Path(docker_value).resolve(strict=True)
-        python_executable = Path(sys.executable).resolve(strict=True)
+        python_candidate = (
+            Path("/usr/bin/python3") if sys.platform.startswith("linux") else Path(sys.executable)
+        )
+        python_executable = python_candidate.resolve(strict=True)
+        python_metadata = python_executable.lstat()
+        self.assertTrue(stat.S_ISREG(python_metadata.st_mode))
+        self.assertIn(python_metadata.st_uid, {0, os.geteuid()})
+        self.assertNotEqual(0, python_metadata.st_mode & stat.S_IXUSR)
+        self.assertEqual(0, python_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
         status_before = self._git_status()
         tracked_sentinel = Path("pyproject.toml")
         tracked_hash_before = hashlib.sha256(tracked_sentinel.read_bytes()).hexdigest()
