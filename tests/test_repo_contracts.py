@@ -1243,7 +1243,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn(("requests", "2.34.2"), entries)
         self.assertIn(("rich", "15.0.0"), entries)
         self.assertIn(("setuptools", "83.0.0"), entries)
-        self.assertIn(("tqdm", "4.69.1"), entries)
+        self.assertIn(("tqdm", "4.70.0"), entries)
         self.assertIn(
             "b42a28c1844fd9de8f3f7d540e36b66f3a9c83fceac7170ebc7a6a19edd9dcae",
             hashes,
