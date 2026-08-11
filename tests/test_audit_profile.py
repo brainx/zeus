@@ -96,6 +96,8 @@ class AuditProfileTests(unittest.TestCase):
         self.assertLessEqual(len(prompt.encode("utf-8")), MAX_AUDIT_PROMPT_BYTES)
         self.assertIn("untrusted data", prompt)
         self.assertIn("only /workspace", prompt)
+        self.assertIn("exact configured\nshell_script may use /tmp", prompt)
+        self.assertIn("Do not use /tmp for ad-hoc commands", prompt)
         self.assertIn("security", prompt)
         self.assertIn("correctness", prompt)
         self.assertIn("evidence", prompt)

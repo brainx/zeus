@@ -393,16 +393,24 @@ class RealDockerAuditIsolationTests(unittest.TestCase):
                 self.assertTrue(
                     all(receipt.state == "exited" for receipt in state.terminal_receipts)
                 )
+                self.assertEqual(0, state.active_terminal_calls)
+                self.assertEqual(0, state.aggregate_reserved_output_bytes)
                 self.assertIsNone(state.active_trusted_receipt_id)
 
                 removed = invoke_audit_docker_broker(
                     prepared.state_path,
                     ("rm", "-f", prepared.container_id),
                 )
+                removal_state = read_audit_docker_broker_state(prepared.state_path)
                 self.assertEqual(
                     0,
                     removed.returncode,
-                    removed.stderr.decode("utf-8", errors="replace"),
+                    (
+                        removed.stderr.decode("utf-8", errors="replace")
+                        + f"phase={removal_state.phase}; "
+                        + f"cleanup={removal_state.cleanup_state}; "
+                        + f"breach={removal_state.breach_reason}"
+                    ),
                 )
                 self.assertEqual(f"{prepared.container_id}\n".encode("ascii"), removed.stdout)
                 broker_closed = True
