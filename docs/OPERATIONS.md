@@ -236,11 +236,18 @@ consume an unbounded number of worker threads:
 
 ```dotenv
 ZEUS_API_MAX_CONCURRENT_REQUESTS=32
+ZEUS_API_MAX_CONNECTIONS_PER_CLIENT=16
 ZEUS_API_REQUEST_TIMEOUT_SECONDS=10
 ZEUS_API_SHUTDOWN_DRAIN_SECONDS=20
 ```
 
-The concurrency limit accepts values from 1 to 256. The request timeout accepts 0.1 to 300
+The concurrency limit accepts values from 1 to 256. The per-client limit accepts values from 1
+to 256 and caps how many connections a single immediate TCP peer address may hold open; excess
+connections from that peer are closed after a JSON `503 client_connection_limited` response with
+`Retry-After: 1`. Zeus does not trust forwarded client-address headers. If a reverse proxy
+connects over loopback, all proxied callers share its bucket: enforce source-specific limits at
+the trusted proxy and, when necessary, set Zeus's peer limit equal to the global limit. The
+request timeout accepts 0.1 to 300
 seconds. When every request slot is occupied, Zeus closes the excess connection after returning a
 JSON `503 server_busy` response with `Retry-After: 1`. Timeouts release their slot automatically.
 On orderly shutdown, Zeus keeps the listener available only to reject new work with
@@ -428,6 +435,16 @@ ZEUS_ENV_PASSTHROUGH=HTTP_PROXY,HTTPS_PROXY,NO_PROXY
 ```
 
 Keep the allowlist empty unless the Hermes process needs those values.
+
+A profile `.env` may only carry bot configuration and secrets. Assignments that
+would steer executable, library, interpreter, or TLS-trust resolution fail
+closed at load time: `PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`,
+`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, and shell startup variables
+(`BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PROMPT_COMMAND`, `IFS`, `CDPATH`,
+`GLOBIGNORE`, `TERMINFO`, `TERMINFO_DIRS`, `NODE_OPTIONS`, `PERL5OPT`,
+`PERL5LIB`, `RUBYOPT`, `RUBYLIB`) are rejected. Relative `hermes` binary names
+are only ever resolved against the daemon's base environment, so profile
+content cannot substitute the executable Zeus launches.
 
 ### Feishu connection mode
 

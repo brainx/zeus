@@ -46,8 +46,13 @@ class Settings:
     allow_legacy_pid_markers: bool
     api_idempotency_retention_seconds: int
     api_idempotency_max_records: int
+    api_max_connections_per_client: int = 16
     api_log_enabled: bool = True
     sqlite_synchronous: SQLiteSynchronous = SQLiteSynchronous.NORMAL
+
+    def __post_init__(self) -> None:
+        if self.api_key is not None and not self.api_key.isascii():
+            raise ValueError("ZEUS_API_KEY must contain ASCII characters only")
 
     @classmethod
     def from_env(
@@ -61,6 +66,7 @@ class Settings:
         sqlite_synchronous = _sqlite_synchronous_env(merged)
         state_dir = nofollow_absolute_path(Path(merged.get("ZEUS_STATE_DIR") or ".zeus"))
         port = _port_env(merged, "ZEUS_PORT", default=4311)
+        api_key = merged.get("ZEUS_API_KEY") or None
         return cls(
             state_dir=state_dir,
             hermes_root=state_dir / "hermes",
@@ -68,7 +74,7 @@ class Settings:
             hermes_bin=merged.get("ZEUS_HERMES_BIN", "hermes"),
             host=merged.get("ZEUS_HOST", "127.0.0.1"),
             port=port,
-            api_key=merged.get("ZEUS_API_KEY") or None,
+            api_key=api_key,
             allow_unauth_reads=merged.get("ZEUS_ALLOW_UNAUTH_READS") == "1",
             api_max_concurrent_requests=_int_env(
                 merged,
@@ -151,6 +157,13 @@ class Settings:
                 default=10_000,
                 minimum=100,
                 maximum=1_000_000,
+            ),
+            api_max_connections_per_client=_int_env(
+                merged,
+                "ZEUS_API_MAX_CONNECTIONS_PER_CLIENT",
+                default=16,
+                minimum=1,
+                maximum=256,
             ),
             api_log_enabled=merged.get("ZEUS_API_LOG_ENABLED", "1") == "1",
             sqlite_synchronous=sqlite_synchronous,

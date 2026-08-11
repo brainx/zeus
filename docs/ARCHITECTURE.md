@@ -171,6 +171,12 @@ operation ID.
 
 Hermes child processes receive a minimal host environment plus profile `.env`
 values. Operators can allow specific host variables with `ZEUS_ENV_PASSTHROUGH`.
+Profile `.env` can never override executable-resolution or interpreter-startup
+variables (`PATH`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`, selected TLS trust
+overrides, and shell startup hooks); such assignments are rejected at load time, and the
+configured `hermes` binary is resolved against the daemon's base environment
+only. The short-lived gateway launcher itself starts with a minimal environment
+so daemon secrets never reach it.
 
 ## Async Delegation
 
