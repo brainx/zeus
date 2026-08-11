@@ -841,6 +841,7 @@ class RepoContractTests(unittest.TestCase):
             "zeus audit run [--json]",
             "zeus audit list [--json]",
             "zeus audit show <run-id> [--json]",
+            "zeus audit gate <run-id> [--json]",
         ):
             with self.subTest(command=command):
                 self.assertIn(command, audit)
@@ -866,7 +867,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("fixed credential", audit)
         self.assertIn("selected snapshot scope", audit)
         self.assertIn("`.git/info/exclude`", audit)
-        self.assertIn("exactly `summary`, `findings`, `checks`, and", audit)
+        self.assertIn("`skipped_checks`, and `coverage`", audit)
         self.assertIn("explicit lowercase Hermes provider", readme)
         self.assertIn("Human\noutput shows run ID, status, and target commit.", audit)
         self.assertIn("fails during pre-run validation\nwithout creating an audit artifact", audit)

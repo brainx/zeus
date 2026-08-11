@@ -256,6 +256,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         server_version = "ZeusHTTP/0.1"
         api_max_concurrent_requests = settings.api_max_concurrent_requests
         api_request_timeout_seconds = settings.api_request_timeout_seconds
+        api_max_connections_per_client = settings.api_max_connections_per_client
         _request_context: RequestContext
         _response_status: int
         _response_error_code: str | None
@@ -848,6 +849,11 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             provided = self.headers.get("x-zeus-api-key")
             if not provided:
                 self._request_context.auth_outcome = "missing"
+                self._reject_invalid_api_key()
+            # hmac.compare_digest raises TypeError for non-ASCII str input;
+            # route such keys through the normal (rate-limited) 401 path.
+            if not provided.isascii():
+                self._request_context.auth_outcome = "rejected"
                 self._reject_invalid_api_key()
             if not hmac.compare_digest(provided, settings.api_key):
                 self._request_context.auth_outcome = "rejected"

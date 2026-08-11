@@ -29,6 +29,22 @@ from zeus.models import BotRecord, StoredProfilePreflightError, TemplateError
 from zeus.private_io import open_private_append
 from zeus.readiness import ReadinessProbe
 
+# The gateway launcher is a short-lived privileged helper: keep its environment
+# minimal so daemon secrets (e.g. ZEUS_API_KEY) are never exposed to it, and so
+# interpreter-influencing variables (PYTHONPATH/PYTHONHOME/...) cannot ride in.
+# Combined with the "-I" flag in launcher_command this makes the launcher
+# interpreter startup independent of inherited environment.
+_LAUNCHER_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TZ")
+
+
+def _launcher_subprocess_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for name in _LAUNCHER_ENV_KEYS:
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    return env
+
 
 class _GatewayRuntimeLaunch(_GatewayRuntimeStop):
     def preflight_start(
@@ -108,7 +124,7 @@ class _GatewayRuntimeLaunch(_GatewayRuntimeStop):
                 launcher_argv = self.adapter.launcher_command(payload_read, ack_write)
                 process = self.popen_factory(
                     launcher_argv,
-                    env=dict(os.environ),
+                    env=_launcher_subprocess_env(),
                     stdout=log_file,
                     stderr=log_file,
                     pass_fds=(payload_read, ack_write),

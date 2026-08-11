@@ -27,7 +27,7 @@ The first version is intentionally narrow:
 - It does not add an HTTP API, a SQLite migration, or cross-host coordination.
 - It does not audit dirty or untracked worktree content.
 - It never remediates findings and does not schedule audit runs; an operator
-  explicitly invokes one of the five local audit commands.
+  explicitly invokes one of the six local audit commands.
 
 ## Chosen Architecture
 
@@ -53,18 +53,30 @@ The implementation is divided into focused internal modules:
 - `zeus.audit_models` defines run state, check, finding, and report contracts.
 - `zeus.audit_workspace` resolves `HEAD`, materializes its Git tree, validates
   the snapshot, and removes disposable state.
+- `zeus.audit_surface` derives a deterministic, bounded inventory and canonical
+  snapshot digest from the materialized Git manifest.
 - `zeus.audit_profile` builds the ephemeral Hermes profile and one-shot prompt.
-- `zeus.audit_docker_broker` creates the exact command container, validates its
-  effective controls, and permits Hermes to address only that container.
+- `zeus.audit_container` creates, validates, and owns the exact primary and
+  optional trusted containers.
+- `zeus.audit_docker_broker` permits Hermes to address only the sealed primary
+  container, internally routes authorized coverage commands to the trusted
+  container, and records commit- and snapshot-bound terminal receipts.
 - `zeus.audit_runner` invokes one-shot Hermes, streams bounded output, applies
   deadlines, terminates the owned process group, and classifies termination.
 - `zeus.audit_report` validates model output, applies field-level redaction and
-  bounds, and renders deterministic Markdown.
+  bounds, binds coverage and evidence to Zeus-owned observations, and renders
+  deterministic Markdown.
 - `zeus.audit_store` atomically installs, lists, and reads private report
   artifacts.
-- `zeus.audit_doctor` verifies Git, Hermes, Docker, image, mount, network, and
-  private-path prerequisites.
-- `zeus.audit` exposes a thin `AuditService` used by all five CLI actions.
+- `zeus.audit_doctor` performs preliminary Git, Hermes, Docker, image, and
+  private-path readiness checks; each run performs authoritative container
+  admission.
+- `zeus.audit_policy` evaluates the deterministic, fail-closed local release
+  gate against a stored report.
+- `zeus.audit_scanners` defines a fixed, non-executable registry for future
+  deterministic scanner adapters. Selecting a registry entry does not execute
+  a scanner.
+- `zeus.audit` exposes a thin `AuditService` used by all six CLI actions.
 - `zeus.bundled_skills.audit` contains the versioned `SKILL.md`.
 
 `zeus.cli` only parses and presents audit commands. It does not contain
@@ -132,6 +144,7 @@ regular files, executable files, and confined relative symlinks, and rejects:
 
 - absolute paths or `.` and `..` components;
 - any path component whose case-folded name is `.git`;
+- C0/C1 control characters or paths deeper than 64 components;
 - hard links, devices, FIFOs, sockets, and unsupported entry types;
 - symlinks whose normalized target escapes the snapshot;
 - duplicate paths and file/directory type conflicts;
@@ -144,10 +157,12 @@ complete report means complete within the selected snapshot scope rather than
 complete across omitted content.
 
 The snapshot contains no `.git` directory, remotes, worktree metadata, or Zeus
-state. Zeus copies it into a size-limited container tmpfs at `/workspace` before
-analysis and validates the copy. The command container has no host bind mounts.
-The real source worktree, audit control directory, Hermes home, Docker socket,
-user home, caches, and credential paths are never mounted.
+state. Zeus copies it into the primary container's size-limited tmpfs at
+`/workspace` before analysis and validates the copy. The primary container has
+no host bind mounts; the trusted container receives only the disposable
+snapshot as a read-only bind. The real source worktree, audit control directory,
+Hermes home, Docker socket, user home, caches, and credential paths are never
+mounted.
 
 The workspace tmpfs is created with the audit UID and GID. Zeus streams its
 bounded archive to an isolated Python extractor running as that same
@@ -159,15 +174,35 @@ seeded manifest and executes a write-and-delete probe as the same unprivileged
 UID used for every audit command. No privileged process seeds the command
 container.
 
-Writes inside `/workspace` are allowed so builds and tests can operate normally.
-They consume only the bounded tmpfs and disappear with the container. Zeus
-itself may write only its private audit state and final report artifacts.
+Ordinary and ad-hoc terminal calls run in the primary command container. Writes
+inside that container's `/workspace` are allowed so builds and tests can
+operate normally; they consume only bounded tmpfs and disappear with the
+container.
+
+An exact operator-configured command that is authorized to satisfy security
+coverage is routed to a second, pre-created trusted container instead. Its
+`/workspace` is the materialized committed snapshot mounted read-only, its root
+filesystem is read-only, and `/tmp` is its only writable application path.
+Coverage tools that need caches or build output must place them under `/tmp`.
+Zeus itself may write only its private audit state, disposable snapshot, and
+final report artifacts.
+
+The invoking host UID and the local Docker daemon are trusted for snapshot
+integrity. Zeus requires a non-root caller, numeric UID/GID parity for the
+read-only bind, and a local Unix or named-pipe Docker endpoint. The attestor
+closes mutation paths from the untrusted primary container, but it does not
+defend the attestation-to-execution interval against another process running as
+the same host UID or a malicious Docker daemon. Rootless, user-namespace, or
+Docker Desktop ownership semantics that cannot preserve these invariants fail
+closed.
 
 ### Network boundary
 
 Hermes runs as a host process because the selected model provider requires
-egress. Repository-side tools run in one Zeus-created Docker container with
-network mode `none`.
+egress. Repository-side tools run in Zeus-created Docker containers with
+network mode `none`: a writable primary container for ordinary forensic calls
+and, when coverage commands are configured, a read-only trusted container for
+those exact commands.
 
 Hermes does not receive direct access to the Docker executable or socket. Zeus
 places a private `docker` broker first in the subprocess `PATH`; the broker uses
@@ -175,33 +210,63 @@ an already-resolved absolute Docker executable and implements only the pinned
 Hermes Docker command grammar. It permits bounded version and configured-image
 inspection, emulates the backend's storage-capability probe without starting a
 probe container, and emulates its label-filtered reuse lookup by returning the
-prevalidated run container. It permits execution, inspection, and removal only
-for that exact container ID. Unknown argument shapes, other IDs, real container
-creation from Hermes, and attempts to change mounts, namespaces, security
-controls, or networking fail closed.
+prevalidated primary container. It permits Hermes inspection and removal only
+for that exact primary ID. Exact configured coverage scripts are internally
+routed to the separately sealed trusted ID; Hermes never selects or configures
+that container. Unknown argument shapes, other IDs, real container creation
+from Hermes, and attempts to change mounts, namespaces, security controls, or
+networking fail closed.
 
-Zeus creates and seeds the actual command container before starting Hermes. It
-then inspects that container and requires all of these effective properties:
+Zeus creates and seals every run container before starting Hermes. It seeds the
+primary container from the materialized snapshot and binds that same snapshot
+read-only into the trusted container. It records both exact container IDs for
+outer cleanup, then inspects each container and requires all of these effective
+properties:
 
 - network mode `none`;
-- empty forwarded environment and no host bind mounts;
+- no forwarded host environment; the primary container has no host bind mounts,
+  and the trusted container has exactly one read-only snapshot bind mount;
 - a fixed unprivileged numeric user, all Linux capabilities dropped,
   no-new-privileges,
-  Docker's default seccomp policy, and no host/device/privileged namespaces;
-- a read-only container root filesystem with bounded temporary storage and the
-  workspace and temporary tmpfs paths as its only writable locations;
+  an active seccomp filter, and no host/device/privileged namespaces;
+- a read-only container root filesystem with bounded temporary storage; the
+  primary workspace and temporary paths are tmpfs, while the trusted
+  container permits writes only under its reset-on-stop `/tmp` tmpfs;
 - fixed CPU, memory, PID, temporary-storage, and command limits;
 - an immutable, digest-qualified image that is already present locally;
 - Docker pull policy `never`.
 
-The broker records the validated container ID in private run state before it
-will service an execution request. It caps each execution's output and call
-duration, updates an aggregate run ledger, and removes the exact container if a
-limit is exceeded. Hermes receives the prevalidated container ID through the
-broker instead of creating or reconfiguring a container through its normal
-Docker path. The ephemeral Hermes profile enables its reuse branch only for
-this handshake; unique run labels and the private broker prevent reuse across
-runs.
+The broker records the validated container IDs, target commit, and canonical
+snapshot digest in private run state before it will service an execution
+request. Before each coverage-bearing command it starts the exact trusted
+container, revalidates its full effective isolation, and runs an in-container
+attestor that recomputes the mounted snapshot digest and proves the effective
+identity, capability, seccomp, mount, and temporary-storage controls. After the
+command, Zeus force-stops the container and proves it is stopped before issuing
+an isolated receipt; the restart boundary clears processes and writable
+temporary state. A failed attestation or reset breaches the run and cannot
+satisfy coverage.
+
+The broker caps each execution's output and call duration, updates an aggregate
+run ledger, and attempts to remove both exact containers if a limit is
+exceeded. An unverified cleanup fails the run closed. Each terminal call
+reserves a monotonic receipt such as `terminal-000001`. A
+terminal receipt records an opaque `hmac-sha256:` command tag, terminal state,
+return code, duration, and stdout and stderr byte counts. A receipt stores
+neither the raw command nor stdout or stderr; the private HMAC key remains only
+in private broker state. The tag binds a canonical record containing the run,
+target commit, snapshot digest, image, receipt sequence, exact command digest,
+terminal state, return code, duration, and output byte counts. Isolated tags
+additionally bind the versioned `isolated-read-only-snapshot-v1` execution
+boundary. Independently, the report may contain bounded, redacted model
+observations about terminal evidence. Before accepting model output,
+`AuditService` rereads the private broker state and requires its target commit
+and snapshot digest to match the run.
+
+Hermes receives the prevalidated container ID through the broker instead of
+creating or reconfiguring a container through its normal Docker path. The
+ephemeral Hermes profile enables its reuse branch only for this handshake;
+unique run labels and the private broker prevent reuse across runs.
 
 The broker protocol is versioned against the supported Hermes release. A
 pinned-Hermes integration test must exercise the complete version, image
@@ -209,9 +274,11 @@ inspection, capability probe, reuse lookup, execution, network inspection, and
 cleanup sequence. Any new or reordered Docker command is a compatibility
 failure until the broker policy is reviewed and updated.
 
-`audit doctor` checks that the platform can enforce the same controls, but every
-run separately inspects its actual container before any repository command or
-source-bearing model request. A missing, degraded, or unverifiable control
+`audit doctor` performs preliminary dependency and configuration readiness
+checks; it does not admit the trusted sandbox or prove its effective mounts,
+network, ownership parity, or caller identity. Every run separately enforces
+those controls and inspects its actual containers before any repository command
+or source-bearing model request. A missing, degraded, or unverifiable control
 blocks the run. There is no fallback to Hermes's local terminal backend, and
 configuration cannot enable terminal network access in version 1.
 
@@ -223,6 +290,14 @@ Invoking `audit run` authorizes Hermes to send the audit prompt, selected source
 excerpts, and command output to that provider. Zeus does not claim that the host
 Hermes process is network-isolated from its provider, or that a third-party
 provider has local retention semantics.
+
+The owner of the Zeus state directory is also trusted. The private receipt HMAC
+prevents untrusted model output from inventing an authorized command during a
+run; it is not a durable third-party signature after the ephemeral broker state
+is removed. A process with the operator's UID can replace local report
+artifacts, so `release-v1` is a host-local policy gate rather than proof against
+a malicious local operator. Exported evidence requiring independent
+verification needs a separate signing design.
 
 The skill requests targeted evidence rather than bulk repository output, and
 all tool results remain bounded, but Zeus cannot guarantee that no committed
@@ -265,17 +340,56 @@ schema. A bounded redacted diagnostic excerpt may be included when parsing
 fails. Markdown is generated deterministically from validated JSON rather than
 accepted from the model.
 
-The model object has exactly `summary`, `findings`, `checks`, and
-`skipped_checks`. Each `checks` entry has exactly `name`, `disposition`, and
-`observation`, records a material audit-time command or inspection, and is
-merged into the final report as structured evidence. Names are unique,
-distinct from Zeus-owned checks, and bounded by the terminal-call ceiling. A
-configured command omitted by the model is recorded by Zeus as skipped. Check
-evidence in a finding must resolve to a recorded preflight or model check.
+The current model object has exactly `summary`, `findings`, `checks`,
+`skipped_checks`, and `coverage`. Each non-skipped model check must reference a
+unique completed terminal receipt. Zeus derives its disposition and duration
+from that receipt rather than trusting the model's claim. Skipped checks have
+no receipt. Names are unique, distinct from Zeus-owned checks, and bounded by
+the terminal-call ceiling. A configured command omitted by the model is
+recorded by Zeus as skipped. Check evidence in a finding must resolve to a
+recorded preflight or model check. For configured commands, Zeus derives one
+exact `shlex.join(argv)` script, routes that script to the trusted read-only
+snapshot, and verifies that the named check's isolated receipt tag matches it.
+A model cannot run `true`, `echo`, a wrapper, a shared-workspace command, or
+another command and relabel the receipt as the configured check.
+
+When security is selected, Zeus derives the required control IDs from the
+authoritative repository surface. `SEC-REPO` is always required. `SEC-DEPS`,
+`SEC-CI`, `SEC-IAC`, `SEC-WEB`, and `SEC-NATIVE` are added only when the
+manifest exposes the corresponding dependency, CI, infrastructure, web, or
+native-code surface. If security is not selected, no security control is
+required. Coverage contains exactly one record per required control, in
+canonical control-ID order. Its dispositions are
+`checked`, `not_applicable`, `skipped`, or `unsupported`. Because all emitted
+required controls are already applicable, `not_applicable` is rejected for
+them. A `checked` record must cite one or more exact configured checks whose
+private configuration explicitly authorizes that control. Ad-hoc terminal
+commands remain forensic checks and cannot satisfy coverage. `skipped` and
+`unsupported` records cite no check and must explain why. Missing coverage is
+materialized as skipped and makes the report incomplete. A security finding
+must identify an applicable control.
+
+The model never supplies source digests or finding fingerprints. Zeus adds the
+committed blob SHA-256 to each validated source evidence entry. It also derives
+a stable fingerprint from the control, category, normalized title, and
+structural evidence anchors. The per-run finding ID remains separate, so the
+fingerprint can correlate the same structural finding across run IDs.
 
 Hermes stderr is separately capped at 256 KiB, redacted, and used only for a
 bounded failure diagnostic. Output beyond either cap terminates the run-owned
 process group and makes the report incomplete.
+
+### Scanner integration boundary
+
+`zeus.audit_scanners` contains a fixed registry of versioned adapter contracts
+for repository policy, dependency advisories, CI policy, infrastructure as
+code, native analysis, and web analysis. Selection is deterministic from the
+authoritative surface. Every current registry entry has
+`execution_available=false`; the module neither imports third-party plugins nor
+starts a process. External deterministic SAST, advisory databases, and related
+scanner engines are not bundled or executed by this release. A registry entry
+therefore does not establish that its control was checked and cannot be used as
+release-gate evidence.
 
 ## Configuration
 
@@ -299,7 +413,11 @@ Unknown fields and invalid types fail closed. Schema version 1 supports:
 - `exclude_paths`: repository-relative paths removed from the snapshot after
   safe materialization;
 - `suggested_commands`: named argument arrays shown to the skill as preferred
-  local verification commands, never shell strings;
+  local verification commands, never caller-supplied shell strings. The legacy
+  form remains `"name": ["tool", "arg"]`. A security check uses the exact
+  structured form `"name": {"argv": ["tool", "arg"], "control_ids":
+  ["SEC-REPO"]}`. The control IDs are an operator authorization, and Zeus
+  verifies the exact derived shell script against the private receipt tag;
 - `limits`: bounded overrides for run duration, command duration, finding
   count, model output, report artifacts, snapshot entries, and snapshot bytes.
 
@@ -368,7 +486,7 @@ The six supported categories are:
 
 ## CLI Contract
 
-Version 1 provides five local commands:
+The audit CLI provides six local commands:
 
 ```text
 zeus audit init [--json]
@@ -376,9 +494,10 @@ zeus audit doctor [--json]
 zeus audit run [--json]
 zeus audit list [--json]
 zeus audit show <run-id> [--json]
+zeus audit gate <run-id> [--json]
 ```
 
-All five commands discover the containing Git repository and its Zeus state
+All six commands discover the containing Git repository and its Zeus state
 context. `audit init` is the explicit provider-selection consent step. Human
 and JSON output identify only the provider, model, credential environment name,
 and next readiness command; they disclose neither a credential value nor a
@@ -407,9 +526,48 @@ validated report envelopes, including timestamps and severity counts.
 `audit show` validates the run ID before accessing storage. Human output prints
 the generated Markdown report; `--json` prints the JSON report.
 
-`audit list` and `audit show` do not invoke Docker, Hermes, provider credential,
-or image readiness checks. They read stored reports in the discovered
-repository and state context.
+`audit gate` validates and reads an existing report, then evaluates the fixed
+`release-v1` policy. Human output is `pass` plus the policy ID, or one `fail`
+line per deterministic reason. JSON output contains `passed`, `policy_id`, and
+ordered reason objects with `code`, `control_ids`, and `observation`. The
+command exits zero only when the policy passes.
+
+`release-v1` fails closed unless all of these conditions hold:
+
+- the report uses schema version 2 and declares its authoritative repository
+  surface using the current catalog;
+- the report uses the current bundled audit skill and matches the discovered
+  repository identity and current committed `HEAD`;
+- report metadata declares the current Zeus-owned
+  `isolated-read-only-snapshot-v1` trusted-receipt execution boundary;
+- status is `completed` and report completeness is true;
+- no committed path or scope was excluded or otherwise skipped;
+- every surface-required control has exactly one required coverage record;
+- every required control was checked by an exact operator-configured command
+  authorized for that control;
+- no required control is `skipped`, `unsupported`, or `not_applicable`; and
+- there are no critical or high findings.
+
+Machine-readable reason codes are emitted in this order when applicable:
+`unsupported_report_schema`, `missing_audit_surface`,
+`unsupported_control_catalog`, `invalid_security_surface`,
+`security_scope_missing`, `unsupported_audit_skill`,
+`unsupported_trusted_execution_boundary`, `target_commit_unbound`,
+`target_commit_mismatch`, `repository_unbound`, `repository_mismatch`,
+`worktree_scope_unverified`, `report_not_completed`, `report_incomplete`,
+`committed_content_skipped`,
+`required_control_missing`, `required_control_skipped`,
+`required_control_unsupported`, `required_control_not_applicable`,
+`critical_findings`, and `high_findings`.
+
+Schema-v1 reports are still readable, but `release-v1` rejects them because
+they cannot carry the v2 surface and coverage evidence. The gate revalidates
+that in-repository state remains ignored and untracked before reading the
+report. `audit gate` does not rerun an audit or modify a report.
+
+`audit list`, `audit show`, and `audit gate` do not invoke Docker, Hermes,
+provider credential, or image readiness checks. They read stored reports in
+the discovered repository and state context.
 
 No audit command initializes `StateStore`, changes SQLite, starts a gateway, or
 uses the public bot lifecycle facade.
@@ -434,19 +592,26 @@ settings are loaded without repository `.env` input.
    untracked changes exist. File names and contents are not copied into
    metadata. Failure from this point produces a `blocked` run.
 5. Materialize the exact committed tree, apply validated exclusions, and verify
-   that `.git` is absent.
+   that `.git` is absent. Derive the canonical snapshot digest, bounded surface
+   inventory, applicable control IDs, and committed source-blob digests from
+   the resulting manifest.
 6. Create an ephemeral Hermes home containing only generated non-secret config,
-   then load the packaged skill text into the one-shot prompt.
-7. Through the Docker broker, create the exact command container, seed its
-   tmpfs workspace, inspect every mandatory control, and seal its private
-   container record against replacement.
+   then load the packaged skill text and authoritative surface into the one-shot
+   prompt.
+7. Create the exact primary command container and, when coverage commands are
+   configured, the trusted read-only-snapshot container. Seed the primary tmpfs
+   workspace, inspect every mandatory control, and seal both exact IDs to the
+   target commit and snapshot digest in private broker state.
 8. Start Hermes in a new process group with only the broker-visible Docker path
    and with the remaining run deadline, terminal limits, and model-iteration
-   limit enforced independently.
-9. Validate, bound, redact, and normalize the final JSON response.
-10. Terminate remaining run-owned processes, remove the exact run-owned
-    container if present, and attempt to destroy the snapshot and ephemeral
-    Hermes home.
+   limit enforced independently. Record each terminal result in the private
+   receipt ledger without storing its raw command or output in the receipt.
+9. Reread the sealed broker state, verify its commit and snapshot bindings, and
+   validate, bound, redact, and normalize the final JSON response against the
+   terminal receipts, required controls, and source-blob digests.
+10. Terminate remaining run-owned processes, remove both exact run-owned
+    containers if present, and only after verified removal attempt to destroy
+    the snapshot and ephemeral Hermes home.
 11. Build final run metadata after cleanup, including any cleanup
     failure, and render `report.md` from `report.json`.
 12. Atomically install both files in the final run directory and release the
@@ -477,7 +642,7 @@ no-follow protections. Report fields use `redact_secrets` and `sanitize_text`
 individually; the existing lifecycle-detail sanitizer is not used as a report
 container because its smaller lifecycle-event limit is a different contract.
 
-The JSON envelope has schema version 1 and contains:
+New JSON envelopes use schema version 2 and contain:
 
 - `run_id`;
 - an opaque repository ID, never an absolute repository path;
@@ -485,14 +650,43 @@ The JSON envelope has schema version 1 and contains:
 - deterministic or configured metadata: Zeus version, required Hermes version,
   skill version, configured image reference, target commit, UTC start and
   finish times, termination reason, model and provider, and whether worktree
-  changes were excluded;
+  changes were excluded, plus the versioned trusted-receipt execution boundary;
 - bounded summary text;
-- checks run and skipped, with name, disposition, duration, and redacted
-  observation but no raw command output;
+- the authoritative repository surface when materialization reached that
+  point, otherwise `null`: catalog version, canonical snapshot digest, detected
+  ecosystems, bounded path samples plus total counts for dependency manifests,
+  CI configuration, infrastructure as code, and web surface, and the exact
+  required security-control IDs;
+- checks run and skipped, with name, disposition, optional terminal receipt,
+  duration, and redacted observation but no raw command output;
+- explicit coverage for every required security control, with category,
+  required flag, disposition, receipt-backed check names or an uncovered
+  reason;
+- terminal receipts in sequence order, containing only receipt ID, opaque
+  keyed command tag, terminal state, return code, duration, and stdout and
+  stderr byte counts;
 - skipped content, including configured snapshot exclusions and unresolved
   external content;
 - findings;
 - severity counts and report completeness.
+
+The surface snapshot digest is SHA-256 over a canonical representation of the
+materialized Git manifest, including each path, Git and filesystem modes, size,
+blob SHA-256, and symlink target. It is not a digest of a mutable worktree.
+Each inventory path sample is capped at 32 sorted entries while its
+accompanying count covers the entire selected manifest.
+
+Schema-v2 receipt IDs are sequential (`terminal-000001`, and so on) and may be
+used by at most one model check. A completed report contains only exited
+receipts; incomplete reports may preserve `inflight`, `execution_failed`, or
+`orphaned` receipts for forensics. Check disposition and duration are reconciled
+against the authoritative terminal result. Every opaque command tag binds the
+sealed run, commit, snapshot, image, command digest, and result metadata;
+isolated trusted-receipt tags additionally bind the current
+`isolated-read-only-snapshot-v1` execution boundary. Tags do so without
+disclosing the raw command; the HMAC key remains in private ephemeral broker
+state and is not included in reports. Raw stdout and stderr are not receipt
+fields.
 
 Blocked reports retain the discovered target commit and the required or
 configured Hermes, image, provider, and model metadata. Individual doctor
@@ -503,7 +697,9 @@ blocked report produced from missing configuration.
 
 Each final finding receives a unique Zeus-generated ID and has:
 
+- a stable Zeus-generated fingerprint, separate from the run-specific ID;
 - category;
+- a security control ID when the finding belongs to the security category;
 - severity: `critical`, `high`, `medium`, `low`, or `note`;
 - confidence: `high`, `medium`, or `low`;
 - bounded title;
@@ -514,8 +710,8 @@ Each final finding receives a unique Zeus-generated ID and has:
 
 An evidence entry has one of three explicit forms:
 
-- `source`: a repository-relative regular text file, existing start and optional
-  end line, and a bounded observation;
+- `source`: a repository-relative regular text file, its committed blob
+  SHA-256, existing start and optional end line, and a bounded observation;
 - `check`: the name of a check present in the report and a bounded observation;
 - `repository`: a bounded observation about an absent or repository-wide
   property plus the bounded inspection method that established it.
@@ -526,6 +722,16 @@ repository-level absence claim must name the bounded listing, search, or
 configuration inspection used to establish it. Invalid findings are rejected
 individually and counted. If rejection or truncation makes the report
 incomplete, the run cannot be `completed`.
+
+The fingerprint is derived from the applicable control, category, normalized
+title, and structural source, check, or repository evidence anchors. It does
+not include the run ID, finding ordinal, severity, prose impact, or blob digest,
+so a structurally equivalent finding can retain its fingerprint across runs.
+
+The report reader remains compatible with exact schema-v1 JSON and Markdown
+artifacts. It parses and renders those legacy fields without synthesizing v2
+surface, coverage, receipt, source-digest, or fingerprint evidence. The current
+writer emits schema v2. `release-v1` deliberately rejects schema-v1 reports.
 
 ## Failure Semantics
 
@@ -569,8 +775,14 @@ The feature is additive and host-local:
   release, Docker, configured provider credentials, and a preloaded immutable
   audit image are external runtime prerequisites for `audit run` only;
   `audit init` creates only private configuration, `audit doctor` checks
-  readiness, and `audit list` and `audit show` do not invoke those runtime
-  checks.
+  readiness, and `audit list`, `audit show`, and `audit gate` do not invoke
+  those runtime checks.
+- The report reader accepts schema-v1 and schema-v2 artifacts. The writer emits
+  schema v2, while the `release-v1` policy requires schema v2 and fails closed
+  for a legacy report.
+- The fixed scanner registry is an additive internal contract only. It exposes
+  no dynamic plugin loading or execution path and does not change dependency or
+  runtime prerequisites.
 - The existing generic Hermes adapter is not reused because it loads complete
   profile environments, permits generic passthrough, and buffers unbounded
   output. Audit subprocess construction has its own strict environment and
@@ -601,10 +813,16 @@ Unit tests cover:
   modes and symlinks, and unprivileged workspace writeability;
 - minimal host environment and empty terminal environment forwarding;
 - Docker-broker command filtering, exact-container identity, inspection
-  requirements, execution and aggregate output ledgers, and fail-closed
-  handling of unsupported Hermes Docker behavior;
+  requirements, execution and aggregate output ledgers, commit/snapshot-bound
+  terminal receipts, and fail-closed handling of unsupported Hermes Docker
+  behavior;
+- deterministic snapshot-surface mapping and bounded inventory samples;
 - report schema validation, evidence verification, redaction, size limits,
-  deterministic Markdown, and atomic installation;
+  receipt-backed checks, explicit coverage, source blob digests, stable finding
+  fingerprints, schema-v1 read compatibility, deterministic Markdown, and
+  atomic installation;
+- the non-executable fixed scanner registry and fail-closed `release-v1`
+  policy;
 - run locking, status classification, cancellation, and timeout;
 - CLI human and JSON output plus exit behavior;
 - installed-wheel access to the bundled skill.
@@ -618,8 +836,9 @@ broker's exact initialization, in-run reuse, terminal execution, inspection,
 and cleanup handshake. It requires the prevalidated container to be reused and
 fails on every unexpected Docker argument shape.
 
-Docker isolation tests prove that an audit command can write inside the
-snapshot but cannot:
+Docker isolation tests prove that an ordinary/ad-hoc command can write only to
+the primary snapshot copy, while a coverage-bearing configured command sees the
+exact committed snapshot read-only. Neither command boundary can:
 
 - observe `.git`;
 - read a sentinel from the real worktree, host home, or host environment;
@@ -627,6 +846,10 @@ snapshot but cannot:
   loopback or container gateway;
 - access the Docker socket or host credential paths;
 - persist a child process or file after cleanup.
+
+The trusted-container path also proves that writable `/tmp` state and
+background processes do not survive the forced stop/start boundary between two
+coverage commands.
 
 The test also inspects the effective container network mode and mounts rather
 than trusting configuration text. It asks the broker to address a different
@@ -642,7 +865,7 @@ lifecycle contract changes.
 
 ## No Scheduling or Remediation
 
-Audit version 1 does not schedule work or add timer, service, API, database,
+Repository audit does not schedule work or add timer, service, API, database,
 or cross-host control-plane behavior. It only produces local reports when an
 operator invokes `zeus audit run`. It never remediates findings, opens issues,
 creates branches, commits, pushes, deploys, publishes, or sends notifications.

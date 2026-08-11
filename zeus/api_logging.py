@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
 from collections.abc import Mapping
@@ -16,6 +17,10 @@ _ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _LOWER_HEX = frozenset("0123456789abcdef")
 _GENERIC_ERROR_TYPE = "Exception"
 _GENERIC_ERROR_MESSAGE = "Unexpected API error"
+# The access log grows one line per request; bound it so an unauthenticated
+# peer cannot exhaust the state-dir filesystem via /health hits.
+MAX_API_LOG_BYTES = 8 * 1024 * 1024
+_ROTATED_SUFFIX = ".1"
 _SAFE_ERROR_TYPES: dict[type[Exception], str] = {
     AssertionError: "AssertionError",
     KeyError: "KeyError",
@@ -144,6 +149,20 @@ class ApiLogWriter:
                 "utf-8"
             )
             with self._lock:
+                self._rotate_if_oversized(len(line))
                 append_private_bytes(self.path, line)
         except (OSError, TypeError, ValueError):
+            return
+
+    def _rotate_if_oversized(self, incoming_bytes: int) -> None:
+        try:
+            current_size = self.path.stat().st_size
+        except OSError:
+            return
+        if current_size + incoming_bytes <= MAX_API_LOG_BYTES:
+            return
+        rotated = self.path.with_name(self.path.name + _ROTATED_SUFFIX)
+        try:
+            os.replace(self.path, rotated)
+        except OSError:
             return

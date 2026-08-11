@@ -78,7 +78,7 @@ def _bool(value: Any, name: str, *, default: bool) -> bool:
 
 
 def validate_id(value: str, name: str = "id") -> str:
-    if not isinstance(value, str) or not ID_RE.match(value):
+    if not isinstance(value, str) or not ID_RE.fullmatch(value):
         raise TemplateError(f"{name} must match ^[a-z][a-z0-9-]{{1,62}}$")
     return value
 

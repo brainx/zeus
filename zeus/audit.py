@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import secrets
+import shlex
 import shutil
 import subprocess  # nosec B404
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -24,26 +25,42 @@ from zeus.audit_container import AuditContainerError, AuditContainerRuntime, Pre
 from zeus.audit_docker_broker import (
     HERMES_VERSION,
     AuditDockerBrokerError,
+    AuditDockerBrokerState,
     install_audit_docker_broker,
+    read_audit_docker_broker_state,
 )
 from zeus.audit_doctor import AuditDoctorCheck, AuditDoctorReport, run_audit_doctor
 from zeus.audit_models import (
+    AuditCategory,
     AuditCheck,
+    AuditCommandReceipt,
     AuditCompleteness,
     AuditConfig,
+    AuditControlCoverage,
+    AuditControlSpec,
     AuditMetadata,
     AuditReport,
     AuditStatus,
+    AuditSurface,
     CheckDisposition,
+    CoverageDisposition,
     ModelAuditResult,
     SkippedContent,
+    TrustedCheckBinding,
+)
+from zeus.audit_policy import (
+    RELEASE_POLICY_ID,
+    AuditPolicyEvaluation,
+    evaluate_audit_policy,
 )
 from zeus.audit_profile import (
+    AUDIT_SKILL_VERSION,
     AuditProfile,
     AuditProfileError,
     build_audit_profile,
     render_audit_profile_config,
 )
+from zeus.audit_receipts import TRUSTED_EXECUTION_BOUNDARY, expected_command_receipt_tag
 from zeus.audit_report import AuditReportError, build_audit_report, validate_model_output
 from zeus.audit_run_control import (
     _RUN_CONTROL_CLEANUP_MAX_DEPTH,
@@ -81,6 +98,7 @@ from zeus.audit_snapshot import (
     snapshot_source_line_counts,
 )
 from zeus.audit_store import AuditStore, AuditStoreError
+from zeus.audit_surface import build_audit_surface
 from zeus.audit_workspace import (
     GIT_HARDENING_ARGUMENTS,
     AuditWorkspace,
@@ -289,11 +307,13 @@ class AuditService:
         termination_reason: str | None,
         config: AuditConfig | None = None,
         skipped_content: tuple[SkippedContent, ...] = (),
+        surface: AuditSurface | None = None,
+        command_receipts: tuple[AuditCommandReceipt, ...] = (),
     ) -> AuditReport:
         metadata = AuditMetadata(
             zeus_version=__version__,
             hermes_version=HERMES_VERSION,
-            skill_version="1.0.0",
+            skill_version=AUDIT_SKILL_VERSION,
             image_digest=config.image if config is not None else None,
             target_commit=self.location.head,
             started_at=started_at,
@@ -302,6 +322,7 @@ class AuditService:
             provider=config.provider if config is not None else None,
             model=config.model if config is not None else None,
             worktree_changes_excluded=True,
+            trusted_execution_boundary=TRUSTED_EXECUTION_BOUNDARY,
         )
         return build_audit_report(
             run_id=run_id,
@@ -311,6 +332,8 @@ class AuditService:
             checks=checks,
             skipped_content=skipped_content,
             model_result=model_result,
+            surface=surface,
+            command_receipts=command_receipts,
         )
 
     def _empty_result(
@@ -319,7 +342,9 @@ class AuditService:
         *,
         complete: bool,
         reason: str | None = None,
+        surface: AuditSurface | None = None,
     ) -> ModelAuditResult:
+        coverage_reason = reason or "audit did not evaluate the required control"
         return ModelAuditResult(
             summary=summary,
             findings=(),
@@ -328,6 +353,21 @@ class AuditService:
             completeness=AuditCompleteness(
                 complete=complete,
                 reasons=() if reason is None else (reason,),
+            ),
+            coverage=(
+                ()
+                if surface is None
+                else tuple(
+                    AuditControlCoverage(
+                        control_id=control_id,
+                        category=AuditCategory.security,
+                        required=True,
+                        disposition=CoverageDisposition.skipped,
+                        check_names=(),
+                        reason=coverage_reason,
+                    )
+                    for control_id in surface.required_control_ids
+                )
             ),
         )
 
@@ -430,6 +470,9 @@ class AuditService:
     ) -> AuditReport:
         run_id = secrets.token_hex(16)
         checks: list[AuditCheck] = []
+        surface: AuditSurface | None = None
+        command_receipts: tuple[AuditCommandReceipt, ...] = ()
+        capture_command_receipts: Callable[[], AuditDockerBrokerState] | None = None
         try:
             self.workspace.revalidate(self.location, deadline=deadline)
             self._validate_state_path(deadline=deadline)
@@ -476,11 +519,12 @@ class AuditService:
         control_lifecycle = _AuditRunControlLifecycle()
         control_removal_safe = False
         control_retention_observation = (
-            "audit run control directory was retained because process/container cleanup "
-            "was incomplete"
+            "audit run control directory and committed snapshot were retained because "
+            "process/container cleanup was incomplete"
         )
         prepared: PreparedAuditContainer | None = None
         runtime: AuditContainerRuntime | None = None
+        snapshot_temporary: Path | None = None
         external_setup_started = False
         try:
             _create_audit_run_control(
@@ -495,37 +539,121 @@ class AuditService:
             hermes = _executable(self.settings.hermes_bin)
             runtime = AuditContainerRuntime(docker, control)
             temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
-            with tempfile.TemporaryDirectory(
-                prefix="zeus-audit-snapshot-",
-                dir=temporary_root,
-            ) as temporary:
-                snapshot = self.workspace.materialize(
-                    self.workspace.inspect(self.location, deadline=deadline),
-                    Path(temporary) / "snapshot",
-                    exclude_paths=config.exclude_paths,
-                    limits=config.limits,
-                    deadline=deadline,
+            snapshot_temporary = Path(
+                tempfile.mkdtemp(
+                    prefix="zeus-audit-snapshot-",
+                    dir=temporary_root,
                 )
-                self.workspace.validate_snapshot(snapshot, deadline=deadline)
-                source_line_counts = snapshot_source_line_counts(snapshot, deadline=deadline)
-                external_setup_started = True
-                prepared = runtime.prepare(
-                    run_id=run_id,
-                    snapshot=snapshot,
-                    image_ref=config.image,
-                    limits=config.limits,
-                    deadline=deadline,
-                )
+            ).resolve(strict=True)
+            snapshot = self.workspace.materialize(
+                self.workspace.inspect(self.location, deadline=deadline),
+                snapshot_temporary / "snapshot",
+                exclude_paths=config.exclude_paths,
+                limits=config.limits,
+                deadline=deadline,
+            )
+            self.workspace.validate_snapshot(snapshot, deadline=deadline)
+            source_line_counts = snapshot_source_line_counts(snapshot, deadline=deadline)
+            surface = build_audit_surface(snapshot.manifest, config.categories)
+            source_digests = {
+                entry.path: entry.sha256
+                for entry in snapshot.manifest
+                if entry.path in source_line_counts
+            }
+            required_controls = tuple(
+                AuditControlSpec(control_id, AuditCategory.security)
+                for control_id in surface.required_control_ids
+            )
+            trusted_command_scripts = tuple(
+                shlex.join(command.argv)
+                for command in config.suggested_commands
+                if command.control_ids
+            )
+            external_setup_started = True
+            prepared = runtime.prepare(
+                run_id=run_id,
+                snapshot=snapshot,
+                image_ref=config.image,
+                limits=config.limits,
+                deadline=deadline,
+                prepare_trusted_workspace=bool(trusted_command_scripts),
+            )
             broker = install_audit_docker_broker(
                 prepared,
                 docker_executable=docker,
                 limits=config.limits,
                 deadline=deadline,
                 python_executable=Path(sys.executable).resolve(),
+                target_commit=snapshot.head,
+                snapshot_digest=surface.snapshot_digest,
+                trusted_command_scripts=trusted_command_scripts,
             )
-            profile = build_audit_profile(config)
+            profile = build_audit_profile(config, surface=surface)
             install_audit_profile(control / "hermes", prepared.profile_name, profile)
             runner = AuditRunner(hermes)
+
+            def capture_receipts() -> AuditDockerBrokerState:
+                nonlocal command_receipts
+                broker_state = read_audit_docker_broker_state(prepared.state_path)
+                if (
+                    broker_state.target_commit != snapshot.head
+                    or broker_state.snapshot_digest != surface.snapshot_digest
+                ):
+                    raise AuditReportError(
+                        "audit command receipt ledger does not match the audited snapshot"
+                    )
+                command_receipts = broker_state.terminal_receipts
+                return broker_state
+
+            capture_command_receipts = capture_receipts
+
+            def validate_output(data: bytes) -> ModelAuditResult:
+                broker_state = capture_receipts()
+                if (
+                    broker_state.receipt_hmac_key is None
+                    or broker_state.target_commit is None
+                    or broker_state.snapshot_digest is None
+                ):
+                    raise AuditReportError("audit command receipt provenance is unavailable")
+                trusted_checks = tuple(
+                    TrustedCheckBinding(
+                        name=command.name,
+                        receipt_tags=tuple(
+                            (
+                                receipt.receipt_id,
+                                expected_command_receipt_tag(
+                                    key_hex=broker_state.receipt_hmac_key,
+                                    run_id=run_id,
+                                    target_commit=broker_state.target_commit,
+                                    snapshot_digest=broker_state.snapshot_digest,
+                                    image_id=broker_state.image_id,
+                                    command_script=shlex.join(command.argv),
+                                    receipt=receipt,
+                                    isolated_workspace=bool(command.control_ids),
+                                ),
+                            )
+                            for receipt in command_receipts
+                        ),
+                        control_ids=command.control_ids,
+                    )
+                    for command in config.suggested_commands
+                )
+                return validate_model_output(
+                    data,
+                    run_id=run_id,
+                    allowed_categories=config.categories,
+                    source_line_counts=source_line_counts,
+                    source_digests=source_digests,
+                    checks=tuple(checks),
+                    configured_check_names=tuple(
+                        command.name for command in config.suggested_commands
+                    ),
+                    trusted_checks=trusted_checks,
+                    required_controls=required_controls,
+                    command_receipts=command_receipts,
+                    limits=config.limits,
+                )
+
             result = runner.run(
                 profile_name=prepared.profile_name,
                 prompt=profile.prompt,
@@ -535,19 +663,20 @@ class AuditService:
                 broker_state_path=prepared.state_path,
                 deadline=deadline,
                 source_env=self.env,
-                validate_output=lambda data: validate_model_output(
-                    data,
-                    run_id=run_id,
-                    allowed_categories=config.categories,
-                    source_line_counts=source_line_counts,
-                    checks=tuple(checks),
-                    configured_check_names=tuple(
-                        command.name for command in config.suggested_commands
-                    ),
-                    limits=config.limits,
-                ),
+                validate_output=validate_output,
             )
-            control_removal_safe = result.cleanup_complete
+            capture_receipts()
+            cleanup_complete = result.cleanup_complete
+            if not cleanup_complete:
+                cleanup = runtime.cleanup(prepared)
+                cleanup_complete = cleanup.removed and not cleanup.ambiguous
+                if not cleanup_complete:
+                    control_retention_observation = (
+                        "audit run control directory and committed snapshot were retained "
+                        "because process/container cleanup could not be verified against "
+                        "the exact container identities"
+                    )
+            control_removal_safe = cleanup_complete
             if isinstance(result.model_result, ModelAuditResult):
                 model_result = result.model_result
                 checks.extend(model_result.checks)
@@ -556,10 +685,11 @@ class AuditService:
                     result.diagnostic or "Audit did not produce a valid result.",
                     complete=False,
                     reason=result.outcome.value,
+                    surface=surface,
                 )
             model_result = _with_cleanup_completeness(
                 model_result,
-                cleanup_complete=result.cleanup_complete,
+                cleanup_complete=cleanup_complete,
             )
             checks.append(
                 AuditCheck(
@@ -584,6 +714,8 @@ class AuditService:
                 else result.outcome.value,
                 config=config,
                 skipped_content=snapshot.skipped_content,
+                surface=surface,
+                command_receipts=command_receipts,
             )
         except KeyboardInterrupt as exc:
             cleanup_reason = ""
@@ -617,6 +749,15 @@ class AuditService:
                 cleanup_reason = "; external resource cleanup could not be verified"
             else:
                 control_removal_safe = True
+            if capture_command_receipts is not None:
+                with suppress(
+                    AuditDockerBrokerError,
+                    AuditReportError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ):
+                    capture_command_receipts()
             checks.append(
                 AuditCheck(
                     "execution",
@@ -634,9 +775,12 @@ class AuditService:
                     "Audit execution was cancelled.",
                     complete=False,
                     reason="audit execution was interrupted",
+                    surface=surface,
                 ),
                 termination_reason="audit execution was interrupted",
                 config=config,
+                surface=surface,
+                command_receipts=command_receipts,
             )
         except (
             AuditServiceError,
@@ -680,6 +824,15 @@ class AuditService:
             else:
                 control_removal_safe = True
                 cleanup_reason = ""
+            if capture_command_receipts is not None:
+                with suppress(
+                    AuditDockerBrokerError,
+                    AuditReportError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ):
+                    capture_command_receipts()
             checks.append(
                 AuditCheck("execution", CheckDisposition.failed, 0.0, str(exc) + cleanup_reason)
             )
@@ -692,11 +845,23 @@ class AuditService:
                     "Audit execution failed.",
                     complete=False,
                     reason="audit execution failed",
+                    surface=surface,
                 ),
                 termination_reason="audit execution failed",
                 config=config,
+                surface=surface,
+                command_receipts=command_receipts,
             )
         finally:
+            if snapshot_temporary is not None and control_removal_safe:
+                try:
+                    shutil.rmtree(snapshot_temporary)
+                except OSError:
+                    control_removal_safe = False
+                    control_retention_observation = (
+                        "audit run control directory was retained because committed snapshot "
+                        "cleanup could not be verified"
+                    )
             if control_lifecycle.handle is not None:
                 control_lifecycle.cleanup = _AuditRunControlCleanup(
                     False,
@@ -728,3 +893,27 @@ class AuditService:
 
     def show_markdown(self, run_id: str) -> str:
         return AuditStore(self.settings.state_dir).read_markdown(run_id)
+
+    def gate(
+        self,
+        run_id: str,
+        *,
+        policy_id: str = RELEASE_POLICY_ID,
+    ) -> AuditPolicyEvaluation:
+        try:
+            self.workspace.revalidate(self.location, deadline=self.deadline)
+            self._validate_state_path(deadline=self.deadline)
+        except (AuditWorkspaceError, AuditServiceError) as exc:
+            raise AuditServiceError("repository changed before the audit policy gate") from exc
+        report = self.show(run_id)
+        try:
+            self.workspace.revalidate(self.location, deadline=self.deadline)
+            self._validate_state_path(deadline=self.deadline)
+        except (AuditWorkspaceError, AuditServiceError) as exc:
+            raise AuditServiceError("repository changed during the audit policy gate") from exc
+        return evaluate_audit_policy(
+            report,
+            policy_id=policy_id,
+            expected_target_commit=self.location.head,
+            expected_repository_id=self.location.repository_id,
+        )

@@ -141,7 +141,10 @@ class AuditConfigTests(unittest.TestCase):
                 "exclude_paths": ["vendor", "fixtures/generated.json"],
                 "suggested_commands": {
                     "lint": ["python3", "-m", "ruff", "check", "."],
-                    "literal-argument": ["tool", "value;not-a-shell-command"],
+                    "literal-argument": {
+                        "argv": ["tool", "value;not-a-shell-command"],
+                        "control_ids": ["SEC-REPO", "SEC-DEPS"],
+                    },
                 },
                 "limits": limits,
             }
@@ -163,6 +166,7 @@ class AuditConfigTests(unittest.TestCase):
                 SuggestedCommand(
                     name="literal-argument",
                     argv=("tool", "value;not-a-shell-command"),
+                    control_ids=("SEC-REPO", "SEC-DEPS"),
                 ),
             ),
             config.suggested_commands,
@@ -421,6 +425,77 @@ class AuditConfigTests(unittest.TestCase):
         for commands_value in invalid_commands:
             with self.subTest(commands=commands_value), self.assertRaises(AuditConfigError):
                 parse_audit_config({"schema_version": 1, "suggested_commands": commands_value})
+
+    def test_suggested_command_security_bindings_have_an_exact_bounded_schema(self) -> None:
+        config = parse_audit_config(
+            {
+                "schema_version": 1,
+                "suggested_commands": {
+                    "legacy": ["true"],
+                    "repository-policy": {
+                        "argv": ["python3", "-m", "policy", "--strict"],
+                        "control_ids": ["SEC-REPO", "SEC-CI"],
+                    },
+                },
+            }
+        )
+
+        self.assertEqual((), config.suggested_commands[0].control_ids)
+        self.assertEqual(
+            ("SEC-REPO", "SEC-CI"),
+            config.suggested_commands[1].control_ids,
+        )
+
+        invalid_records = (
+            {"argv": ["true"]},
+            {"argv": ["true"], "control_ids": [], "extra": True},
+            {"argv": "true", "control_ids": ["SEC-REPO"]},
+            {"argv": ["true"], "control_ids": "SEC-REPO"},
+            {"argv": ["true"], "control_ids": ["SEC-UNKNOWN"]},
+            {"argv": ["true"], "control_ids": ["SEC-REPO", "SEC-REPO"]},
+        )
+        for record in invalid_records:
+            with self.subTest(record=record), self.assertRaises(AuditConfigError):
+                parse_audit_config({"schema_version": 1, "suggested_commands": {"check": record}})
+
+    def test_suggested_commands_reject_identical_argv_across_names(self) -> None:
+        duplicate_argv = ["python3", "-m", "policy", "--strict"]
+
+        with self.assertRaisesRegex(
+            AuditConfigError,
+            (
+                "suggested commands dependency-policy and repository-policy have identical argv; "
+                "combine control_ids on one command"
+            ),
+        ):
+            parse_audit_config(
+                {
+                    "schema_version": 1,
+                    "suggested_commands": {
+                        "repository-policy": {
+                            "argv": duplicate_argv,
+                            "control_ids": ["SEC-REPO"],
+                        },
+                        "dependency-policy": {
+                            "argv": duplicate_argv,
+                            "control_ids": ["SEC-DEPS"],
+                        },
+                    },
+                }
+            )
+
+    def test_suggested_commands_allow_distinct_argv_with_a_shared_executable(self) -> None:
+        config = parse_audit_config(
+            {
+                "schema_version": 1,
+                "suggested_commands": {
+                    "repository-policy": ["python3", "-m", "policy", "repository"],
+                    "dependency-policy": ["python3", "-m", "policy", "dependencies"],
+                },
+            }
+        )
+
+        self.assertEqual(2, len(config.suggested_commands))
 
     def test_suggested_command_keys_are_validated_before_sorting(self) -> None:
         commands: dict[object, object] = {
