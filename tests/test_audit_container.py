@@ -34,6 +34,7 @@ RUN_ID = "1" * 32
 IMAGE_REF = "registry.example.invalid/audit@sha256:" + "a" * 64
 IMAGE_ID = "sha256:" + "b" * 64
 CONTAINER_ID = "c" * 64
+TRUSTED_CONTAINER_ID = "9" * 64
 
 
 def _deadline() -> float:
@@ -54,6 +55,7 @@ class FakeDockerRunner:
             },
         }
         self.remove_stdout = CONTAINER_ID.encode() + b"\n"
+        self.container_present = True
         self.calls: list[tuple[tuple[str, ...], bytes | None, dict[str, str]]] = []
 
     def run(
@@ -81,8 +83,108 @@ class FakeDockerRunner:
                 stdout=json.dumps([self.inspect_value], separators=(",", ":")).encode() + b"\n",
                 stderr=b"",
             )
+        if argv[1:3] == ("ps", "-aq"):
+            return DockerCommandResult(
+                stdout=(CONTAINER_ID.encode() + b"\n") if self.container_present else b"",
+                stderr=b"",
+            )
         if argv[1:3] == ("rm", "-f"):
+            if self.remove_stdout == CONTAINER_ID.encode() + b"\n":
+                self.container_present = False
             return DockerCommandResult(stdout=self.remove_stdout, stderr=b"")
+        return DockerCommandResult(stdout=b"", stderr=b"")
+
+
+class TrustedDockerRunner(FakeDockerRunner):
+    def __init__(
+        self,
+        inspect_value: dict[str, object],
+        trusted_inspect_value: dict[str, object],
+        *,
+        endpoint: str = "unix:///var/run/docker.sock",
+        uncertain_trusted_create: bool = False,
+        trusted_name_visibility_delay: int = 0,
+    ) -> None:
+        super().__init__(inspect_value)
+        self.trusted_inspect_value = trusted_inspect_value
+        self.endpoint = endpoint
+        self.uncertain_trusted_create = uncertain_trusted_create
+        self.trusted_name_visibility_delay = trusted_name_visibility_delay
+        self.create_calls = 0
+        self.main_present = True
+        self.trusted_present = False
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        input_stream: io.BufferedIOBase | io.BytesIO | None,
+        deadline: float,
+        stdout_limit: int,
+        stderr_limit: int,
+        env: dict[str, str],
+    ) -> DockerCommandResult:
+        del deadline, stdout_limit, stderr_limit
+        payload = None if input_stream is None else input_stream.read()
+        self.calls.append((argv, payload, env))
+        if argv[1:3] == ("image", "inspect"):
+            return DockerCommandResult(
+                stdout=json.dumps(self.image_value, separators=(",", ":")).encode() + b"\n",
+                stderr=b"",
+            )
+        if argv[1:3] == ("context", "inspect"):
+            return DockerCommandResult(
+                stdout=json.dumps(self.endpoint).encode("ascii") + b"\n",
+                stderr=b"",
+            )
+        if argv[1] == "create":
+            self.create_calls += 1
+            if self.create_calls == 1:
+                return DockerCommandResult(stdout=CONTAINER_ID.encode() + b"\n", stderr=b"")
+            self.trusted_present = True
+            if self.uncertain_trusted_create:
+                raise AuditContainerError("simulated ambiguous trusted create")
+            return DockerCommandResult(
+                stdout=TRUSTED_CONTAINER_ID.encode() + b"\n",
+                stderr=b"",
+            )
+        if argv[1] == "inspect":
+            target = argv[2]
+            value = (
+                self.trusted_inspect_value
+                if target in {TRUSTED_CONTAINER_ID, f"zeus-audit-trusted-{RUN_ID}"}
+                else self.inspect_value
+            )
+            return DockerCommandResult(
+                stdout=json.dumps([value], separators=(",", ":")).encode() + b"\n",
+                stderr=b"",
+            )
+        if argv[1:3] == ("ps", "-aq"):
+            filter_value = argv[argv.index("--filter") + 1]
+            if filter_value.startswith("name="):
+                if self.trusted_name_visibility_delay:
+                    self.trusted_name_visibility_delay -= 1
+                    present = False
+                else:
+                    present = self.trusted_present
+                identifier = TRUSTED_CONTAINER_ID
+            elif filter_value == f"id={TRUSTED_CONTAINER_ID}":
+                present = self.trusted_present
+                identifier = TRUSTED_CONTAINER_ID
+            else:
+                present = self.main_present
+                identifier = CONTAINER_ID
+            return DockerCommandResult(
+                stdout=(identifier.encode() + b"\n") if present else b"",
+                stderr=b"",
+            )
+        if argv[1:3] == ("rm", "-f"):
+            identifier = argv[3]
+            if identifier == TRUSTED_CONTAINER_ID:
+                self.trusted_present = False
+            elif identifier == CONTAINER_ID:
+                self.main_present = False
+            return DockerCommandResult(stdout=identifier.encode() + b"\n", stderr=b"")
         return DockerCommandResult(stdout=b"", stderr=b"")
 
 
@@ -229,6 +331,124 @@ class AuditContainerTests(unittest.TestCase):
         }
         value.update(changes)
         return value
+
+    def _trusted_inspect(
+        self,
+        *,
+        image_environment: tuple[str, ...] = (),
+        **changes: object,
+    ) -> dict[str, object]:
+        uid = os.geteuid()
+        gid = os.getegid()
+        environment: dict[str, str] = {}
+        for item in image_environment:
+            key, _separator, value = item.partition("=")
+            environment[key] = value
+        for item in audit_container.TRUSTED_EXEC_ENV:
+            key, _separator, value = item.partition("=")
+            environment[key] = value
+        effective_environment = [
+            f"{key}={environment[key]}" for key in sorted(environment, reverse=True)
+        ]
+        value = self._inspect()
+        value.update(
+            {
+                "Id": TRUSTED_CONTAINER_ID,
+                "Name": f"/zeus-audit-trusted-{RUN_ID}",
+                "Config": {
+                    "Image": IMAGE_REF,
+                    "User": f"{uid}:{gid}",
+                    "WorkingDir": "/workspace",
+                    "Entrypoint": ["/bin/sh"],
+                    "Cmd": ["-c", "trap : TERM INT; sleep infinity & wait"],
+                    "Env": effective_environment,
+                    "Healthcheck": {"Test": ["NONE"]},
+                    "Volumes": None,
+                    "Labels": {
+                        "com.zeus.audit": "true",
+                        "com.zeus.audit.run-id": RUN_ID,
+                        "com.zeus.audit.profile": f"audit-{RUN_ID}",
+                        "com.zeus.audit.trusted-command": "true",
+                    },
+                },
+                "HostConfig": {
+                    "NetworkMode": "none",
+                    "Binds": None,
+                    "Mounts": [
+                        {
+                            "Type": "bind",
+                            "Source": str(self.snapshot_root),
+                            "Target": "/workspace",
+                            "ReadOnly": True,
+                            "BindOptions": {},
+                        }
+                    ],
+                    "CapAdd": None,
+                    "CapDrop": ["ALL"],
+                    "SecurityOpt": ["no-new-privileges:true"],
+                    "ReadonlyRootfs": True,
+                    "PidsLimit": HARD_LIMITS.pids,
+                    "NanoCpus": HARD_LIMITS.cpu_count * 1_000_000_000,
+                    "Memory": HARD_LIMITS.memory_bytes,
+                    "MemorySwap": HARD_LIMITS.memory_bytes,
+                    "Privileged": False,
+                    "PidMode": "",
+                    "IpcMode": "none",
+                    "UTSMode": "",
+                    "UsernsMode": "",
+                    "CgroupnsMode": "private",
+                    "Devices": [],
+                    "DeviceRequests": [],
+                    "DeviceCgroupRules": [],
+                    "GroupAdd": [],
+                    "PortBindings": {},
+                    "Tmpfs": {
+                        "/tmp": (
+                            f"rw,noexec,nosuid,nodev,size={HARD_LIMITS.temp_bytes},"
+                            f"uid={uid},gid={gid},mode=0700"
+                        )
+                    },
+                    "LogConfig": {"Type": "none", "Config": {}},
+                    "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                },
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": str(self.snapshot_root),
+                        "Destination": "/workspace",
+                        "RW": False,
+                    }
+                ],
+                "State": {"Running": False, "Pid": 0, "Status": "created"},
+            }
+        )
+        value.update(changes)
+        return value
+
+    def _trusted_runtime(
+        self,
+        *,
+        endpoint: str = "unix:///var/run/docker.sock",
+        uncertain_trusted_create: bool = False,
+        trusted_name_visibility_delay: int = 0,
+        image_environment: tuple[str, ...] = (),
+    ) -> tuple[AuditContainerRuntime, TrustedDockerRunner]:
+        main = self._inspect()
+        main["Config"]["Env"] = list(image_environment)  # type: ignore[index]
+        runner = TrustedDockerRunner(
+            main,
+            self._trusted_inspect(image_environment=image_environment),
+            endpoint=endpoint,
+            uncertain_trusted_create=uncertain_trusted_create,
+            trusted_name_visibility_delay=trusted_name_visibility_delay,
+        )
+        runner.image_value["Config"]["Env"] = list(image_environment)  # type: ignore[index]
+        runtime = AuditContainerRuntime(
+            Path("/usr/bin/docker"),
+            self.root / "trusted-control",
+            runner=runner,
+        )
+        return runtime, runner
 
     def _runtime(self, inspect_value: dict[str, object] | None = None):
         runner = FakeDockerRunner(self._inspect() if inspect_value is None else inspect_value)
@@ -426,6 +646,251 @@ class AuditContainerTests(unittest.TestCase):
             self.assertEqual({"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}, env)
         self.assertEqual(CONTAINER_ID, prepared.container_id)
         self.assertEqual(0o700, stat.S_IMODE(prepared.broker_dir.lstat().st_mode))
+
+    @unittest.skipIf(os.geteuid() == 0, "trusted audit containers reject root hosts")
+    def test_trusted_container_is_precreated_with_exact_read_only_isolation(self) -> None:
+        image_environment = (
+            "PATH=/image/toolchain/bin",
+            "HOME=/root",
+            "CUSTOM_IMAGE_FLAG=enabled",
+        )
+        runtime, runner = self._trusted_runtime(image_environment=image_environment)
+
+        prepared = runtime.prepare(
+            run_id=RUN_ID,
+            snapshot=self.snapshot,
+            image_ref=IMAGE_REF,
+            limits=HARD_LIMITS,
+            deadline=_deadline(),
+            prepare_trusted_workspace=True,
+        )
+
+        self.assertEqual(TRUSTED_CONTAINER_ID, prepared.trusted_container_id)
+        self.assertEqual(str(self.snapshot_root), prepared.trusted_snapshot_path)
+        plan = json.loads(
+            (runtime._control_dir / audit_container._TRUSTED_PLAN_FILE).read_text(encoding="ascii")
+        )
+        self.assertEqual("created", plan["status"])
+        self.assertEqual(TRUSTED_CONTAINER_ID, plan["container_id"])
+        trusted_create_call = next(
+            call
+            for call in runner.calls
+            if call[0][1] == "create" and f"zeus-audit-trusted-{RUN_ID}" in call[0]
+        )
+        trusted_create = trusted_create_call[0]
+        self.assertIn("--read-only", trusted_create)
+        self.assertIn("--network=none", trusted_create)
+        self.assertIn("--cap-drop=ALL", trusted_create)
+        self.assertIn("--security-opt=no-new-privileges:true", trusted_create)
+        self.assertIn("--log-driver=none", trusted_create)
+        self.assertIn("--restart=no", trusted_create)
+        self.assertIn(
+            f"type=bind,src={self.snapshot_root},dst=/workspace,readonly",
+            trusted_create,
+        )
+        for item in audit_container.TRUSTED_EXEC_ENV:
+            self.assertIn(f"--env={item}", trusted_create)
+        context_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[0][1:3] == ("context", "inspect")
+        )
+        self.assertLess(context_index, runner.calls.index(trusted_create_call))
+
+        cleanup = runtime.cleanup(prepared)
+        self.assertTrue(cleanup.removed, cleanup.observation)
+        removals = [call[0][3] for call in runner.calls if call[0][1:3] == ("rm", "-f")]
+        self.assertEqual([TRUSTED_CONTAINER_ID, CONTAINER_ID], removals)
+
+    @unittest.skipIf(os.geteuid() == 0, "trusted audit containers reject root hosts")
+    def test_remote_docker_context_is_rejected_before_trusted_create(self) -> None:
+        runtime, runner = self._trusted_runtime(endpoint="ssh://builder.example.invalid")
+
+        with self.assertRaisesRegex(AuditContainerError, "local Docker endpoint"):
+            runtime.prepare(
+                run_id=RUN_ID,
+                snapshot=self.snapshot,
+                image_ref=IMAGE_REF,
+                limits=HARD_LIMITS,
+                deadline=_deadline(),
+                prepare_trusted_workspace=True,
+            )
+
+        self.assertEqual(1, runner.create_calls)
+        self.assertFalse(runner.main_present)
+        self.assertFalse(runner.trusted_present)
+
+    @unittest.skipIf(os.geteuid() == 0, "trusted audit containers reject root hosts")
+    def test_cleanup_continues_to_main_when_trusted_container_is_already_absent(self) -> None:
+        runtime, runner = self._trusted_runtime()
+        prepared = runtime.prepare(
+            run_id=RUN_ID,
+            snapshot=self.snapshot,
+            image_ref=IMAGE_REF,
+            limits=HARD_LIMITS,
+            deadline=_deadline(),
+            prepare_trusted_workspace=True,
+        )
+        runner.trusted_present = False
+
+        cleanup = runtime.cleanup(prepared)
+
+        self.assertTrue(cleanup.removed, cleanup.observation)
+        self.assertFalse(runner.main_present)
+        removals = [call[0][3] for call in runner.calls if call[0][1:3] == ("rm", "-f")]
+        self.assertEqual([CONTAINER_ID], removals)
+
+    @unittest.skipIf(os.geteuid() == 0, "trusted audit containers reject root hosts")
+    def test_ambiguous_trusted_create_is_reconciled_by_exact_name_and_labels(self) -> None:
+        runtime, runner = self._trusted_runtime(
+            uncertain_trusted_create=True,
+            trusted_name_visibility_delay=1,
+        )
+
+        with self.assertRaisesRegex(AuditContainerError, "ambiguous trusted create"):
+            runtime.prepare(
+                run_id=RUN_ID,
+                snapshot=self.snapshot,
+                image_ref=IMAGE_REF,
+                limits=HARD_LIMITS,
+                deadline=_deadline(),
+                prepare_trusted_workspace=True,
+            )
+
+        self.assertFalse(runner.trusted_present)
+        self.assertFalse(runner.main_present)
+        plan = json.loads(
+            (runtime._control_dir / audit_container._TRUSTED_PLAN_FILE).read_text(encoding="ascii")
+        )
+        self.assertEqual("reconciled-removed", plan["status"])
+        self.assertEqual(TRUSTED_CONTAINER_ID, plan["container_id"])
+        removals = [call[0][3] for call in runner.calls if call[0][1:3] == ("rm", "-f")]
+        self.assertEqual([TRUSTED_CONTAINER_ID, CONTAINER_ID], removals)
+        self.assertGreaterEqual(
+            sum(
+                call[0][1:3] == ("ps", "-aq") and f"name=^/zeus-audit-trusted-{RUN_ID}$" in call[0]
+                for call in runner.calls
+            ),
+            2,
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "trusted audit containers reject root hosts")
+    def test_keyboard_interrupt_after_trusted_id_parse_removes_exact_sandbox(self) -> None:
+        runtime, runner = self._trusted_runtime()
+        original = runtime._with_trusted_container
+        interrupted = False
+
+        def interrupt_once(*args: object, **kwargs: object):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected after trusted ID parse")
+            return original(*args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.object(runtime, "_with_trusted_container", side_effect=interrupt_once),
+            self.assertRaisesRegex(KeyboardInterrupt, "injected after trusted ID parse"),
+        ):
+            runtime.prepare(
+                run_id=RUN_ID,
+                snapshot=self.snapshot,
+                image_ref=IMAGE_REF,
+                limits=HARD_LIMITS,
+                deadline=_deadline(),
+                prepare_trusted_workspace=True,
+            )
+
+        self.assertTrue(interrupted)
+        self.assertFalse(runner.trusted_present)
+        self.assertFalse(runner.main_present)
+        plan = json.loads(
+            (runtime._control_dir / audit_container._TRUSTED_PLAN_FILE).read_text(encoding="ascii")
+        )
+        self.assertEqual("reconciled-removed", plan["status"])
+        self.assertEqual(TRUSTED_CONTAINER_ID, plan["container_id"])
+        removals = [call[0][3] for call in runner.calls if call[0][1:3] == ("rm", "-f")]
+        self.assertEqual([TRUSTED_CONTAINER_ID, CONTAINER_ID], removals)
+        self.assertFalse(
+            any(
+                call[0][1:3] == ("ps", "-aq") and f"name=^/zeus-audit-trusted-{RUN_ID}$" in call[0]
+                for call in runner.calls
+            ),
+            "a parsed exact ID must not fall back to ambiguous name polling",
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "trusted audit containers reject root hosts")
+    def test_late_trusted_create_retains_durable_recovery_plan_and_snapshot_binding(self) -> None:
+        runtime, runner = self._trusted_runtime(
+            uncertain_trusted_create=True,
+            trusted_name_visibility_delay=10,
+        )
+
+        with self.assertRaisesRegex(AuditContainerError, "recovery plan was retained"):
+            runtime.prepare(
+                run_id=RUN_ID,
+                snapshot=self.snapshot,
+                image_ref=IMAGE_REF,
+                limits=HARD_LIMITS,
+                deadline=_deadline(),
+                prepare_trusted_workspace=True,
+            )
+
+        self.assertTrue(runner.trusted_present)
+        self.assertFalse(runner.main_present)
+        plan_path = runtime._control_dir / audit_container._TRUSTED_PLAN_FILE
+        plan = json.loads(plan_path.read_text(encoding="ascii"))
+        self.assertEqual(0o600, stat.S_IMODE(plan_path.lstat().st_mode))
+        self.assertEqual("create-ambiguous", plan["status"])
+        self.assertIsNone(plan["container_id"])
+        self.assertEqual(f"zeus-audit-trusted-{RUN_ID}", plan["container_name"])
+        self.assertEqual(str(self.snapshot_root), plan["snapshot_path"])
+
+    @unittest.skipIf(os.geteuid() == 0, "trusted audit containers reject root hosts")
+    def test_trusted_container_full_isolation_drift_is_rejected(self) -> None:
+        mutations = {
+            "pid namespace": ("HostConfig.PidMode", "host"),
+            "uts namespace": ("HostConfig.UTSMode", "host"),
+            "user namespace": ("HostConfig.UsernsMode", "host"),
+            "cgroup namespace": ("HostConfig.CgroupnsMode", "host"),
+            "device": ("HostConfig.Devices", [{"PathOnHost": "/dev/null"}]),
+            "port": ("HostConfig.PortBindings", {"80/tcp": [{"HostPort": "8080"}]}),
+            "environment": ("Config.Env", ["HOME=/tmp"]),
+            "network": ("NetworkSettings.Networks", {"bridge": {}}),
+            "mount": (
+                "Mounts",
+                [
+                    {
+                        "Type": "bind",
+                        "Source": str(self.snapshot_root),
+                        "Destination": "/workspace",
+                        "RW": False,
+                    },
+                    {
+                        "Type": "bind",
+                        "Source": "/",
+                        "Destination": "/host",
+                        "RW": False,
+                    },
+                ],
+            ),
+        }
+        for name, (path, replacement) in mutations.items():
+            with self.subTest(name=name):
+                runtime, runner = self._trusted_runtime()
+                target: dict[str, object] = runner.trusted_inspect_value
+                components = path.split(".")
+                for component in components[:-1]:
+                    target = target[component]  # type: ignore[assignment]
+                target[components[-1]] = replacement
+                with self.assertRaises(AuditContainerError):
+                    runtime.prepare(
+                        run_id=RUN_ID,
+                        snapshot=self.snapshot,
+                        image_ref=IMAGE_REF,
+                        limits=HARD_LIMITS,
+                        deadline=_deadline(),
+                        prepare_trusted_workspace=True,
+                    )
 
     def test_seed_script_preserves_files_directories_modes_and_confined_symlinks(
         self,

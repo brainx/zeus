@@ -2,38 +2,60 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
-import math
 import os
 import re
-import selectors
 import stat
-import subprocess  # nosec B404
-import tarfile
-import tempfile
-import threading
+import tempfile as tempfile
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
-from typing import BinaryIO, NoReturn, Protocol, cast
+from typing import BinaryIO, cast
 
-from zeus.audit_config import AuditConfigError, parse_audit_config
 from zeus.audit_container_seed import SEED_SCRIPT as _SEED_SCRIPT
+from zeus.audit_container_support import _actual_snapshot_paths as _actual_snapshot_paths
+from zeus.audit_container_support import (
+    _build_seed_archive,
+    _manifest_directories,
+    _normalized_environment,
+    _trusted_environment,
+    _validated_image_reference,
+    _validation_manifest,
+)
+from zeus.audit_container_support import _DeadlineReader as _DeadlineReader
+from zeus.audit_container_support import (
+    _has_isolated_none_network as _has_isolated_none_network,
+)
+from zeus.audit_container_support import _stop_process as _stop_process
+from zeus.audit_container_support import _SubprocessDockerRunner as _SubprocessDockerRunner
+from zeus.audit_container_types import AUDIT_GID as AUDIT_GID
+from zeus.audit_container_types import AUDIT_UID as AUDIT_UID
+from zeus.audit_container_types import AuditContainerError as AuditContainerError
+from zeus.audit_container_types import CleanupResult as CleanupResult
+from zeus.audit_container_types import DockerCommandResult as DockerCommandResult
+from zeus.audit_container_types import DockerCommandRunner as DockerCommandRunner
+from zeus.audit_container_types import PreparedAuditContainer as PreparedAuditContainer
+from zeus.audit_container_types import PreparedRecord as _PreparedRecord
+from zeus.audit_container_types import (
+    _command_deadline,
+    _error,
+    _safe_private_directory,
+    _validate_deadline,
+    _validate_limits,
+)
 from zeus.audit_container_validate import VALIDATION_SCRIPT as _VALIDATION_SCRIPT
 from zeus.audit_models import HARD_LIMITS, AuditLimits
-from zeus.audit_process import AuditProcessError, stop_process_group, wait_process_exit
-from zeus.audit_workspace import MaterializedSnapshot, SnapshotManifestEntry
-from zeus.private_io import ensure_private_directory, inspect_private_directory
+from zeus.audit_trusted_snapshot_attest import TRUSTED_EXEC_ENV as TRUSTED_EXEC_ENV
+from zeus.audit_workspace import MaterializedSnapshot
+from zeus.private_io import write_private_bytes_atomic
 
-AUDIT_UID = AUDIT_GID = 65532
-_PRIVATE_DIRECTORY_MODE = 0o700
 _DOCKER_STDOUT_LIMIT = 1024 * 1024
 _DOCKER_STDERR_LIMIT = 256 * 1024
 _ARCHIVE_OUTPUT_LIMIT = 64 * 1024
-_PROCESS_CHUNK = 64 * 1024
+_TRUSTED_PLAN_FILE = "trusted-container-plan.json"
+_TRUSTED_PLAN_LIMIT = 16 * 1024
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -49,111 +71,6 @@ _TEMP_TMPFS = (
     f"rw,noexec,nosuid,nodev,size={HARD_LIMITS.temp_bytes},"
     f"uid={AUDIT_UID},gid={AUDIT_GID},mode=0700"
 )
-
-
-class AuditContainerError(RuntimeError):
-    """Raised when an audit container control cannot be proven safe."""
-
-
-@dataclass(frozen=True)
-class DockerCommandResult:
-    stdout: bytes
-    stderr: bytes
-
-
-@dataclass(frozen=True)
-class PreparedAuditContainer:
-    container_id: str
-    container_name: str
-    profile_name: str
-    image_ref: str
-    image_id: str
-    broker_dir: Path
-    state_path: Path
-
-
-@dataclass(frozen=True)
-class CleanupResult:
-    removed: bool
-    ambiguous: bool
-    observation: str
-
-
-class DockerCommandRunner(Protocol):
-    def run(
-        self,
-        argv: tuple[str, ...],
-        *,
-        input_stream: BinaryIO | None,
-        deadline: float,
-        stdout_limit: int,
-        stderr_limit: int,
-        env: dict[str, str],
-    ) -> DockerCommandResult: ...
-
-
-@dataclass(frozen=True)
-class _PreparedRecord:
-    prepared: PreparedAuditContainer
-    limits: AuditLimits
-    deadline: float
-    labels: dict[str, str]
-    image_environment: tuple[str, ...]
-
-
-def _error(message: str) -> NoReturn:
-    raise AuditContainerError(message)
-
-
-def _remaining(deadline: float) -> float:
-    value = deadline - time.monotonic()
-    if value <= 0:
-        _error("audit container deadline has expired")
-    return value
-
-
-def _validate_deadline(deadline: float) -> float:
-    if (
-        isinstance(deadline, bool)
-        or not isinstance(deadline, (int, float))
-        or not math.isfinite(deadline)
-    ):
-        _error("audit container deadline must be a finite monotonic timestamp")
-    result = float(deadline)
-    _remaining(result)
-    return result
-
-
-def _command_deadline(deadline: float, limits: AuditLimits) -> float:
-    _remaining(deadline)
-    return min(deadline, time.monotonic() + limits.docker_control_seconds)
-
-
-def _validate_limits(limits: AuditLimits) -> None:
-    if not isinstance(limits, AuditLimits):
-        _error("audit container limits are invalid")
-    for field in (
-        "cpu_count",
-        "memory_bytes",
-        "pids",
-        "workspace_bytes",
-        "temp_bytes",
-    ):
-        if getattr(limits, field) != getattr(HARD_LIMITS, field):
-            _error("audit container isolation limits cannot be configured")
-    if (
-        isinstance(limits.docker_control_seconds, bool)
-        or not isinstance(limits.docker_control_seconds, int)
-        or not 1 <= limits.docker_control_seconds <= HARD_LIMITS.docker_control_seconds
-    ):
-        _error("audit Docker control deadline is outside its hard limit")
-
-
-def _safe_private_directory(path: Path) -> None:
-    try:
-        ensure_private_directory(path)
-    except (OSError, TypeError, ValueError) as exc:
-        raise AuditContainerError("audit container control directory is unavailable") from exc
 
 
 def _decode_json_list(data: bytes, description: str) -> list[object]:
@@ -176,458 +93,6 @@ def _single_line(data: bytes, description: str, pattern: re.Pattern[str]) -> str
     if pattern.fullmatch(value) is None:
         _error(f"{description} returned an invalid identity")
     return value
-
-
-def _validated_image_reference(image_ref: str) -> tuple[str, str]:
-    try:
-        validated = parse_audit_config({"schema_version": 1, "image": image_ref}).image
-    except AuditConfigError as exc:
-        raise AuditContainerError(
-            "audit image must be an immutable digest-qualified reference"
-        ) from exc
-    if _DIGEST_RE.fullmatch(validated):
-        return validated, validated
-    repository, digest = validated.rsplit("@sha256:", 1)
-    prefix, separator, last_component = repository.rpartition("/")
-    if ":" in last_component:
-        last_component = last_component.rsplit(":", 1)[0]
-    canonical_repository = f"{prefix}{separator}{last_component}"
-    return validated, f"{canonical_repository}@sha256:{digest}"
-
-
-def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    if not stop_process_group(process):
-        _error("Docker control process group cleanup could not be verified")
-
-
-class _SubprocessDockerRunner:
-    def run(
-        self,
-        argv: tuple[str, ...],
-        *,
-        input_stream: BinaryIO | None,
-        deadline: float,
-        stdout_limit: int,
-        stderr_limit: int,
-        env: dict[str, str],
-    ) -> DockerCommandResult:
-        try:
-            process = subprocess.Popen(  # nosec B603
-                argv,
-                stdin=subprocess.PIPE if input_stream is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                shell=False,
-                close_fds=True,
-                start_new_session=True,
-                bufsize=0,
-            )
-        except OSError as exc:
-            raise AuditContainerError("Docker control process could not be started") from exc
-        writer_error: list[BaseException] = []
-
-        def write_input() -> None:
-            if process.stdin is None or input_stream is None:
-                return
-            try:
-                while True:
-                    chunk = input_stream.read(_PROCESS_CHUNK)
-                    if not chunk:
-                        break
-                    process.stdin.write(chunk)
-                process.stdin.close()
-            except (BrokenPipeError, OSError, ValueError) as exc:
-                writer_error.append(exc)
-                with suppress(OSError):
-                    process.stdin.close()
-
-        writer = threading.Thread(target=write_input, daemon=True)
-        if input_stream is not None:
-            writer.start()
-        if process.stdout is None or process.stderr is None:
-            _stop_process(process)
-            _error("Docker control process pipes are unavailable")
-        selector = selectors.DefaultSelector()
-        outputs = {process.stdout: bytearray(), process.stderr: bytearray()}
-        limits = {process.stdout: stdout_limit, process.stderr: stderr_limit}
-        try:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            selector.register(process.stderr, selectors.EVENT_READ)
-            while selector.get_map():
-                events = selector.select(_remaining(deadline))
-                if not events:
-                    _stop_process(process)
-                    _error("Docker control process exceeded its deadline")
-                for key, _mask in events:
-                    stream = cast(BinaryIO, key.fileobj)
-                    try:
-                        chunk = os.read(key.fd, _PROCESS_CHUNK)
-                    except OSError as exc:
-                        _stop_process(process)
-                        raise AuditContainerError(
-                            "Docker control output could not be read"
-                        ) from exc
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    outputs[stream].extend(chunk)
-                    if len(outputs[stream]) > limits[stream]:
-                        _stop_process(process)
-                        _error("Docker control output exceeded its byte limit")
-            try:
-                return_code = wait_process_exit(process, deadline=deadline)
-            except (AuditProcessError, subprocess.TimeoutExpired):
-                _stop_process(process)
-                _error("Docker control process exceeded its deadline")
-            if input_stream is not None:
-                writer.join(timeout=min(1.0, _remaining(deadline)))
-                if writer.is_alive():
-                    _stop_process(process)
-                    _error("Docker control input did not terminate")
-            if return_code != 0:
-                _error("Docker control command failed")
-            if writer_error:
-                _error("Docker control input could not be written")
-            return DockerCommandResult(
-                stdout=bytes(outputs[process.stdout]),
-                stderr=bytes(outputs[process.stderr]),
-            )
-        finally:
-            selector.close()
-            for close_stream in (process.stdin, process.stdout, process.stderr):
-                if close_stream is not None:
-                    with suppress(OSError):
-                        close_stream.close()
-            if process.returncode is None:
-                _stop_process(process)
-
-
-def _open_directory_at(parent: int, name: str) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent)
-        result = os.fstat(descriptor)
-    except OSError as exc:
-        raise AuditContainerError("snapshot directory binding changed") from exc
-    if not stat.S_ISDIR(result.st_mode):
-        os.close(descriptor)
-        _error("snapshot directory binding changed")
-    return descriptor
-
-
-def _open_parent(root_descriptor: int, path: str) -> tuple[int, str]:
-    components = path.split("/")
-    current = os.dup(root_descriptor)
-    try:
-        for component in components[:-1]:
-            child = _open_directory_at(current, component)
-            os.close(current)
-            current = child
-        return current, components[-1]
-    except BaseException:
-        with suppress(OSError):
-            os.close(current)
-        raise
-
-
-def _actual_snapshot_paths(
-    root_descriptor: int,
-    *,
-    deadline: float,
-) -> tuple[set[str], set[str]]:
-    files: set[str] = set()
-    directories: set[str] = set()
-    pending: list[tuple[str, int]] = [("", os.dup(root_descriptor))]
-    try:
-        while pending:
-            _remaining(deadline)
-            prefix, descriptor = pending.pop()
-            try:
-                names = os.listdir(descriptor)
-                _remaining(deadline)
-                for name in names:
-                    _remaining(deadline)
-                    if name in {".", ".."}:
-                        _error("snapshot contains an ambiguous path")
-                    path = name if not prefix else f"{prefix}/{name}"
-                    result = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                    if stat.S_ISDIR(result.st_mode):
-                        directories.add(path)
-                        pending.append((path, _open_directory_at(descriptor, name)))
-                    elif stat.S_ISREG(result.st_mode) or stat.S_ISLNK(result.st_mode):
-                        files.add(path)
-                    else:
-                        _error("snapshot contains an unsupported entry")
-                    _remaining(deadline)
-            finally:
-                os.close(descriptor)
-        return files, directories
-    except BaseException:
-        for _prefix, descriptor in pending:
-            with suppress(OSError):
-                os.close(descriptor)
-        raise
-
-
-def _manifest_directories(manifest: tuple[SnapshotManifestEntry, ...]) -> set[str]:
-    directories: set[str] = set()
-    for entry in manifest:
-        parts = entry.path.split("/")
-        directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
-    return directories
-
-
-def _tar_info(name: str, mode: int, entry_type: bytes) -> tarfile.TarInfo:
-    info = tarfile.TarInfo(name=name)
-    info.type = entry_type
-    info.mode = mode
-    info.uid = AUDIT_UID
-    info.gid = AUDIT_GID
-    info.uname = ""
-    info.gname = ""
-    info.mtime = 0
-    return info
-
-
-class _DeadlineReader:
-    def __init__(self, stream: BinaryIO, deadline: float) -> None:
-        self._stream = stream
-        self._deadline = deadline
-        self._digest = hashlib.sha256()
-        self._bytes_read = 0
-
-    def read(self, size: int = -1) -> bytes:
-        _remaining(self._deadline)
-        value = self._stream.read(size)
-        self._digest.update(value)
-        self._bytes_read += len(value)
-        _remaining(self._deadline)
-        return value
-
-    @property
-    def bytes_read(self) -> int:
-        return self._bytes_read
-
-    def hexdigest(self) -> str:
-        return self._digest.hexdigest()
-
-
-def _has_isolated_none_network(networks: object) -> bool:
-    if not isinstance(networks, dict) or set(networks) != {"none"}:
-        return False
-    endpoint = networks.get("none")
-    if not isinstance(endpoint, dict):
-        return False
-    expected_values = {
-        "Aliases": None,
-        "DriverOpts": None,
-        "Gateway": "",
-        "GlobalIPv6Address": "",
-        "GlobalIPv6PrefixLen": 0,
-        "IPAMConfig": None,
-        "IPAddress": "",
-        "IPPrefixLen": 0,
-        "IPv6Gateway": "",
-        "Links": None,
-        "MacAddress": "",
-    }
-    if any(endpoint.get(key) != value for key, value in expected_values.items()):
-        return False
-    if endpoint.get("DNSNames") not in (None, []):
-        return False
-    if endpoint.get("GwPriority", 0) != 0:
-        return False
-    return all(isinstance(endpoint.get(key), str) for key in ("EndpointID", "NetworkID"))
-
-
-def _validate_snapshot_archive_limits(snapshot: MaterializedSnapshot, limits: AuditLimits) -> None:
-    for field in ("snapshot_entries", "snapshot_blob_bytes"):
-        value = getattr(limits, field)
-        hard = getattr(HARD_LIMITS, field)
-        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= hard:
-            _error("snapshot archive limit is outside its hard ceiling")
-    if (
-        len(snapshot.manifest) > limits.snapshot_entries
-        or snapshot.source_entry_count > limits.snapshot_entries
-    ):
-        _error("snapshot archive exceeds its entry limit")
-    manifest_bytes = sum(entry.size for entry in snapshot.manifest)
-    if (
-        manifest_bytes > limits.snapshot_blob_bytes
-        or snapshot.source_blob_bytes > limits.snapshot_blob_bytes
-    ):
-        _error("snapshot archive exceeds its blob byte limit")
-
-
-def _build_seed_archive(
-    snapshot: MaterializedSnapshot,
-    deadline: float,
-    *,
-    limits: AuditLimits,
-    spool_dir: Path,
-) -> BinaryIO:
-    _remaining(deadline)
-    if not isinstance(snapshot, MaterializedSnapshot):
-        _error("materialized snapshot is invalid")
-    if not isinstance(limits, AuditLimits):
-        _error("snapshot archive limits are invalid")
-    if not isinstance(spool_dir, Path) or not spool_dir.is_absolute():
-        _error("snapshot archive spool directory is invalid")
-    try:
-        private_spool = inspect_private_directory(spool_dir)
-    except (OSError, TypeError, ValueError) as exc:
-        raise AuditContainerError("snapshot archive spool directory is unsafe") from exc
-    if not private_spool:
-        _error("snapshot archive spool directory is unavailable")
-    _validate_snapshot_archive_limits(snapshot, limits)
-    try:
-        root_result = snapshot.root.lstat()
-    except OSError as exc:
-        raise AuditContainerError("materialized snapshot root is unavailable") from exc
-    identity = snapshot._root_identity
-    if (
-        not stat.S_ISDIR(root_result.st_mode)
-        or root_result.st_dev != identity.device
-        or root_result.st_ino != identity.inode
-        or root_result.st_uid != identity.owner
-        or stat.S_IMODE(root_result.st_mode) != identity.permissions
-    ):
-        _error("materialized snapshot root binding changed")
-    root_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    try:
-        root_descriptor = os.open(snapshot.root, root_flags)
-    except OSError as exc:
-        raise AuditContainerError("materialized snapshot root could not be opened") from exc
-    # The caller owns and closes this bounded archive after Docker consumes it.
-    archive = tempfile.SpooledTemporaryFile(  # noqa: SIM115
-        max_size=8 * 1024 * 1024,
-        mode="w+b",
-        dir=str(spool_dir),
-    )
-    try:
-        opened_root = os.fstat(root_descriptor)
-        if (
-            opened_root.st_dev != identity.device
-            or opened_root.st_ino != identity.inode
-            or opened_root.st_uid != identity.owner
-        ):
-            _error("materialized snapshot root binding changed")
-        expected_paths = {entry.path for entry in snapshot.manifest}
-        if len(expected_paths) != len(snapshot.manifest):
-            _error("snapshot manifest contains duplicate paths")
-        expected_directories = _manifest_directories(snapshot.manifest)
-        actual_paths, actual_directories = _actual_snapshot_paths(
-            root_descriptor,
-            deadline=deadline,
-        )
-        if actual_paths != expected_paths or actual_directories != expected_directories:
-            _error("snapshot path set changed before container seeding")
-        with tarfile.open(fileobj=archive, mode="w", format=tarfile.PAX_FORMAT) as tar:
-            for directory in sorted(expected_directories):
-                _remaining(deadline)
-                info = _tar_info(directory, _PRIVATE_DIRECTORY_MODE, tarfile.DIRTYPE)
-                tar.addfile(info)
-            for entry in sorted(snapshot.manifest, key=lambda value: value.path):
-                _remaining(deadline)
-                parent, name = _open_parent(root_descriptor, entry.path)
-                try:
-                    result = os.stat(name, dir_fd=parent, follow_symlinks=False)
-                    if entry.is_symlink:
-                        if not stat.S_ISLNK(result.st_mode):
-                            _error("snapshot manifest entry type changed")
-                        target = os.readlink(name, dir_fd=parent)
-                        if target != entry.symlink_target or result.st_size != entry.size:
-                            _error("snapshot symlink metadata changed")
-                        info = _tar_info(entry.path, 0o777, tarfile.SYMTYPE)
-                        info.linkname = target
-                        tar.addfile(info)
-                        continue
-                    if (
-                        not stat.S_ISREG(result.st_mode)
-                        or result.st_nlink != 1
-                        or stat.S_IMODE(result.st_mode) != entry.mode
-                        or result.st_size != entry.size
-                    ):
-                        _error("snapshot file metadata changed")
-                    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-                    descriptor = os.open(name, flags, dir_fd=parent)
-                    try:
-                        opened = os.fstat(descriptor)
-                        if (
-                            opened.st_dev != result.st_dev
-                            or opened.st_ino != result.st_ino
-                            or opened.st_size != result.st_size
-                        ):
-                            _error("snapshot file binding changed")
-                        digest = hashlib.sha256()
-                        while True:
-                            _remaining(deadline)
-                            chunk = os.read(descriptor, _PROCESS_CHUNK)
-                            if not chunk:
-                                break
-                            digest.update(chunk)
-                        if digest.hexdigest() != entry.sha256:
-                            _error("snapshot file digest changed")
-                        os.lseek(descriptor, 0, os.SEEK_SET)
-                        info = _tar_info(entry.path, entry.mode, tarfile.REGTYPE)
-                        info.size = entry.size
-                        with os.fdopen(os.dup(descriptor), "rb") as source:
-                            reader = _DeadlineReader(source, deadline)
-                            tar.addfile(info, reader)
-                            if (
-                                reader.bytes_read != entry.size
-                                or reader.hexdigest() != entry.sha256
-                            ):
-                                _error("snapshot file changed while archive was streamed")
-                    finally:
-                        os.close(descriptor)
-                    final = os.stat(name, dir_fd=parent, follow_symlinks=False)
-                    if (
-                        final.st_dev != result.st_dev
-                        or final.st_ino != result.st_ino
-                        or final.st_size != result.st_size
-                        or stat.S_IMODE(final.st_mode) != entry.mode
-                    ):
-                        _error("snapshot file binding changed")
-                finally:
-                    os.close(parent)
-        final_root = os.fstat(root_descriptor)
-        if final_root.st_dev != identity.device or final_root.st_ino != identity.inode:
-            _error("materialized snapshot root binding changed")
-        _remaining(deadline)
-        archive.seek(0)
-        _remaining(deadline)
-        return cast(BinaryIO, archive)
-    except BaseException:
-        archive.close()
-        raise
-    finally:
-        os.close(root_descriptor)
-
-
-def _validation_manifest(snapshot: MaterializedSnapshot) -> bytes:
-    entries: list[dict[str, object]] = []
-    for entry in sorted(snapshot.manifest, key=lambda value: value.path):
-        if entry.is_symlink:
-            entries.append(
-                {
-                    "path": entry.path,
-                    "type": "symlink",
-                    "target": entry.symlink_target,
-                }
-            )
-        else:
-            entries.append(
-                {
-                    "mode": entry.mode,
-                    "path": entry.path,
-                    "sha256": entry.sha256,
-                    "size": entry.size,
-                    "type": "file",
-                }
-            )
-    return json.dumps(entries, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
 
 
 class AuditContainerRuntime:
@@ -725,6 +190,32 @@ class AuditContainerRuntime:
             _error("local image digest binding does not match the configured image")
         return image_id, normalized_environment, normalized_labels
 
+    def _validate_local_docker_endpoint(
+        self,
+        *,
+        limits: AuditLimits,
+        deadline: float,
+    ) -> None:
+        result = self._run(
+            (
+                "context",
+                "inspect",
+                "--format",
+                "{{json .Endpoints.docker.Host}}",
+            ),
+            limits=limits,
+            deadline=deadline,
+            stdout_limit=_ARCHIVE_OUTPUT_LIMIT,
+        )
+        if result.stderr or not result.stdout.endswith(b"\n"):
+            _error("effective Docker endpoint could not be proven local")
+        try:
+            endpoint = json.loads(result.stdout[:-1].decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AuditContainerError("effective Docker endpoint is invalid") from exc
+        if not isinstance(endpoint, str) or not endpoint.startswith(("unix://", "npipe://")):
+            _error("trusted audit workspace requires a local Docker endpoint")
+
     def _create_arguments(
         self,
         *,
@@ -764,6 +255,245 @@ class AuditContainerRuntime:
             *_COMMAND,
         )
 
+    def _create_trusted_arguments(
+        self,
+        *,
+        name: str,
+        profile: str,
+        run_id: str,
+        image_ref: str,
+        snapshot_path: Path,
+        limits: AuditLimits,
+    ) -> tuple[str, ...]:
+        uid = os.geteuid()
+        gid = os.getegid()
+        temp_tmpfs = (
+            f"rw,noexec,nosuid,nodev,size={limits.temp_bytes},uid={uid},gid={gid},mode=0700"
+        )
+        return (
+            "create",
+            "--pull=never",
+            "--name",
+            name,
+            "--label",
+            "com.zeus.audit=true",
+            "--label",
+            f"com.zeus.audit.run-id={run_id}",
+            "--label",
+            f"com.zeus.audit.profile={profile}",
+            "--label",
+            "com.zeus.audit.trusted-command=true",
+            "--network=none",
+            f"--user={uid}:{gid}",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true",
+            "--read-only",
+            "--no-healthcheck",
+            "--log-driver=none",
+            "--stop-timeout=1",
+            "--restart=no",
+            "--ipc=none",
+            f"--pids-limit={limits.pids}",
+            f"--cpus={limits.cpu_count}",
+            f"--memory={limits.memory_bytes}",
+            f"--memory-swap={limits.memory_bytes}",
+            *(f"--env={value}" for value in TRUSTED_EXEC_ENV),
+            "--mount",
+            f"type=bind,src={snapshot_path},dst=/workspace,readonly",
+            f"--tmpfs={_TEMP_PATH}:{temp_tmpfs}",
+            "--workdir=/workspace",
+            "--entrypoint=/bin/sh",
+            image_ref,
+            *_COMMAND,
+        )
+
+    def _with_trusted_container(
+        self,
+        record: _PreparedRecord,
+        *,
+        trusted_id: str,
+        trusted_name: str,
+        snapshot: MaterializedSnapshot,
+        trusted_environment: tuple[str, ...],
+        publish: bool = False,
+    ) -> _PreparedRecord:
+        prepared = replace(
+            record.prepared,
+            trusted_container_id=trusted_id,
+            trusted_container_name=trusted_name,
+            trusted_snapshot_path=str(snapshot.root),
+            trusted_snapshot_device=snapshot._root_identity.device,
+            trusted_snapshot_inode=snapshot._root_identity.inode,
+            trusted_snapshot_owner=snapshot._root_identity.owner,
+            trusted_snapshot_mode=snapshot._root_identity.permissions,
+            trusted_execution_uid=os.geteuid(),
+            trusted_execution_gid=os.getegid(),
+        )
+        updated = replace(
+            record,
+            prepared=prepared,
+            trusted_snapshot_path=str(snapshot.root),
+            trusted_environment=trusted_environment,
+        )
+        if publish:
+            self._records[record.prepared.container_id] = updated
+        return updated
+
+    def _write_trusted_plan(
+        self,
+        record: _PreparedRecord,
+        *,
+        trusted_name: str,
+        snapshot: MaterializedSnapshot,
+        status: str,
+        trusted_id: str | None,
+        replace_existing: bool,
+    ) -> None:
+        value = {
+            "schema_version": 1,
+            "status": status,
+            "container_id": trusted_id,
+            "container_name": trusted_name,
+            "image_id": record.prepared.image_id,
+            "image_ref": record.prepared.image_ref,
+            "labels": {
+                **record.labels,
+                "com.zeus.audit.trusted-command": "true",
+            },
+            "snapshot_path": str(snapshot.root),
+            "snapshot_device": snapshot._root_identity.device,
+            "snapshot_inode": snapshot._root_identity.inode,
+            "snapshot_owner": snapshot._root_identity.owner,
+            "snapshot_mode": snapshot._root_identity.permissions,
+        }
+        data = (
+            json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
+                "ascii"
+            )
+            + b"\n"
+        )
+        try:
+            write_private_bytes_atomic(
+                self._control_dir / _TRUSTED_PLAN_FILE,
+                data,
+                _TRUSTED_PLAN_LIMIT,
+                replace=replace_existing,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise AuditContainerError(
+                "trusted audit container recovery plan could not be persisted"
+            ) from exc
+
+    def _trusted_candidate_id(
+        self,
+        record: _PreparedRecord,
+        *,
+        trusted_name: str,
+        deadline: float,
+    ) -> str | None:
+        result = self._run(
+            (
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                f"name=^/{trusted_name}$",
+                "--format",
+                "{{.ID}}",
+            ),
+            limits=record.limits,
+            deadline=deadline,
+            stdout_limit=_ARCHIVE_OUTPUT_LIMIT,
+        )
+        if result.stderr:
+            _error("trusted Docker create reconciliation returned an error")
+        if not result.stdout:
+            return None
+        return _single_line(
+            result.stdout,
+            "trusted Docker create reconciliation",
+            _CONTAINER_ID_RE,
+        )
+
+    def _remove_trusted_candidate(
+        self,
+        record: _PreparedRecord,
+        *,
+        trusted_name: str,
+        snapshot: MaterializedSnapshot,
+        trusted_environment: tuple[str, ...],
+        candidate_id: str,
+        deadline: float,
+    ) -> str:
+        candidate = self._with_trusted_container(
+            record,
+            trusted_id=candidate_id,
+            trusted_name=trusted_name,
+            snapshot=snapshot,
+            trusted_environment=trusted_environment,
+        )
+        inspected = self._inspect(candidate, deadline=deadline, container_id=candidate_id)
+        self._validate_trusted_inspected_record(candidate, inspected, allow_running=True)
+        removed = self._run(
+            ("rm", "-f", candidate_id),
+            limits=record.limits,
+            deadline=deadline,
+            stdout_limit=_ARCHIVE_OUTPUT_LIMIT,
+        )
+        removed_id = _single_line(
+            removed.stdout,
+            "trusted Docker create reconciliation removal",
+            _CONTAINER_ID_RE,
+        )
+        if removed_id != candidate_id:
+            _error("trusted Docker create reconciliation removed an unexpected identity")
+        return candidate_id
+
+    def _reconcile_uncertain_trusted_create(
+        self,
+        record: _PreparedRecord,
+        *,
+        trusted_name: str,
+        snapshot: MaterializedSnapshot,
+        trusted_environment: tuple[str, ...],
+        known_id: str | None = None,
+    ) -> str | None:
+        """Remove a possibly-created exact-name sandbox without trusting CLI output."""
+
+        cleanup_deadline = time.monotonic() + record.limits.docker_control_seconds
+        if known_id is not None:
+            return self._remove_trusted_candidate(
+                record,
+                trusted_name=trusted_name,
+                snapshot=snapshot,
+                trusted_environment=trusted_environment,
+                candidate_id=known_id,
+                deadline=cleanup_deadline,
+            )
+        # A killed Docker CLI can return before the daemon publishes the new name. Poll a
+        # bounded quiet window, but treat continued absence as ambiguous rather than proof.
+        for attempt in range(4):
+            candidate_id = self._trusted_candidate_id(
+                record,
+                trusted_name=trusted_name,
+                deadline=cleanup_deadline,
+            )
+            if candidate_id is not None:
+                return self._remove_trusted_candidate(
+                    record,
+                    trusted_name=trusted_name,
+                    snapshot=snapshot,
+                    trusted_environment=trusted_environment,
+                    candidate_id=candidate_id,
+                    deadline=cleanup_deadline,
+                )
+            if attempt < 3:
+                remaining = cleanup_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.05, remaining))
+        return None
+
     def prepare(
         self,
         *,
@@ -772,6 +502,7 @@ class AuditContainerRuntime:
         image_ref: str,
         limits: AuditLimits,
         deadline: float,
+        prepare_trusted_workspace: bool = False,
     ) -> PreparedAuditContainer:
         active_deadline = _validate_deadline(deadline)
         _validate_limits(limits)
@@ -779,6 +510,8 @@ class AuditContainerRuntime:
             _error("audit container run ID is invalid")
         if not isinstance(image_ref, str):
             _error("audit image must be an immutable digest-qualified reference")
+        if not isinstance(prepare_trusted_workspace, bool):
+            _error("trusted audit workspace selection is invalid")
         validated_image_ref, canonical_digest = _validated_image_reference(image_ref)
         if not isinstance(snapshot, MaterializedSnapshot):
             _error("materialized snapshot is invalid")
@@ -832,6 +565,128 @@ class AuditContainerRuntime:
         self._records[container_id] = record
         archive: BinaryIO | None = None
         try:
+            if prepare_trusted_workspace:
+                if os.geteuid() == 0:
+                    _error("trusted audit workspace cannot run as root")
+                try:
+                    snapshot_root = snapshot.root.lstat()
+                except OSError as exc:
+                    raise AuditContainerError("trusted audit snapshot root is unavailable") from exc
+                if (
+                    snapshot_root.st_uid != os.geteuid()
+                    or snapshot_root.st_gid != os.getegid()
+                    or stat.S_IMODE(snapshot_root.st_mode) != 0o700
+                ):
+                    _error("trusted audit snapshot root ownership is invalid")
+                self._validate_local_docker_endpoint(
+                    limits=limits,
+                    deadline=active_deadline,
+                )
+                trusted_name = f"zeus-audit-trusted-{run_id}"
+                effective_trusted_environment = _trusted_environment(image_environment)
+                self._write_trusted_plan(
+                    record,
+                    trusted_name=trusted_name,
+                    snapshot=snapshot,
+                    status="planned",
+                    trusted_id=None,
+                    replace_existing=False,
+                )
+                trusted_id: str | None = None
+                try:
+                    trusted_create = self._run(
+                        self._create_trusted_arguments(
+                            name=trusted_name,
+                            profile=profile,
+                            run_id=run_id,
+                            image_ref=validated_image_ref,
+                            snapshot_path=snapshot.root,
+                            limits=limits,
+                        ),
+                        limits=limits,
+                        deadline=active_deadline,
+                    )
+                    trusted_id = _single_line(
+                        trusted_create.stdout,
+                        "trusted Docker create",
+                        _CONTAINER_ID_RE,
+                    )
+                    if trusted_id == container_id:
+                        _error("trusted audit container identity is not unique")
+                    record = self._with_trusted_container(
+                        record,
+                        trusted_id=trusted_id,
+                        trusted_name=trusted_name,
+                        snapshot=snapshot,
+                        trusted_environment=effective_trusted_environment,
+                        publish=True,
+                    )
+                    prepared = record.prepared
+                except BaseException as create_error:
+                    # The daemon may finish a create after its CLI was interrupted. Reconcile
+                    # the reserved exact name and delete only after validating full ownership.
+                    try:
+                        reconciled_id = self._reconcile_uncertain_trusted_create(
+                            record,
+                            trusted_name=trusted_name,
+                            snapshot=snapshot,
+                            trusted_environment=effective_trusted_environment,
+                            known_id=trusted_id,
+                        )
+                    except BaseException as reconciliation_error:
+                        with suppress(OSError, TypeError, ValueError, AuditContainerError):
+                            self._write_trusted_plan(
+                                record,
+                                trusted_name=trusted_name,
+                                snapshot=snapshot,
+                                status="create-ambiguous",
+                                trusted_id=None,
+                                replace_existing=True,
+                            )
+                        if isinstance(
+                            create_error,
+                            KeyboardInterrupt,
+                        ) or isinstance(reconciliation_error, KeyboardInterrupt):
+                            raise KeyboardInterrupt(
+                                "trusted Docker create reconciliation was interrupted"
+                            ) from reconciliation_error
+                        raise AuditContainerError(
+                            "trusted Docker create could not be reconciled safely"
+                        ) from reconciliation_error
+                    if reconciled_id is None:
+                        self._write_trusted_plan(
+                            record,
+                            trusted_name=trusted_name,
+                            snapshot=snapshot,
+                            status="create-ambiguous",
+                            trusted_id=None,
+                            replace_existing=True,
+                        )
+                        if isinstance(create_error, KeyboardInterrupt):
+                            raise KeyboardInterrupt(
+                                "trusted Docker create cleanup remained ambiguous"
+                            ) from create_error
+                        raise AuditContainerError(
+                            "trusted Docker create cleanup remained ambiguous; recovery plan "
+                            "was retained"
+                        ) from create_error
+                    self._write_trusted_plan(
+                        record,
+                        trusted_name=trusted_name,
+                        snapshot=snapshot,
+                        status="reconciled-removed",
+                        trusted_id=reconciled_id,
+                        replace_existing=True,
+                    )
+                    raise
+                self._write_trusted_plan(
+                    record,
+                    trusted_name=trusted_name,
+                    snapshot=snapshot,
+                    status="created",
+                    trusted_id=trusted_id,
+                    replace_existing=True,
+                )
             self._run(("start", container_id), limits=limits, deadline=active_deadline)
             archive = _build_seed_archive(
                 snapshot,
@@ -904,9 +759,10 @@ class AuditContainerRuntime:
         record: _PreparedRecord,
         *,
         deadline: float | None = None,
+        container_id: str | None = None,
     ) -> dict[str, object]:
         result = self._run(
-            ("inspect", record.prepared.container_id),
+            ("inspect", record.prepared.container_id if container_id is None else container_id),
             limits=record.limits,
             deadline=record.deadline if deadline is None else deadline,
         )
@@ -918,6 +774,198 @@ class AuditContainerRuntime:
     def _validate_record(self, record: _PreparedRecord) -> None:
         item = self._inspect(record)
         self._validate_inspected_record(record, item)
+        if record.prepared.trusted_container_id is not None:
+            trusted = self._inspect(
+                record,
+                container_id=record.prepared.trusted_container_id,
+            )
+            self._validate_trusted_inspected_record(record, trusted)
+
+    def _validate_trusted_inspected_record(
+        self,
+        record: _PreparedRecord,
+        item: dict[str, object],
+        *,
+        allow_running: bool = False,
+    ) -> None:
+        prepared = record.prepared
+        trusted_id = prepared.trusted_container_id
+        trusted_name = prepared.trusted_container_name
+        snapshot_path = record.trusted_snapshot_path
+        if trusted_id is None or trusted_name is None or snapshot_path is None:
+            _error("trusted audit container binding is incomplete")
+        config = item.get("Config")
+        host = item.get("HostConfig")
+        state = item.get("State")
+        network = item.get("NetworkSettings")
+        if (
+            not isinstance(config, dict)
+            or not isinstance(host, dict)
+            or not isinstance(state, dict)
+            or not isinstance(network, dict)
+            or record.trusted_environment is None
+        ):
+            _error("trusted audit container inspection omitted mandatory controls")
+        uid = os.geteuid()
+        gid = os.getegid()
+        temp_tmpfs = (
+            f"rw,noexec,nosuid,nodev,size={record.limits.temp_bytes},uid={uid},gid={gid},mode=0700"
+        )
+        expected_labels = dict(record.labels)
+        expected_labels["com.zeus.audit.trusted-command"] = "true"
+        config_environment = config.get("Env")
+        observed_environment = (
+            _normalized_environment(tuple(config_environment))
+            if isinstance(config_environment, list)
+            and all(isinstance(value, str) for value in config_environment)
+            else ()
+        )
+        state_running = state.get("Running")
+        state_pid = state.get("Pid")
+        state_status = state.get("Status")
+        state_ok = (
+            isinstance(state_running, bool)
+            and isinstance(state_pid, int)
+            and not isinstance(state_pid, bool)
+            and (
+                (state_running and allow_running and state_pid > 0 and state_status == "running")
+                or (not state_running and state_pid == 0 and state_status in {"created", "exited"})
+            )
+        )
+        requested_mounts = host.get("Mounts")
+        requested_mount_ok = False
+        if isinstance(requested_mounts, list) and len(requested_mounts) == 1:
+            requested = requested_mounts[0]
+            if isinstance(requested, dict):
+                bind_options = requested.get("BindOptions")
+                requested_mount_ok = (
+                    requested.get("Type") == "bind"
+                    and requested.get("Source") == snapshot_path
+                    and requested.get("Target") == "/workspace"
+                    and requested.get("ReadOnly") is True
+                    and requested.get("Consistency") in (None, "", "default")
+                    and isinstance(bind_options, dict)
+                    and set(bind_options).issubset(
+                        {"Propagation", "NonRecursive", "CreateMountpoint"}
+                    )
+                    and bind_options.get("Propagation") in (None, "", "rprivate")
+                    and bind_options.get("NonRecursive") in (None, False)
+                    and bind_options.get("CreateMountpoint") in (None, False)
+                    and requested.get("VolumeOptions") in (None, {})
+                    and requested.get("TmpfsOptions") in (None, {})
+                )
+        effective_mounts = item.get("Mounts")
+        effective_bind_count = 0
+        effective_temp_count = 0
+        effective_mounts_ok = isinstance(effective_mounts, list)
+        if isinstance(effective_mounts, list):
+            for mount in effective_mounts:
+                if not isinstance(mount, dict):
+                    effective_mounts_ok = False
+                    continue
+                if mount.get("Destination") == "/workspace":
+                    effective_bind_count += 1
+                    effective_mounts_ok = effective_mounts_ok and (
+                        mount.get("Type") == "bind"
+                        and mount.get("Source") == snapshot_path
+                        and mount.get("RW") is False
+                    )
+                elif mount.get("Destination") == _TEMP_PATH:
+                    effective_temp_count += 1
+                    effective_mounts_ok = effective_mounts_ok and (
+                        mount.get("Type") == "tmpfs" and mount.get("RW") is True
+                    )
+                else:
+                    effective_mounts_ok = False
+        effective_mounts_ok = (
+            effective_mounts_ok
+            and effective_bind_count == 1
+            and effective_temp_count in {0, 1}
+            and isinstance(effective_mounts, list)
+            and len(effective_mounts) == effective_bind_count + effective_temp_count
+        )
+        checks = (
+            (item.get("Id") == trusted_id, "trusted container identity"),
+            (item.get("Name") == f"/{trusted_name}", "trusted container name"),
+            (item.get("Image") == prepared.image_id, "trusted container image ID"),
+            (config.get("Image") == prepared.image_ref, "trusted container image reference"),
+            (config.get("User") == f"{uid}:{gid}", "trusted container user"),
+            (config.get("WorkingDir") == "/workspace", "trusted container workdir"),
+            (config.get("Entrypoint") == list(_ENTRYPOINT), "trusted container entrypoint"),
+            (config.get("Cmd") == list(_COMMAND), "trusted container command"),
+            (
+                observed_environment == record.trusted_environment,
+                "trusted container environment",
+            ),
+            (config.get("Healthcheck") == {"Test": ["NONE"]}, "trusted healthcheck"),
+            (config.get("Volumes") in (None, {}), "trusted inherited volumes"),
+            (config.get("Labels") == expected_labels, "trusted container labels"),
+            (host.get("NetworkMode") == "none", "trusted container network"),
+            (host.get("Binds") in (None, []), "trusted container binds"),
+            (requested_mount_ok, "trusted read-only source mount"),
+            (host.get("CapAdd") in (None, []), "trusted added capabilities"),
+            (host.get("CapDrop") == ["ALL"], "trusted dropped capabilities"),
+            (
+                host.get("SecurityOpt") == ["no-new-privileges:true"],
+                "trusted security options",
+            ),
+            (host.get("ReadonlyRootfs") is True, "trusted root filesystem"),
+            (host.get("PidsLimit") == record.limits.pids, "trusted PID limit"),
+            (
+                host.get("NanoCpus") == record.limits.cpu_count * 1_000_000_000,
+                "trusted CPU limit",
+            ),
+            (host.get("Memory") == record.limits.memory_bytes, "trusted memory limit"),
+            (host.get("MemorySwap") == record.limits.memory_bytes, "trusted swap limit"),
+            (host.get("Privileged") is False, "trusted privileged mode"),
+            (host.get("PidMode") in (None, "", "private"), "trusted PID namespace"),
+            (host.get("IpcMode") == "none", "trusted IPC namespace"),
+            (host.get("UTSMode") in (None, "", "private"), "trusted UTS namespace"),
+            (host.get("UsernsMode") in (None, "", "private"), "trusted user namespace"),
+            (
+                host.get("CgroupnsMode") in (None, "", "private"),
+                "trusted cgroup namespace",
+            ),
+            (host.get("Devices") in (None, []), "trusted devices"),
+            (host.get("DeviceRequests") in (None, []), "trusted device requests"),
+            (
+                host.get("DeviceCgroupRules") in (None, []),
+                "trusted device cgroup rules",
+            ),
+            (host.get("GroupAdd") in (None, []), "trusted supplementary groups"),
+            (host.get("PortBindings") in (None, {}), "trusted port bindings"),
+            (host.get("Tmpfs") == {_TEMP_PATH: temp_tmpfs}, "trusted tmpfs controls"),
+            (
+                host.get("LogConfig") in ({"Type": "none", "Config": {}}, {"Type": "none"}),
+                "trusted log persistence",
+            ),
+            (
+                host.get("RestartPolicy") in (None, {"Name": "no", "MaximumRetryCount": 0}),
+                "trusted restart policy",
+            ),
+            (state_ok, "trusted container state"),
+            (effective_mounts_ok, "trusted effective mounts"),
+            (network.get("Ports") in (None, {}), "trusted effective ports"),
+            (
+                _has_isolated_none_network(network.get("Networks")),
+                "trusted effective network attachments",
+            ),
+            (
+                network.get("IPAddress") in (None, ""),
+                "trusted effective IP address",
+            ),
+            (
+                network.get("Gateway") in (None, ""),
+                "trusted effective gateway",
+            ),
+            (
+                network.get("MacAddress") in (None, ""),
+                "trusted effective MAC address",
+            ),
+        )
+        for accepted, description in checks:
+            if not accepted:
+                _error(f"{description} does not match the required isolation policy")
 
     def _validate_inspected_record(
         self,
@@ -1047,28 +1095,75 @@ class AuditContainerRuntime:
 
     def _cleanup_record(self, record: _PreparedRecord) -> CleanupResult:
         cleanup_deadline = time.monotonic() + record.limits.docker_control_seconds
-        try:
-            item = self._inspect(record, deadline=cleanup_deadline)
-            self._validate_inspected_record(record, item, require_running=False)
-        except AuditContainerError:
+        container_ids = tuple(
+            container_id
+            for container_id in (
+                record.prepared.trusted_container_id,
+                record.prepared.container_id,
+            )
+            if container_id is not None
+        )
+        all_removed = True
+        for container_id in container_ids:
+            try:
+                presence = self._run(
+                    (
+                        "ps",
+                        "-aq",
+                        "--no-trunc",
+                        "--filter",
+                        f"id={container_id}",
+                        "--format",
+                        "{{.ID}}",
+                    ),
+                    limits=record.limits,
+                    deadline=cleanup_deadline,
+                    stdout_limit=_ARCHIVE_OUTPUT_LIMIT,
+                )
+                if presence.stderr:
+                    _error("Docker container presence check returned an error")
+                if not presence.stdout:
+                    continue
+                if presence.stdout != f"{container_id}\n".encode("ascii"):
+                    _error("Docker container presence check was ambiguous")
+                item = self._inspect(
+                    record,
+                    deadline=cleanup_deadline,
+                    container_id=container_id,
+                )
+                if container_id == record.prepared.trusted_container_id:
+                    self._validate_trusted_inspected_record(
+                        record,
+                        item,
+                        allow_running=True,
+                    )
+                else:
+                    self._validate_inspected_record(record, item, require_running=False)
+                remove_result = self._run(
+                    ("rm", "-f", container_id),
+                    limits=record.limits,
+                    deadline=cleanup_deadline,
+                    stdout_limit=_ARCHIVE_OUTPUT_LIMIT,
+                )
+                removed_id = _single_line(
+                    remove_result.stdout,
+                    "Docker remove",
+                    _CONTAINER_ID_RE,
+                )
+                if removed_id != container_id:
+                    _error("Docker remove returned an unexpected container identity")
+            except AuditContainerError:
+                all_removed = False
+        if not all_removed:
             return CleanupResult(
                 removed=False,
                 ambiguous=True,
-                observation="container identity or ownership could not be proven",
+                observation="one or more audit container cleanups could not be verified",
             )
-        remove_result = self._run(
-            ("rm", "-f", record.prepared.container_id),
-            limits=record.limits,
-            deadline=cleanup_deadline,
-            stdout_limit=_ARCHIVE_OUTPUT_LIMIT,
-        )
-        removed_id = _single_line(remove_result.stdout, "Docker remove", _CONTAINER_ID_RE)
-        if removed_id != record.prepared.container_id:
-            _error("Docker remove returned an unexpected container identity")
         return CleanupResult(
             removed=True,
             ambiguous=False,
-            observation="exact audit-owned container removed",
+            observation="exact audit-owned containers removed",
         )
 
     def cleanup(self, prepared: PreparedAuditContainer) -> CleanupResult:

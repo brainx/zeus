@@ -24,6 +24,11 @@ class AuditCliContractTests(unittest.TestCase):
         self.assertEqual("show", args.action)
         self.assertTrue(args.as_json)
 
+        gate = parser.parse_args(["audit", "gate", "b" * 32, "--json"])
+        self.assertEqual("gate", gate.action)
+        self.assertEqual("b" * 32, gate.run_id)
+        self.assertTrue(gate.as_json)
+
     def test_audit_dispatch_happens_before_normal_settings(self) -> None:
         with (
             mock.patch("zeus.cli._run_audit", return_value=7) as audit,
@@ -221,6 +226,55 @@ class AuditCliContractTests(unittest.TestCase):
                         )
                     else:
                         self.assertEqual("# Audit\n", output)
+
+    def test_audit_gate_human_json_and_exit_matrix(self) -> None:
+        from zeus.audit_policy import AuditPolicyEvaluation, AuditPolicyReason
+
+        evaluations = (
+            AuditPolicyEvaluation("release-v1", True, ()),
+            AuditPolicyEvaluation(
+                "release-v1",
+                False,
+                (
+                    AuditPolicyReason(
+                        "required_control_skipped",
+                        "required controls were skipped: SEC-REPO",
+                        ("SEC-REPO",),
+                    ),
+                ),
+            ),
+        )
+        for evaluation in evaluations:
+            for as_json in (False, True):
+                with self.subTest(passed=evaluation.passed, as_json=as_json):
+                    service = mock.Mock()
+                    service.gate.return_value = evaluation
+                    argv = ["audit", "gate", "a" * 32]
+                    if as_json:
+                        argv.append("--json")
+                    with (
+                        mock.patch("zeus.audit.AuditService.from_cwd", return_value=service),
+                        mock.patch("sys.stdout", new_callable=StringIO) as stdout,
+                    ):
+                        exit_code = main(argv)
+                    self.assertEqual(0 if evaluation.passed else 1, exit_code)
+                    service.gate.assert_called_once_with("a" * 32)
+                    if as_json:
+                        payload = json.loads(stdout.getvalue())
+                        self.assertEqual(evaluation.passed, payload["passed"])
+                        self.assertEqual("release-v1", payload["policy_id"])
+                        self.assertEqual(
+                            [reason.code for reason in evaluation.reasons],
+                            [reason["code"] for reason in payload["reasons"]],
+                        )
+                    elif evaluation.passed:
+                        self.assertEqual("pass\trelease-v1\n", stdout.getvalue())
+                    else:
+                        self.assertEqual(
+                            "fail\trequired_control_skipped\t"
+                            "required controls were skipped: SEC-REPO\n",
+                            stdout.getvalue(),
+                        )
 
     def test_audit_errors_use_human_or_json_output_and_exit_one(self) -> None:
         service = mock.Mock()

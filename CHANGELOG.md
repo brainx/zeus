@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Audit: executed configured security-coverage commands in a pre-created,
+  read-only snapshot sandbox; attested the mounted digest and effective process
+  controls before each command; force-reset temporary state before accepting a
+  versioned isolated receipt; and added exact-ID outer fallback cleanup when
+  broker cleanup cannot prove removal.
+- Security: added owner validation for the audit Hermes executable, rejected
+  C0/C1 control characters in committed-tree paths, and capped committed
+  snapshot path depth.
+- Hardened repository audits with schema-v2 committed-surface inventory,
+  commit/snapshot/image/result-bound terminal receipts, exact operator-command
+  and control provenance for security coverage, source-blob digests, stable
+  finding fingerprints, schema-v1 read compatibility, and a fail-closed
+  `release-v1` local gate. Added a fixed, non-executable scanner-adapter registry
+  for future integrations; external deterministic SAST and advisory engines are
+  not bundled or executed.
+
 ## 0.5.0
 
 - Decomposed oversized lifecycle, gateway-runtime, private-I/O, and audit

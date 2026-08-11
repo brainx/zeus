@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,14 @@ from zeus.audit_docker_broker_protocol import (
     _claim_cleanup,
     _expected_removal,
 )
+from zeus.audit_models import AuditCommandReceipt
+from zeus.audit_receipts import finalize_command_tag
+
+_TRUSTED_CLEANUP_FORMAT = (
+    "{{json .Id}}\t{{json .Name}}\t{{json .Image}}\t"
+    '{{json (index .Config.Labels "com.zeus.audit.run-id")}}\t'
+    '{{json (index .Config.Labels "com.zeus.audit.trusted-command")}}'
+)
 
 
 def _valid_removal(result: BrokerCommandResult, container_id: str) -> bool:
@@ -29,6 +38,122 @@ def _valid_removal(result: BrokerCommandResult, container_id: str) -> bool:
         result.returncode == 0
         and result.stdout == f"{container_id}\n".encode("ascii")
         and not result.stderr
+    )
+
+
+def _container_presence(
+    state: AuditDockerBrokerState,
+    container_id: str,
+    *,
+    runner: DockerExecutionRunner,
+    deadline: float,
+) -> bool | None:
+    try:
+        result = runner.run(
+            (
+                state.docker_executable,
+                "ps",
+                "-aq",
+                "--no-trunc",
+                "--filter",
+                f"id={container_id}",
+                "--format",
+                "{{.ID}}",
+            ),
+            deadline=deadline,
+            output_limit=_CONTROL_OUTPUT_LIMIT,
+            env=dict(_MINIMAL_DOCKER_ENV),
+        )
+    except (AuditDockerBrokerError, OSError, TypeError, ValueError):
+        return None
+    if result.returncode != 0 or result.stderr:
+        return None
+    if not result.stdout:
+        return False
+    if result.stdout == f"{container_id}\n".encode("ascii"):
+        return True
+    return None
+
+
+def _remove_trusted_container(
+    state: AuditDockerBrokerState,
+    *,
+    runner: DockerExecutionRunner,
+    deadline: float,
+) -> bool:
+    trusted_id = state.trusted_container_id
+    trusted_name = state.trusted_container_name
+    if trusted_id is None and trusted_name is None:
+        return True
+    if trusted_id is None or trusted_name is None:
+        return False
+    presence = _container_presence(
+        state,
+        trusted_id,
+        runner=runner,
+        deadline=deadline,
+    )
+    if presence is not True:
+        return presence is False
+    try:
+        inspected = runner.run(
+            (
+                state.docker_executable,
+                "inspect",
+                "--format",
+                _TRUSTED_CLEANUP_FORMAT,
+                trusted_id,
+            ),
+            deadline=deadline,
+            output_limit=_CONTROL_OUTPUT_LIMIT,
+            env=dict(_MINIMAL_DOCKER_ENV),
+        )
+    except (AuditDockerBrokerError, OSError, TypeError, ValueError):
+        return False
+    if inspected.returncode != 0:
+        return (
+            _container_presence(
+                state,
+                trusted_id,
+                runner=runner,
+                deadline=deadline,
+            )
+            is False
+        )
+    if inspected.stderr or not inspected.stdout.endswith(b"\n"):
+        return False
+    try:
+        fields = tuple(
+            json.loads(field)
+            for field in inspected.stdout[:-1].decode("utf-8", errors="strict").split("\t")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if fields != (
+        trusted_id,
+        f"/{trusted_name}",
+        state.image_id,
+        state.profile_name.removeprefix("audit-"),
+        "true",
+    ):
+        return False
+    try:
+        removed = runner.run(
+            (state.docker_executable, "rm", "-f", trusted_id),
+            deadline=deadline,
+            output_limit=_CONTROL_OUTPUT_LIMIT,
+            env=dict(_MINIMAL_DOCKER_ENV),
+        )
+    except (AuditDockerBrokerError, OSError, TypeError, ValueError):
+        return False
+    return _valid_removal(removed, trusted_id) or (
+        _container_presence(
+            state,
+            trusted_id,
+            runner=runner,
+            deadline=deadline,
+        )
+        is False
     )
 
 
@@ -101,6 +226,9 @@ def _breach_control(
 def _release_terminal_reservation(
     state_path: Path,
     *,
+    receipt_id: str | None,
+    result: BrokerCommandResult | None,
+    duration_ms: int | None,
     output_bytes: int | None,
     breach_reason: str | None,
 ) -> AuditDockerBrokerState:
@@ -116,7 +244,61 @@ def _release_terminal_reservation(
             current,
             aggregate_reserved_output_bytes=(current.aggregate_reserved_output_bytes - reservation),
             active_terminal_calls=current.active_terminal_calls - 1,
+            active_trusted_receipt_id=(
+                None
+                if current.active_trusted_receipt_id == receipt_id
+                else current.active_trusted_receipt_id
+            ),
         )
+        if current.schema_version >= 2:
+            if receipt_id is None or current.receipt_hmac_key is None:
+                _error("audit Docker broker terminal receipt is unavailable")
+            matches = [
+                index
+                for index, receipt in enumerate(current.terminal_receipts)
+                if receipt.receipt_id == receipt_id and receipt.state == "inflight"
+            ]
+            if len(matches) != 1:
+                _error("audit Docker broker terminal receipt binding is invalid")
+            index = matches[0]
+            receipt = current.terminal_receipts[index]
+            if result is None:
+                finalized = replace(
+                    receipt,
+                    command_tag=finalize_command_tag(
+                        key_hex=current.receipt_hmac_key,
+                        identity_tag=receipt.command_tag,
+                        state="execution_failed",
+                        returncode=None,
+                        duration_ms=None,
+                        stdout_bytes=None,
+                        stderr_bytes=None,
+                    ),
+                    state="execution_failed",
+                )
+            else:
+                if duration_ms is None or output_bytes is None:
+                    _error("audit Docker broker terminal receipt result is incomplete")
+                finalized = replace(
+                    receipt,
+                    command_tag=finalize_command_tag(
+                        key_hex=current.receipt_hmac_key,
+                        identity_tag=receipt.command_tag,
+                        state="exited",
+                        returncode=result.returncode,
+                        duration_ms=duration_ms,
+                        stdout_bytes=len(result.stdout),
+                        stderr_bytes=len(result.stderr),
+                    ),
+                    state="exited",
+                    returncode=result.returncode,
+                    duration_ms=duration_ms,
+                    stdout_bytes=len(result.stdout),
+                    stderr_bytes=len(result.stderr),
+                )
+            receipts = list(current.terminal_receipts)
+            receipts[index] = finalized
+            updated = replace(updated, terminal_receipts=tuple(receipts))
         if breach_reason is not None:
             updated = _breached(updated, breach_reason)
         elif not updated.limit_breach and output_bytes is not None:
@@ -168,11 +350,35 @@ def _perform_cleanup(
                     stdout=b"",
                     stderr=b"audit Docker broker execution is still running\n",
                 )
+            if state.schema_version >= 2 and state.receipt_hmac_key is None:
+                _error("audit Docker broker receipt key is unavailable")
+
+            def orphan(receipt: AuditCommandReceipt) -> AuditCommandReceipt:
+                if receipt.state != "inflight":
+                    return receipt
+                if state.receipt_hmac_key is None:
+                    _error("audit Docker broker receipt key is unavailable")
+                return replace(
+                    receipt,
+                    command_tag=finalize_command_tag(
+                        key_hex=state.receipt_hmac_key,
+                        identity_tag=receipt.command_tag,
+                        state="orphaned",
+                        returncode=None,
+                        duration_ms=None,
+                        stdout_bytes=None,
+                        stderr_bytes=None,
+                    ),
+                    state="orphaned",
+                )
+
             state = _breached(
                 replace(
                     state,
                     active_terminal_calls=0,
                     aggregate_reserved_output_bytes=0,
+                    active_trusted_receipt_id=None,
+                    terminal_receipts=tuple(orphan(receipt) for receipt in state.terminal_receipts),
                 ),
                 "orphaned execution",
             )
@@ -183,13 +389,18 @@ def _perform_cleanup(
     if cleanup_owner is None or cleanup_deadline is None:
         _error("audit Docker broker cleanup claim is invalid")
     try:
+        trusted_successful = _remove_trusted_container(
+            claimed,
+            runner=runner,
+            deadline=cleanup_deadline,
+        )
         result = runner.run(
             (claimed.docker_executable, *_expected_removal(claimed)),
             deadline=cleanup_deadline,
             output_limit=_CONTROL_OUTPUT_LIMIT,
             env=dict(_MINIMAL_DOCKER_ENV),
         )
-        successful = _valid_removal(result, claimed.container_id)
+        successful = trusted_successful and _valid_removal(result, claimed.container_id)
     except (AuditDockerBrokerError, OSError, TypeError, ValueError):
         result = BrokerCommandResult(returncode=126, stdout=b"", stderr=b"")
         successful = False

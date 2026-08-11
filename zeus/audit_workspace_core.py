@@ -37,6 +37,8 @@ _IGNORE_POLICY_BLOB_BYTES = 256 * 1024
 _IGNORE_POLICY_METADATA_BYTES = 64 * 1024
 _IGNORE_POLICY_OUTPUT_BYTES = 2 * 1024 * 1024
 _IGNORE_POLICY_MAX_DEPTH = 64
+# Keep one-fd-per-component walks inside RLIMIT_NOFILE and bound tree metadata.
+_MAX_RELATIVE_PATH_COMPONENTS = 64
 _INDEX_DEBUG_RE = re.compile(
     rb"  ctime: (?P<ctime_seconds>[0-9]{1,20}):(?P<ctime_nanoseconds>[0-9]{1,20})\n"
     rb"  mtime: (?P<mtime_seconds>[0-9]{1,20}):(?P<mtime_nanoseconds>[0-9]{1,20})\n"
@@ -468,13 +470,22 @@ def _single_oid(data: bytes, description: str) -> str:
     return value
 
 
+def _contains_forbidden_path_character(component: str) -> bool:
+    return any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in component)
+
+
 def _validate_relative_path_text(value: str, description: str) -> str:
     _strict_utf8_path_text(value, description)
     if not value or value.startswith("/") or "\\" in value or "\0" in value:
         _error(f"{description} is not a confined relative POSIX path")
     components = value.split("/")
+    # Control characters (ESC/CSI/OSC via hostile committed filenames) must not
+    # flow into reports or operator terminals; deep nesting exhausts the
+    # one-fd-per-component walks, so both are rejected here.
     if (
-        any(component in {"", ".", ".."} for component in components)
+        len(components) > _MAX_RELATIVE_PATH_COMPONENTS
+        or any(_contains_forbidden_path_character(component) for component in components)
+        or any(component in {"", ".", ".."} for component in components)
         or any(component.casefold() == ".git" for component in components)
         or _WINDOWS_DRIVE_RE.match(components[0]) is not None
         or posixpath.normpath(value) != value

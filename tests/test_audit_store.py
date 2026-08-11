@@ -20,6 +20,7 @@ from zeus.audit_models import (
     AuditStatus,
     SeverityCounts,
 )
+from zeus.audit_receipts import TRUSTED_EXECUTION_BOUNDARY
 from zeus.audit_report import REPORT_SCHEMA_VERSION, render_audit_markdown
 from zeus.audit_store import AuditStore, AuditStoreError
 from zeus.private_io import UnsafeFileError, write_private_bytes_atomic_tracked
@@ -48,6 +49,7 @@ def _report(
             provider="provider",
             model="model",
             worktree_changes_excluded=True,
+            trusted_execution_boundary=TRUSTED_EXECUTION_BOUNDARY,
         ),
         summary=summary,
         checks=(),

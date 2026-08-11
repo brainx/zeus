@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import stat
 import subprocess
@@ -24,14 +25,19 @@ from zeus.audit_docker_broker import (
     invoke_audit_docker_broker,
     read_audit_docker_broker_state,
 )
-from zeus.audit_models import HARD_LIMITS
+from zeus.audit_models import HARD_LIMITS, AuditCommandReceipt
+from zeus.audit_receipts import expected_command_receipt_tag
+from zeus.audit_trusted_snapshot_attest import TRUSTED_EXEC_ENV
 
 RUN_ID = "1" * 32
 PROFILE = f"audit-{RUN_ID}"
 IMAGE_REF = "registry.example.invalid/audit@sha256:" + "a" * 64
 IMAGE_ID = "sha256:" + "b" * 64
 CONTAINER_ID = "c" * 64
+TRUSTED_CONTAINER_ID = "9" * 64
 OTHER_CONTAINER_ID = "d" * 64
+TARGET_COMMIT = "e" * 40
+SNAPSHOT_DIGEST = "f" * 64
 
 
 def _bootstrap_script(session_id: str) -> str:
@@ -54,6 +60,104 @@ def _bootstrap_script(session_id: str) -> str:
         "builtin cd -- /workspace 2>/dev/null || true\n"
         f"""printf '\\n{marker}%s{marker}\\n' "$(pwd -P)"\n"""
     )
+
+
+def _trusted_state_fields(snapshot_path: Path, *, running: bool) -> tuple[object, ...]:
+    uid = os.geteuid()
+    gid = os.getegid()
+    tmpfs = f"rw,noexec,nosuid,nodev,size={HARD_LIMITS.temp_bytes},uid={uid},gid={gid},mode=0700"
+    networks = {
+        "none": {
+            "Aliases": None,
+            "DNSNames": None,
+            "DriverOpts": None,
+            "EndpointID": "endpoint-id",
+            "Gateway": "",
+            "GlobalIPv6Address": "",
+            "GlobalIPv6PrefixLen": 0,
+            "GwPriority": 0,
+            "IPAMConfig": None,
+            "IPAddress": "",
+            "IPPrefixLen": 0,
+            "IPv6Gateway": "",
+            "Links": None,
+            "MacAddress": "",
+            "NetworkID": "network-id",
+        }
+    }
+    requested_mount = {
+        "Type": "bind",
+        "Source": str(snapshot_path),
+        "Target": "/workspace",
+        "ReadOnly": True,
+        "BindOptions": {},
+    }
+    effective_mounts = [
+        {
+            "Type": "bind",
+            "Source": str(snapshot_path),
+            "Destination": "/workspace",
+            "RW": False,
+        },
+        {"Type": "tmpfs", "Destination": "/tmp", "RW": True},
+    ]
+    return (
+        TRUSTED_CONTAINER_ID,
+        f"/zeus-audit-trusted-{RUN_ID}",
+        IMAGE_ID,
+        RUN_ID,
+        "true",
+        running,
+        123 if running else 0,
+        "running" if running else "exited",
+        f"{uid}:{gid}",
+        "/workspace",
+        ["/bin/sh"],
+        ["-c", "trap : TERM INT; sleep infinity & wait"],
+        list(TRUSTED_EXEC_ENV),
+        None,
+        {"Test": ["NONE"]},
+        "none",
+        True,
+        None,
+        ["ALL"],
+        ["no-new-privileges:true"],
+        "",
+        "none",
+        "",
+        "",
+        "private",
+        [],
+        [],
+        [],
+        [],
+        {},
+        HARD_LIMITS.pids,
+        HARD_LIMITS.cpu_count * 1_000_000_000,
+        HARD_LIMITS.memory_bytes,
+        HARD_LIMITS.memory_bytes,
+        False,
+        [requested_mount],
+        {"/tmp": tmpfs},
+        {"Type": "none", "Config": {}},
+        {"Name": "no", "MaximumRetryCount": 0},
+        effective_mounts,
+        {},
+        networks,
+        "",
+        "",
+        "",
+    )
+
+
+def _encode_trusted_fields(fields: tuple[object, ...]) -> bytes:
+    return ("\t".join(json.dumps(field, separators=(",", ":")) for field in fields) + "\n").encode(
+        "ascii"
+    )
+
+
+def _encoded_trusted_state(snapshot_path: Path, *, running: bool) -> bytes:
+    return _encode_trusted_fields(_trusted_state_fields(snapshot_path, running=running))
 
 
 class FakeDockerRunner:
@@ -87,6 +191,262 @@ class FakeDockerRunner:
                 BrokerCommandResult(returncode=0, stdout=b"ok\n", stderr=b""),
             )
         raise AssertionError(f"unexpected real Docker call: {argv!r}")
+
+
+class MutatingWorkspaceDockerRunner(FakeDockerRunner):
+    def __init__(self, snapshot_path: Path) -> None:
+        super().__init__()
+        self.snapshot_path = snapshot_path
+        self.shared_workspace_content = b"committed\n"
+        self.trusted_running = False
+        self.trusted_temp_dirty = False
+        self.trusted_background_alive = False
+        self.attestor_returncode = 0
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        deadline: float,
+        output_limit: int,
+        env: dict[str, str],
+    ) -> BrokerCommandResult:
+        if argv[1:] == (
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "printf 'mutated\\n' > tracked.txt",
+        ):
+            self.calls.append((argv, deadline, output_limit, env))
+            self.shared_workspace_content = b"mutated\n"
+            return BrokerCommandResult(returncode=0, stdout=b"", stderr=b"")
+        if argv[1:] == ("exec", CONTAINER_ID, "bash", "-c", "cat tracked.txt"):
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=self.shared_workspace_content,
+                stderr=b"",
+            )
+        if argv[1:3] == ("inspect", "--format") and argv[-1] == TRUSTED_CONTAINER_ID:
+            self.calls.append((argv, deadline, output_limit, env))
+            if argv[3] != audit_docker_broker._TRUSTED_STATE_FORMAT:
+                fields = (
+                    TRUSTED_CONTAINER_ID,
+                    f"/zeus-audit-trusted-{RUN_ID}",
+                    IMAGE_ID,
+                    RUN_ID,
+                    "true",
+                )
+                return BrokerCommandResult(
+                    returncode=0,
+                    stdout=(
+                        "\t".join(json.dumps(field, separators=(",", ":")) for field in fields)
+                        + "\n"
+                    ).encode("ascii"),
+                    stderr=b"",
+                )
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=_encoded_trusted_state(
+                    self.snapshot_path,
+                    running=self.trusted_running,
+                ),
+                stderr=b"",
+            )
+        if argv[1:] == ("start", TRUSTED_CONTAINER_ID):
+            self.calls.append((argv, deadline, output_limit, env))
+            self.trusted_running = True
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{TRUSTED_CONTAINER_ID}\n".encode("ascii"),
+                stderr=b"",
+            )
+        if (
+            argv[1] == "exec"
+            and TRUSTED_CONTAINER_ID in argv
+            and "python3" in argv
+            and audit_docker_broker.ATTEST_SCRIPT in argv
+        ):
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(
+                returncode=self.attestor_returncode,
+                stdout=b"",
+                stderr=b"attestation failed\n" if self.attestor_returncode else b"",
+            )
+        if argv[-3:] == ("bash", "-c", "cat tracked.txt") and TRUSTED_CONTAINER_ID in argv:
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=b"committed\n",
+                stderr=b"",
+            )
+        if (
+            argv[-3:] == ("bash", "-c", "spawn background and dirty temp")
+            and TRUSTED_CONTAINER_ID in argv
+        ):
+            self.calls.append((argv, deadline, output_limit, env))
+            self.trusted_temp_dirty = True
+            self.trusted_background_alive = True
+            return BrokerCommandResult(returncode=0, stdout=b"spawned\n", stderr=b"")
+        if (
+            argv[-3:] == ("bash", "-c", "verify pristine trusted sandbox")
+            and TRUSTED_CONTAINER_ID in argv
+        ):
+            self.calls.append((argv, deadline, output_limit, env))
+            clean = not self.trusted_temp_dirty and not self.trusted_background_alive
+            return BrokerCommandResult(
+                returncode=0 if clean else 9,
+                stdout=b"clean\n" if clean else b"contaminated\n",
+                stderr=b"",
+            )
+        if argv[1:] == ("kill", "--signal=KILL", TRUSTED_CONTAINER_ID):
+            self.calls.append((argv, deadline, output_limit, env))
+            self.trusted_running = False
+            self.trusted_temp_dirty = False
+            self.trusted_background_alive = False
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{TRUSTED_CONTAINER_ID}\n".encode("ascii"),
+                stderr=b"",
+            )
+        if argv[1:3] == ("ps", "-aq") and f"id={TRUSTED_CONTAINER_ID}" in argv:
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{TRUSTED_CONTAINER_ID}\n".encode("ascii"),
+                stderr=b"",
+            )
+        if argv[1:] == ("rm", "-f", TRUSTED_CONTAINER_ID):
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{TRUSTED_CONTAINER_ID}\n".encode("ascii"),
+                stderr=b"",
+            )
+        return super().run(argv, deadline=deadline, output_limit=output_limit, env=env)
+
+
+class BlockingTrustedDockerRunner(MutatingWorkspaceDockerRunner):
+    def __init__(self, snapshot_path: Path) -> None:
+        super().__init__(snapshot_path)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        deadline: float,
+        output_limit: int,
+        env: dict[str, str],
+    ) -> BrokerCommandResult:
+        if argv[-3:] == ("bash", "-c", "cat tracked.txt") and TRUSTED_CONTAINER_ID in argv:
+            self.calls.append((argv, deadline, output_limit, env))
+            self.started.set()
+            if not self.release.wait(timeout=3):
+                raise AssertionError("trusted terminal test runner was not released")
+            return BrokerCommandResult(returncode=0, stdout=b"committed\n", stderr=b"")
+        return super().run(argv, deadline=deadline, output_limit=output_limit, env=env)
+
+
+class TimedOutTrustedContainerRunner(FakeDockerRunner):
+    def __init__(self, snapshot_path: Path) -> None:
+        super().__init__()
+        self.snapshot_path = snapshot_path
+        self.trusted_name = f"zeus-audit-trusted-{RUN_ID}"
+        self.trusted_id = TRUSTED_CONTAINER_ID
+        self.trusted_running = False
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        deadline: float,
+        output_limit: int,
+        env: dict[str, str],
+    ) -> BrokerCommandResult:
+        if argv[1:3] == ("inspect", "--format") and argv[-1] == self.trusted_id:
+            self.calls.append((argv, deadline, output_limit, env))
+            if argv[3] == audit_docker_broker._TRUSTED_STATE_FORMAT:
+                return BrokerCommandResult(
+                    returncode=0,
+                    stdout=_encoded_trusted_state(
+                        self.snapshot_path,
+                        running=self.trusted_running,
+                    ),
+                    stderr=b"",
+                )
+            else:
+                fields = (
+                    f'"{self.trusted_id}"',
+                    f'"/{self.trusted_name}"',
+                    f'"{IMAGE_ID}"',
+                    f'"{RUN_ID}"',
+                    '"true"',
+                )
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=("\t".join(fields) + "\n").encode("ascii"),
+                stderr=b"",
+            )
+        if argv[1:] == ("start", self.trusted_id):
+            self.calls.append((argv, deadline, output_limit, env))
+            self.trusted_running = True
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{self.trusted_id}\n".encode("ascii"),
+                stderr=b"",
+            )
+        if (
+            argv[1] == "exec"
+            and self.trusted_id in argv
+            and "python3" in argv
+            and audit_docker_broker.ATTEST_SCRIPT in argv
+        ):
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(returncode=0, stdout=b"", stderr=b"")
+        if argv[-3:] == ("bash", "-c", "cat tracked.txt") and self.trusted_id in argv:
+            self.calls.append((argv, deadline, output_limit, env))
+            raise AuditDockerBrokerError("simulated trusted command timeout")
+        if argv[1:] == ("kill", "--signal=KILL", self.trusted_id):
+            self.calls.append((argv, deadline, output_limit, env))
+            self.trusted_running = False
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{self.trusted_id}\n".encode("ascii"),
+                stderr=b"",
+            )
+        if argv[1:] == ("rm", "-f", self.trusted_id):
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{self.trusted_id}\n".encode("ascii"),
+                stderr=b"",
+            )
+        if argv[1:3] == ("ps", "-aq") and f"id={self.trusted_id}" in argv:
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(
+                returncode=0,
+                stdout=f"{self.trusted_id}\n".encode("ascii"),
+                stderr=b"",
+            )
+        return super().run(argv, deadline=deadline, output_limit=output_limit, env=env)
+
+
+class MissingTrustedContainerRunner(FakeDockerRunner):
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        deadline: float,
+        output_limit: int,
+        env: dict[str, str],
+    ) -> BrokerCommandResult:
+        if argv[1:3] == ("ps", "-aq") and f"id={TRUSTED_CONTAINER_ID}" in argv:
+            self.calls.append((argv, deadline, output_limit, env))
+            return BrokerCommandResult(returncode=0, stdout=b"", stderr=b"")
+        return super().run(argv, deadline=deadline, output_limit=output_limit, env=env)
 
 
 class BlockingDockerRunner(FakeDockerRunner):
@@ -171,6 +531,9 @@ class AuditDockerBrokerTests(unittest.TestCase):
         self.trusted_executable.chmod(0o700)
         self.broker_dir = self.root / "broker"
         self.broker_dir.mkdir(mode=0o700)
+        self.snapshot_dir = self.root / "snapshot"
+        self.snapshot_dir.mkdir(mode=0o700)
+        (self.snapshot_dir / "tracked.txt").write_bytes(b"committed\n")
         self.prepared = PreparedAuditContainer(
             container_id=CONTAINER_ID,
             container_name=f"zeus-audit-{RUN_ID}",
@@ -186,19 +549,42 @@ class AuditDockerBrokerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
+    def test_trusted_snapshot_attestor_is_valid_isolated_python(self) -> None:
+        compile(audit_docker_broker.ATTEST_SCRIPT, "<trusted-snapshot-attestor>", "exec")
+
     def _install(
         self,
         *,
         runner: FakeDockerRunner | None = None,
         limits=HARD_LIMITS,
         deadline: float | None = None,
+        trusted_command_scripts: tuple[str, ...] = (),
     ) -> Path:
+        prepared = (
+            replace(
+                self.prepared,
+                trusted_container_id=TRUSTED_CONTAINER_ID,
+                trusted_container_name=f"zeus-audit-trusted-{RUN_ID}",
+                trusted_snapshot_path=str(self.snapshot_dir),
+                trusted_snapshot_device=self.snapshot_dir.lstat().st_dev,
+                trusted_snapshot_inode=self.snapshot_dir.lstat().st_ino,
+                trusted_snapshot_owner=self.snapshot_dir.lstat().st_uid,
+                trusted_snapshot_mode=stat.S_IMODE(self.snapshot_dir.lstat().st_mode),
+                trusted_execution_uid=os.geteuid(),
+                trusted_execution_gid=os.getegid(),
+            )
+            if trusted_command_scripts
+            else self.prepared
+        )
         return install_audit_docker_broker(
-            self.prepared,
+            prepared,
             docker_executable=self.trusted_executable,
             limits=limits,
             deadline=self.deadline if deadline is None else deadline,
             python_executable=self.trusted_executable,
+            target_commit=TARGET_COMMIT,
+            snapshot_digest=SNAPSHOT_DIGEST,
+            trusted_command_scripts=trusted_command_scripts,
         )
 
     def _invoke(
@@ -355,6 +741,370 @@ class AuditDockerBrokerTests(unittest.TestCase):
             },
             state.hermes_labels,
         )
+        self.assertEqual(TARGET_COMMIT, state.target_commit)
+        self.assertEqual(SNAPSHOT_DIGEST, state.snapshot_digest)
+        self.assertEqual(1, len(state.terminal_receipts))
+        receipt = state.terminal_receipts[0]
+        self.assertEqual("terminal-000001", receipt.receipt_id)
+        self.assertEqual(1, receipt.sequence)
+        self.assertEqual("exited", receipt.state)
+        self.assertEqual(0, receipt.returncode)
+        self.assertIsNotNone(receipt.duration_ms)
+        self.assertEqual(3, receipt.stdout_bytes)
+        self.assertEqual(0, receipt.stderr_bytes)
+        self.assertRegex(receipt.command_tag, r"^hmac-sha256:[0-9a-f]{64}$")
+        assert state.receipt_hmac_key is not None
+        self.assertEqual(
+            receipt.command_tag,
+            expected_command_receipt_tag(
+                key_hex=state.receipt_hmac_key,
+                run_id=RUN_ID,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
+                image_id=IMAGE_ID,
+                command_script="printf audited",
+                receipt=receipt,
+            ),
+        )
+        self.assertNotEqual(
+            receipt.command_tag,
+            expected_command_receipt_tag(
+                key_hex=state.receipt_hmac_key,
+                run_id=RUN_ID,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
+                image_id=IMAGE_ID,
+                command_script="true",
+                receipt=receipt,
+            ),
+        )
+        state_bytes = self.prepared.state_path.read_bytes()
+        self.assertNotIn(b"printf audited", state_bytes)
+        self.assertNotIn(b"ok\\n", state_bytes)
+
+    def test_coverage_command_uses_fresh_read_only_snapshot_after_ad_hoc_mutation(self) -> None:
+        runner = MutatingWorkspaceDockerRunner(self.snapshot_dir)
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        self._advance_to_terminal(runner=runner)
+
+        mutated = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "printf 'mutated\\n' > tracked.txt",
+            runner=runner,
+        )
+        trusted = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "cat tracked.txt",
+            runner=runner,
+        )
+
+        self.assertEqual(0, mutated.returncode)
+        self.assertEqual(b"committed\n", trusted.stdout)
+        trusted_calls = [
+            call[0]
+            for call in runner.calls
+            if call[0][1] == "exec"
+            and TRUSTED_CONTAINER_ID in call[0]
+            and call[0][-3:] == ("bash", "-c", "cat tracked.txt")
+        ]
+        self.assertEqual(1, len(trusted_calls))
+        trusted_argv = trusted_calls[0]
+        self.assertNotIn(CONTAINER_ID, trusted_argv)
+        trusted_index = trusted_argv.index(TRUSTED_CONTAINER_ID)
+        self.assertEqual(
+            ("/usr/bin/env", "-i", *TRUSTED_EXEC_ENV),
+            trusted_argv[trusted_index + 1 : -3],
+        )
+        self.assertIn(("start", TRUSTED_CONTAINER_ID), [call[0][1:] for call in runner.calls])
+        self.assertIn(
+            ("kill", "--signal=KILL", TRUSTED_CONTAINER_ID),
+            [call[0][1:] for call in runner.calls],
+        )
+        self.assertFalse(
+            any(
+                call[0][1:] == ("exec", CONTAINER_ID, "bash", "-c", "cat tracked.txt")
+                for call in runner.calls
+            )
+        )
+
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        trusted_receipt = state.terminal_receipts[1]
+        assert state.receipt_hmac_key is not None
+        self.assertEqual(
+            trusted_receipt.command_tag,
+            expected_command_receipt_tag(
+                key_hex=state.receipt_hmac_key,
+                run_id=RUN_ID,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
+                image_id=IMAGE_ID,
+                command_script="cat tracked.txt",
+                receipt=trusted_receipt,
+                isolated_workspace=True,
+            ),
+        )
+        self.assertNotEqual(
+            trusted_receipt.command_tag,
+            expected_command_receipt_tag(
+                key_hex=state.receipt_hmac_key,
+                run_id=RUN_ID,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
+                image_id=IMAGE_ID,
+                command_script="cat tracked.txt",
+                receipt=trusted_receipt,
+            ),
+        )
+        state_bytes = self.prepared.state_path.read_bytes()
+        self.assertNotIn(b"cat tracked.txt", state_bytes)
+        self.assertNotIn(b"mutated", state_bytes)
+        self.assertNotIn(b"committed", state_bytes)
+
+    def test_trusted_sandbox_reset_clears_background_processes_and_tmpfs(self) -> None:
+        runner = MutatingWorkspaceDockerRunner(self.snapshot_dir)
+        commands = (
+            "spawn background and dirty temp",
+            "verify pristine trusted sandbox",
+        )
+        self._install(trusted_command_scripts=commands)
+        self._advance_to_terminal(runner=runner)
+
+        first = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            commands[0],
+            runner=runner,
+        )
+        second = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            commands[1],
+            runner=runner,
+        )
+
+        self.assertEqual((0, b"spawned\n"), (first.returncode, first.stdout))
+        self.assertEqual((0, b"clean\n"), (second.returncode, second.stdout))
+        real_arguments = [call[0][1:] for call in runner.calls]
+        self.assertEqual(2, real_arguments.count(("start", TRUSTED_CONTAINER_ID)))
+        self.assertEqual(
+            2,
+            real_arguments.count(("kill", "--signal=KILL", TRUSTED_CONTAINER_ID)),
+        )
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        self.assertEqual(("exited", "exited"), tuple(r.state for r in state.terminal_receipts))
+        self.assertIsNone(state.active_trusted_receipt_id)
+
+    def test_concurrent_trusted_call_is_refused_without_blocking_ordinary_terminal(self) -> None:
+        runner = BlockingTrustedDockerRunner(self.snapshot_dir)
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        self._advance_to_terminal(runner=runner)
+        result: list[BrokerCommandResult] = []
+
+        thread = threading.Thread(
+            target=lambda: result.append(
+                self._invoke(
+                    "exec",
+                    CONTAINER_ID,
+                    "bash",
+                    "-c",
+                    "cat tracked.txt",
+                    runner=runner,
+                )
+            )
+        )
+        thread.start()
+        self.assertTrue(runner.started.wait(timeout=2))
+        refused = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "cat tracked.txt",
+            runner=runner,
+        )
+        ordinary = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "printf ordinary",
+            runner=runner,
+        )
+        runner.release.set()
+        thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(126, refused.returncode)
+        self.assertEqual((0, b"ok\n"), (ordinary.returncode, ordinary.stdout))
+        self.assertEqual((0, b"committed\n"), (result[0].returncode, result[0].stdout))
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        self.assertEqual(2, state.terminal_calls)
+        self.assertEqual(0, state.active_terminal_calls)
+        self.assertIsNone(state.active_trusted_receipt_id)
+
+    def test_failed_attestation_never_executes_trusted_command(self) -> None:
+        runner = MutatingWorkspaceDockerRunner(self.snapshot_dir)
+        runner.attestor_returncode = 9
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        self._advance_to_terminal(runner=runner)
+
+        result = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "cat tracked.txt",
+            runner=runner,
+        )
+
+        self.assertEqual(126, result.returncode)
+        self.assertFalse(
+            any(
+                call[0][-3:] == ("bash", "-c", "cat tracked.txt")
+                and TRUSTED_CONTAINER_ID in call[0]
+                for call in runner.calls
+            )
+        )
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        self.assertTrue(state.limit_breach)
+        self.assertEqual("execution_failed", state.terminal_receipts[0].state)
+
+    def test_snapshot_root_identity_drift_refuses_trusted_start(self) -> None:
+        runner = MutatingWorkspaceDockerRunner(self.snapshot_dir)
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        self._advance_to_terminal(runner=runner)
+        self.snapshot_dir.chmod(0o755)
+        try:
+            result = self._invoke(
+                "exec",
+                CONTAINER_ID,
+                "bash",
+                "-c",
+                "cat tracked.txt",
+                runner=runner,
+            )
+        finally:
+            self.snapshot_dir.chmod(0o700)
+
+        self.assertEqual(126, result.returncode)
+        self.assertNotIn(
+            ("start", TRUSTED_CONTAINER_ID),
+            [call[0][1:] for call in runner.calls],
+        )
+
+    def test_broker_revalidates_full_trusted_isolation_before_each_start(self) -> None:
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        mutations = {
+            "environment": (12, ["HOME=/tmp"]),
+            "pid namespace": (20, "host"),
+            "uts namespace": (22, "host"),
+            "user namespace": (23, "host"),
+            "cgroup namespace": (24, "host"),
+            "device": (25, [{"PathOnHost": "/dev/null"}]),
+            "port": (29, {"80/tcp": [{"HostPort": "8080"}]}),
+            "requested mount": (35, []),
+            "log persistence": (37, {"Type": "json-file", "Config": {}}),
+            "effective mount": (39, []),
+            "effective network": (41, {"bridge": {}}),
+        }
+        for name, (index, replacement) in mutations.items():
+            with self.subTest(name=name):
+                fields = list(_trusted_state_fields(self.snapshot_dir, running=False))
+                fields[index] = replacement
+                result = BrokerCommandResult(
+                    returncode=0,
+                    stdout=_encode_trusted_fields(tuple(fields)),
+                    stderr=b"",
+                )
+                self.assertFalse(
+                    audit_docker_broker._trusted_state_matches(
+                        state,
+                        result,
+                        running=False,
+                    )
+                )
+
+    def test_trusted_container_timeout_is_validated_and_removed_without_orphan(self) -> None:
+        runner = TimedOutTrustedContainerRunner(self.snapshot_dir)
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        self._advance_to_terminal(runner=runner)
+
+        result = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "cat tracked.txt",
+            runner=runner,
+        )
+
+        self.assertEqual(126, result.returncode)
+        real_arguments = [call[0][1:] for call in runner.calls]
+        self.assertIn(("rm", "-f", runner.trusted_id), real_arguments)
+        trusted_remove_index = real_arguments.index(("rm", "-f", runner.trusted_id))
+        main_remove_index = real_arguments.index(("rm", "-f", CONTAINER_ID))
+        self.assertLess(trusted_remove_index, main_remove_index)
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        self.assertTrue(state.limit_breach)
+        self.assertEqual("terminal execution failure", state.breach_reason)
+        self.assertEqual("execution_failed", state.terminal_receipts[0].state)
+
+    def test_missing_trusted_container_cleanup_is_idempotent_and_removes_main(self) -> None:
+        runner = MissingTrustedContainerRunner()
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        self._advance_to_terminal(runner=runner)
+
+        result = self._invoke("rm", "-f", CONTAINER_ID, runner=runner)
+
+        self.assertEqual(0, result.returncode)
+        real_arguments = [call[0][1:] for call in runner.calls]
+        self.assertIn(("rm", "-f", CONTAINER_ID), real_arguments)
+        self.assertNotIn(("rm", "-f", TRUSTED_CONTAINER_ID), real_arguments)
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        self.assertEqual("complete", state.cleanup_state)
+        self.assertEqual("closed", state.phase)
+
+    def test_nonzero_terminal_exit_is_recorded_without_changing_command_output(self) -> None:
+        self._install()
+        self._advance_to_terminal()
+        self.runner.command_results["secret-bearing-command"] = BrokerCommandResult(
+            returncode=7,
+            stdout=b"public-output",
+            stderr=b"public-error",
+        )
+
+        result = self._invoke(
+            "exec",
+            CONTAINER_ID,
+            "bash",
+            "-c",
+            "secret-bearing-command",
+        )
+
+        self.assertEqual(7, result.returncode)
+        self.assertEqual(b"public-output", result.stdout)
+        self.assertEqual(b"public-error", result.stderr)
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        receipt = state.terminal_receipts[0]
+        self.assertEqual("exited", receipt.state)
+        self.assertEqual(7, receipt.returncode)
+        self.assertEqual(len(result.stdout), receipt.stdout_bytes)
+        self.assertEqual(len(result.stderr), receipt.stderr_bytes)
+        state_bytes = self.prepared.state_path.read_bytes()
+        self.assertNotIn(b"secret-bearing-command", state_bytes)
+        self.assertNotIn(b"public-output", state_bytes)
+        self.assertNotIn(b"public-error", state_bytes)
 
     def test_protocol_removal_refuses_each_outstanding_terminal_signal(self) -> None:
         self._install()
@@ -365,11 +1115,26 @@ class AuditDockerBrokerTests(unittest.TestCase):
             bootstrap_complete=True,
             session_id="0123456789ab",
         )
+        inflight = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="inflight",
+            returncode=None,
+            duration_ms=None,
+            stdout_bytes=None,
+            stderr_bytes=None,
+        )
         scenarios = {
             "active call": replace(terminal, active_terminal_calls=1),
             "output reservation": replace(
                 terminal,
                 aggregate_reserved_output_bytes=terminal.per_call_reserved_output_bytes,
+            ),
+            "inflight receipt": replace(
+                terminal,
+                terminal_calls=1,
+                terminal_receipts=(inflight,),
             ),
         }
 
@@ -435,16 +1200,58 @@ class AuditDockerBrokerTests(unittest.TestCase):
     def test_closed_state_rejects_outstanding_terminal_work(self) -> None:
         self._install()
         state = read_audit_docker_broker_state(self.prepared.state_path)
+        inflight = AuditCommandReceipt(
+            receipt_id="terminal-000001",
+            sequence=1,
+            command_tag="hmac-sha256:" + "a" * 64,
+            state="inflight",
+            returncode=None,
+            duration_ms=None,
+            stdout_bytes=None,
+            stderr_bytes=None,
+        )
         invalid = replace(
             state,
             phase="closed",
             cleanup_state="complete",
+            terminal_calls=1,
             active_terminal_calls=1,
             aggregate_reserved_output_bytes=state.per_call_reserved_output_bytes,
+            terminal_receipts=(inflight,),
         )
 
         with self.assertRaises(AuditDockerBrokerError):
             audit_docker_broker._decode_state(audit_docker_broker._state_bytes(invalid))
+
+    def test_malformed_state_always_raises_broker_error(self) -> None:
+        malformed_states = (
+            b"",
+            b"{}",
+            b'{"schema_version":2}',
+            b'{"schema_version":999,"unknown":true}',
+        )
+
+        for data in malformed_states:
+            with self.subTest(data=data), self.assertRaises(AuditDockerBrokerError):
+                audit_docker_broker._decode_state(data)
+
+    def test_schema_v1_state_remains_readable(self) -> None:
+        self._install()
+        with audit_docker_broker._locked_state(self.prepared.state_path) as locked:
+            current = audit_docker_broker._read_state_unlocked(locked)
+            audit_docker_broker._write_state_unlocked(
+                locked,
+                replace(current, schema_version=1),
+            )
+
+        legacy = read_audit_docker_broker_state(self.prepared.state_path)
+
+        self.assertEqual(1, legacy.schema_version)
+        self.assertEqual("expect_version", legacy.phase)
+        self.assertIsNone(legacy.target_commit)
+        self.assertIsNone(legacy.snapshot_digest)
+        self.assertIsNone(legacy.receipt_hmac_key)
+        self.assertEqual((), legacy.terminal_receipts)
 
     def test_storage_probe_is_optional_and_emulated_without_create_or_run(self) -> None:
         self._install()
@@ -1097,15 +1904,34 @@ class AuditDockerBrokerTests(unittest.TestCase):
                     limits=HARD_LIMITS,
                     deadline=sealed_deadline,
                     python_executable=self.trusted_executable,
+                    target_commit=TARGET_COMMIT,
+                    snapshot_digest=SNAPSHOT_DIGEST,
                 )
                 with audit_docker_broker._locked_state(prepared.state_path) as locked:
                     state = audit_docker_broker._read_state_unlocked(locked)
                     orphaned = replace(
                         state,
                         phase=phase,
+                        terminal_calls=active_calls,
                         active_terminal_calls=active_calls,
                         aggregate_reserved_output_bytes=(
                             state.per_call_reserved_output_bytes * active_calls
+                        ),
+                        terminal_receipts=(
+                            (
+                                AuditCommandReceipt(
+                                    receipt_id="terminal-000001",
+                                    sequence=1,
+                                    command_tag="hmac-sha256:" + "a" * 64,
+                                    state="inflight",
+                                    returncode=None,
+                                    duration_ms=None,
+                                    stdout_bytes=None,
+                                    stderr_bytes=None,
+                                ),
+                            )
+                            if active_calls
+                            else ()
                         ),
                     )
                     audit_docker_broker._write_state_unlocked(locked, orphaned)
@@ -1136,6 +1962,8 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 limits=HARD_LIMITS,
                 deadline=self.deadline,
                 python_executable=self.trusted_executable,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
             )
 
         self.broker_dir.chmod(0o755)
@@ -1157,6 +1985,8 @@ class AuditDockerBrokerTests(unittest.TestCase):
             limits=HARD_LIMITS,
             deadline=self.deadline,
             python_executable=self.trusted_executable,
+            target_commit=TARGET_COMMIT,
+            snapshot_digest=SNAPSHOT_DIGEST,
         )
         self.assertEqual(self.broker_dir / "docker", executable)
 
@@ -1171,6 +2001,8 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 limits=HARD_LIMITS,
                 deadline=self.deadline,
                 python_executable=self.trusted_executable,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
             )
 
     def test_installation_rejects_executables_owned_by_an_unrelated_user(self) -> None:
@@ -1209,6 +2041,8 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 limits=HARD_LIMITS,
                 deadline=self.deadline,
                 python_executable=self.trusted_executable,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
             )
 
     def test_deadline_is_resampled_after_waiting_for_the_state_lock(self) -> None:

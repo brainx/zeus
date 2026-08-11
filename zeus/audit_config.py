@@ -14,6 +14,7 @@ from zeus.audit_models import (
     AuditLimits,
     SuggestedCommand,
 )
+from zeus.audit_surface import SECURITY_CONTROL_IDS
 from zeus.private_io import (
     ensure_private_directory,
     read_private_bytes,
@@ -62,6 +63,7 @@ _REGISTRY_AUTHORITY_RE = re.compile(
 )
 _IMAGE_PATH_COMPONENT_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*$")
 _IMAGE_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+_SUGGESTED_COMMAND_RECORD_FIELDS = frozenset({"argv", "control_ids"})
 _TOP_LEVEL_FIELDS = frozenset(
     {
         "schema_version",
@@ -249,6 +251,7 @@ def _suggested_commands(value: object) -> tuple[SuggestedCommand, ...]:
             _error("suggested command names must be strings")
         names.append(name)
     commands: list[SuggestedCommand] = []
+    command_names_by_argv: dict[tuple[str, ...], str] = {}
     for name in sorted(names):
         if (
             not name
@@ -258,7 +261,31 @@ def _suggested_commands(value: object) -> tuple[SuggestedCommand, ...]:
             _error("suggested command names must be non-empty text strings")
         if name in AUDIT_RESERVED_CHECK_NAMES:
             _error("suggested command name is reserved by Zeus")
-        argv = value[name]
+        raw_command = value[name]
+        control_ids: tuple[str, ...] = ()
+        if isinstance(raw_command, dict):
+            if frozenset(raw_command) != _SUGGESTED_COMMAND_RECORD_FIELDS:
+                _error(f"suggested command {name} record must contain exactly argv and control_ids")
+            argv = raw_command["argv"]
+            raw_control_ids = raw_command["control_ids"]
+            if not isinstance(raw_control_ids, list) or len(raw_control_ids) > len(
+                SECURITY_CONTROL_IDS
+            ):
+                _error(f"suggested command {name} control_ids must be a bounded list")
+            parsed_control_ids: list[str] = []
+            for control_id in raw_control_ids:
+                if (
+                    not isinstance(control_id, str)
+                    or control_id not in SECURITY_CONTROL_IDS
+                    or control_id in parsed_control_ids
+                ):
+                    _error(
+                        f"suggested command {name} control_ids must contain unique known controls"
+                    )
+                parsed_control_ids.append(control_id)
+            control_ids = tuple(parsed_control_ids)
+        else:
+            argv = raw_command
         if not isinstance(argv, list) or not argv:
             _error(f"suggested command {name} must be a non-empty argv list")
         parsed_argv: list[str] = []
@@ -268,7 +295,15 @@ def _suggested_commands(value: object) -> tuple[SuggestedCommand, ...]:
             if index == 0 and not argument:
                 _error(f"suggested command {name} executable must not be empty")
             parsed_argv.append(argument)
-        commands.append(SuggestedCommand(name=name, argv=tuple(parsed_argv)))
+        command_argv = tuple(parsed_argv)
+        duplicate_name = command_names_by_argv.get(command_argv)
+        if duplicate_name is not None:
+            _error(
+                f"suggested commands {duplicate_name} and {name} have identical argv; "
+                "combine control_ids on one command"
+            )
+        command_names_by_argv[command_argv] = name
+        commands.append(SuggestedCommand(name=name, argv=command_argv, control_ids=control_ids))
     return tuple(commands)
 
 
