@@ -380,7 +380,11 @@ class AuditContainerTests(unittest.TestCase):
                             "Source": str(self.snapshot_root),
                             "Target": "/workspace",
                             "ReadOnly": True,
-                            "BindOptions": {},
+                            "BindOptions": {
+                                "Propagation": "rprivate",
+                                "ReadOnlyNonRecursive": False,
+                                "ReadOnlyForceRecursive": False,
+                            },
                         }
                     ],
                     "CapAdd": None,
@@ -685,7 +689,7 @@ class AuditContainerTests(unittest.TestCase):
         self.assertIn("--log-driver=none", trusted_create)
         self.assertIn("--restart=no", trusted_create)
         self.assertIn(
-            f"type=bind,src={self.snapshot_root},dst=/workspace,readonly",
+            f"type=bind,src={self.snapshot_root},dst=/workspace,readonly,bind-propagation=rprivate",
             trusted_create,
         )
         for item in audit_container.TRUSTED_EXEC_ENV:
@@ -871,6 +875,51 @@ class AuditContainerTests(unittest.TestCase):
                         "Destination": "/host",
                         "RW": False,
                     },
+                ],
+            ),
+            "writable recursive submounts": (
+                "HostConfig.Mounts",
+                [
+                    {
+                        "Type": "bind",
+                        "Source": str(self.snapshot_root),
+                        "Target": "/workspace",
+                        "ReadOnly": True,
+                        "BindOptions": {
+                            "Propagation": "rprivate",
+                            "ReadOnlyNonRecursive": True,
+                        },
+                    }
+                ],
+            ),
+            "missing private propagation": (
+                "HostConfig.Mounts",
+                [
+                    {
+                        "Type": "bind",
+                        "Source": str(self.snapshot_root),
+                        "Target": "/workspace",
+                        "ReadOnly": True,
+                        "BindOptions": {
+                            "ReadOnlyNonRecursive": False,
+                            "ReadOnlyForceRecursive": False,
+                        },
+                    }
+                ],
+            ),
+            "source mountpoint creation": (
+                "HostConfig.Mounts",
+                [
+                    {
+                        "Type": "bind",
+                        "Source": str(self.snapshot_root),
+                        "Target": "/workspace",
+                        "ReadOnly": True,
+                        "BindOptions": {
+                            "Propagation": "rprivate",
+                            "CreateMountpoint": True,
+                        },
+                    }
                 ],
             ),
         }

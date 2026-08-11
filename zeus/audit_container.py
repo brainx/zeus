@@ -299,7 +299,7 @@ class AuditContainerRuntime:
             f"--memory-swap={limits.memory_bytes}",
             *(f"--env={value}" for value in TRUSTED_EXEC_ENV),
             "--mount",
-            f"type=bind,src={snapshot_path},dst=/workspace,readonly",
+            f"type=bind,src={snapshot_path},dst=/workspace,readonly,bind-propagation=rprivate",
             f"--tmpfs={_TEMP_PATH}:{temp_tmpfs}",
             "--workdir=/workspace",
             "--entrypoint=/bin/sh",
@@ -846,11 +846,19 @@ class AuditContainerRuntime:
                     and requested.get("Consistency") in (None, "", "default")
                     and isinstance(bind_options, dict)
                     and set(bind_options).issubset(
-                        {"Propagation", "NonRecursive", "CreateMountpoint"}
+                        {
+                            "Propagation",
+                            "NonRecursive",
+                            "CreateMountpoint",
+                            "ReadOnlyNonRecursive",
+                            "ReadOnlyForceRecursive",
+                        }
                     )
-                    and bind_options.get("Propagation") in (None, "", "rprivate")
+                    and bind_options.get("Propagation") == "rprivate"
                     and bind_options.get("NonRecursive") in (None, False)
                     and bind_options.get("CreateMountpoint") in (None, False)
+                    and bind_options.get("ReadOnlyNonRecursive") in (None, False)
+                    and bind_options.get("ReadOnlyForceRecursive") in (None, False, True)
                     and requested.get("VolumeOptions") in (None, {})
                     and requested.get("TmpfsOptions") in (None, {})
                 )
