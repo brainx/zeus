@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Added read-only `zeus reconcile list/show` and `zeus fleet status`, with
+  authenticated `/reconcile/runs`, `/reconcile/runs/<run-id>`, and `/fleet`
+  endpoints. History is paginated; fleet evidence includes observation age,
+  attention reasons, pending intent, and remaining restart budget.
+- Added schema-v7 indexes for ordered run history and per-bot latest results.
+  Normal startup upgrades state; read-only inspection refuses older schemas.
+- Added a disposable Ubuntu installed-wheel service recovery and backup/restore
+  drill before CI preview publication. The one-shot reconcile service preserves
+  its Zeus-owned gateway processes after the pass exits.
+- Fixed gateway child reaping, final-retry adoption, and PID command matching;
+  enforced an absolute inbound HTTP read deadline and bounded secret scanning.
+- Preserved committed profiles after post-commit interruption and withdrew audit
+  reports when durable publication fails. Bound audit receipts to the commands
+  actually executed and made reconciliation appends independent of prior results.
+- Added a restart stability window to retain retry budgets across brief recoveries
+  and downloadable CI preview artifacts with verified package metadata/checksums.
+
 - Security: resolved the relative `hermes` binary name against the daemon's
   base environment instead of profile dotenv content, and rejected profile
   dotenv assignments that steer executable, library, interpreter, or TLS-trust

@@ -15,7 +15,7 @@ from zeus.lifecycle import LifecycleEvent, LifecycleEventInput, serialize_lifecy
 from zeus.models import BotRecord, BotStatus, DesiredState
 from zeus.reconciliation import BotReconcileResult, ReconcileOutcome, ReconcileRunStart
 from zeus.sanitization import sanitize_details, sanitize_text
-from zeus.state import StateStore
+from zeus.state import SCHEMA_VERSION, StateStore
 
 
 def create_v2_database_with_bots(root: Path, *bot_ids: str) -> Path:
@@ -147,7 +147,7 @@ class LifecycleLedgerTests(unittest.TestCase):
                     "SELECT bot_id, last_event_id FROM bots ORDER BY bot_id"
                 ).fetchall()
 
-            self.assertEqual(6, version)
+            self.assertEqual(SCHEMA_VERSION, version)
             self.assertIn("last_event_id", columns)
             self.assertEqual(["alpha", "zeta"], [row["bot_id"] for row in events])
             self.assertEqual(
@@ -254,7 +254,7 @@ class LifecycleLedgerTests(unittest.TestCase):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
                 database = create_v2_database_with_bots(Path(tmp), "coder")
                 with closing(sqlite3.connect(database)) as conn:
-                    conn.execute("UPDATE schema_version SET version = 7")
+                    conn.execute("UPDATE schema_version SET version = 8")
                     conn.commit()
                     before = list(conn.iterdump())
                     self.assertEqual("delete", conn.execute("PRAGMA journal_mode").fetchone()[0])

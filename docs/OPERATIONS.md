@@ -46,9 +46,46 @@ when `ZEUS_ALLOW_UNAUTH_READS=1` is explicitly enabled. It opens the existing
 database read-only, requires the current schema version, and runs `SELECT 1`.
 It never creates or migrates a database and does not require bots to be running.
 
-A ready service returns `{"schema_version":6,"status":"ready"}`. State-store
+A ready service returns `{"schema_version":7,"status":"ready"}`. State-store
 failures return `503` with `error.code=not_ready`. If state initialization fails
 before the API binds, the process exits instead of serving `/ready`.
+
+## Service Ownership and Orderly Shutdown
+
+The bundled `zeus-reconcile.service` deliberately uses `KillMode=process`:
+gateways created by a one-shot reconciliation pass must survive that pass and
+later timer invocations. Zeus retains their exact process-generation ownership
+in PID markers and lifecycle state, with per-bot locks protecting operations.
+The API service retains systemd's default control-group cleanup, including its
+child gateways, when it stops or crashes.
+
+Stopping or disabling the reconciliation timer **does not stop gateways**.
+`KillMode=process` also means systemd does not clean up every descendant of the
+one-shot service. Use `zeus bot stop` for gateway shutdown; do not substitute
+unverified PID signals. Run trusted Hermes executables under the service account
+and investigate any unrecognized descendants before maintenance.
+
+Before a coordinated backup, restore, or upgrade, record which bots should be
+running afterward, stop automated/API lifecycle writers, and stop every bot:
+
+```bash
+sudo systemctl stop zeus-reconcile.timer zeus-reconcile.service zeus-api
+# Repeat for every bot, using the same Hermes executable configured for the service.
+bot_id=coder
+sudo -u zeus env ZEUS_STATE_DIR=/var/lib/zeus ZEUS_SQLITE_SYNCHRONOUS=FULL \
+  ZEUS_HERMES_BIN=/usr/local/bin/hermes \
+  /opt/zeus/.venv/bin/zeus bot stop "$bot_id"
+sudo -u zeus env ZEUS_STATE_DIR=/var/lib/zeus ZEUS_SQLITE_SYNCHRONOUS=FULL \
+  ZEUS_HERMES_BIN=/usr/local/bin/hermes \
+  /opt/zeus/.venv/bin/zeus bot inspect "$bot_id" --json
+```
+
+Verify each stop completed and ownership inspection reports no live gateway.
+If ownership is ambiguous or a stop fails, preserve the state and resolve that
+condition before replacing it. Keep other manual writers stopped throughout the
+snapshot. Stopping a bot commits `desired_state=stopped`; a quiesced backup
+therefore restores stopped bots. Explicitly start the intended bots after
+successful restoration and readiness checks.
 
 ## Backup
 
@@ -60,7 +97,10 @@ Keep the state root owned by `zeus:zeus` with mode `0750` or stricter so users
 outside the service group cannot traverse it; `zeus doctor` enforces that boundary.
 
 Use SQLite's backup API for the registry so the database snapshot is consistent
-even if Zeus is running:
+even if Zeus is running. A live database backup alone does not synchronize the
+profile archive with the registry. For a coordinated restorable snapshot, first
+complete the orderly shutdown above and leave all writers stopped until both
+the database and profile backups finish:
 
 ```bash
 sudo install -o zeus -g zeus -m 0750 -d /var/lib/zeus/backups
@@ -72,7 +112,8 @@ sudo -u zeus sqlite3 /var/lib/zeus/zeus.db \
 Archive the rest of the state tree separately:
 
 ```bash
-sudo tar --exclude='zeus/backups' -C /var/lib \
+sudo tar --exclude='zeus/backups' --exclude='zeus/zeus.db' \
+  --exclude='zeus/zeus.db-wal' --exclude='zeus/zeus.db-shm' -C /var/lib \
   -czf "/var/lib/zeus/backups/zeus-state-${backup_ts}.tar.gz" zeus
 sudo sha256sum \
   "/var/lib/zeus/backups/zeus-${backup_ts}.db" \
@@ -84,7 +125,8 @@ Back up `/etc/zeus/zeus.env` separately in a secret store. It may contain `ZEUS_
 
 ## Restore
 
-Stop scheduled reconciliation and the API before replacing state:
+Complete orderly shutdown, including every exact-owned gateway stop, before
+replacing state. Stopping these services alone is insufficient:
 
 ```bash
 restore_ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -92,8 +134,9 @@ sudo systemctl stop zeus-reconcile.timer zeus-reconcile.service zeus-api
 sudo mv /var/lib/zeus "/var/lib/zeus.before-restore-${restore_ts}"
 ```
 
-Restore the archived state tree, then replace the registry with the SQLite
-backup:
+Restore the archived state tree into the now-absent destination, then install
+the SQLite backup. Use an archive made with the exclusions above: it must not
+restore a stale database, WAL, or SHM alongside the standalone SQLite backup.
 
 ```bash
 sudo tar -C /var/lib -xzf /secure-backups/zeus-state-20260627T120000Z.tar.gz
@@ -119,17 +162,20 @@ aside before putting `/var/lib/zeus.before-restore-${restore_ts}` back.
 ## Migration Rollback
 
 The v2-to-v3 migration is one-way and creates the immutable lifecycle ledger.
-Schema v4 through schema v6 migrations are forward-only. V4 adds durable
+Schema v4 through schema v7 migrations are forward-only. V4 adds durable
 idempotency claims and responses; v5 adds desired state, pending lifecycle
 intent, and migration snapshots; v6 adds persisted reconciliation runs and
-ordered per-bot results. Take a pre-v4/v5/v6 SQLite backup and state-tree
+ordered per-bot results. V7 adds indexes for bounded reconciliation history
+queries without rewriting recorded events. Take a pre-v4/v5/v6/v7 SQLite backup and state-tree
 backup before upgrading; this is the required pre-migration database backup.
-Older binaries cannot use schema v6, so rolling back
+Older binaries cannot use a newer schema, including schema v7, so rolling back
 the executable requires restoring that backup. Zeus rejects a newer database
 rather than attempting a down migration; never hand-edit schema state.
 
 If a migration or startup fails after an upgrade, leave Zeus stopped, capture
-recent logs, and keep the failed state for inspection:
+recent logs, and keep the failed state for inspection. Confirm gateways were
+stopped before the upgrade; if any remain, resolve their ownership before
+moving the state directory:
 
 ```bash
 sudo systemctl stop zeus-reconcile.timer zeus-reconcile.service zeus-api
@@ -142,6 +188,40 @@ Check out and reinstall the previous known-good Zeus version, restore the
 pre-upgrade database and state tarball, then start the services and run
 `zeus doctor --strict`. Do not hand-edit `zeus.db` during rollback unless the
 backup is unavailable and the recovery plan has been reviewed.
+
+## Installed Service Recovery Drill
+
+The Ubuntu 24.04 GitHub-hosted package job runs
+`scripts/verify_service_recovery.sh` after wheel installation smoke checks and
+package metadata verification, before generating checksums and uploading the
+preview artifact. A failed drill blocks that upload.
+
+The drill installs the built wheel into a private temporary virtual environment
+and runs uniquely named copies of the bundled systemd units as the non-root
+runner account. Only disposable state under `/run/zeus-service-recovery.*` and
+the corresponding runtime unit files are used. The script requires explicit CI
+opt-in, a GitHub-hosted Linux runner, Ubuntu 24.04, systemd as PID 1, and sudo's
+non-root invoking identity. It refuses local and self-hosted execution. Bounded
+traps stop owned units and validate gateway UID, command, and process-start
+fingerprint before any fallback cleanup signal.
+
+Using packaged fake Hermes and a fixture readiness endpoint, the drill checks:
+
+- An API process interruption retains a pending start intent; systemd restarts
+  the API and retains its control-group child cleanup behavior.
+- A one-shot pass recovers the original operation exactly once, leaves a unique
+  gateway alive after unit exit, and preserves it across two timer passes.
+- After stopping services and the exact-owned gateway, a SQLite backup and
+  profile snapshot restore into a fresh state directory with identical managed
+  profile hashes and lifecycle ledger, a valid database, and stopped intent.
+- An explicit start after restore converges to a new owned generation; the
+  final Zeus stop clears the intent and leaves no fixture gateway alive.
+
+The driver opens even read-only SQLite connections as the service account,
+because WAL reads can create coordination sidecars. This drill covers process
+interruption and current-schema backup/restore. It does not exercise physical
+power loss, host reboot, older-schema rollback, or real Hermes/provider
+workloads, and is not a production recovery command.
 
 ## Logs
 

@@ -389,6 +389,9 @@ class RepoContractTests(unittest.TestCase):
                 "rm -rf dist\npython -m build",
                 "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
                 "twine check dist/*",
+                "sudo --preserve-env=GITHUB_ACTIONS,RUNNER_OS,RUNNER_ENVIRONMENT,"
+                "GITHUB_WORKSPACE,ZEUS_SERVICE_RECOVERY_DRILL "
+                'sh scripts/verify_service_recovery.sh "$(command -v python)"',
                 "sh scripts/generate_checksums.sh dist",
             ),
         }
@@ -480,9 +483,12 @@ class RepoContractTests(unittest.TestCase):
                 "rm -rf dist\npython -m build",
                 "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
                 "twine check dist/*",
+                "sudo --preserve-env=GITHUB_ACTIONS,RUNNER_OS,RUNNER_ENVIRONMENT,"
+                "GITHUB_WORKSPACE,ZEUS_SERVICE_RECOVERY_DRILL "
+                'sh scripts/verify_service_recovery.sh "$(command -v python)"',
                 "sh scripts/generate_checksums.sh dist",
             ),
-            _job_run_commands(package)[-4:],
+            _job_run_commands(package)[-5:],
         )
         self.assertNotRegex(package, r"(?m)^ {4,}if:")
         self.assertNotIn("continue-on-error:", package)

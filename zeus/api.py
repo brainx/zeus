@@ -36,6 +36,7 @@ from zeus.models import (
     RestartPolicy,
     validate_id,
 )
+from zeus.operator_api import is_operator_path, operator_response
 from zeus.process_lock import LockTimeoutError
 from zeus.rate_limit import TokenBucket
 from zeus.reconciliation import (
@@ -279,6 +280,15 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
         def _dispatch_get(self) -> None:
             path = self._normalized_path()
+            if is_operator_path(path):
+                self._require_key(read=False)
+                status, payload = operator_response(path, self.path, settings.database_path)
+                if status >= 400:
+                    error = payload["error"]
+                    self._json_error_response(status, error["code"], error["message"])
+                else:
+                    self._json(status, payload)
+                return
             is_history = path.startswith("/bots/") and path.endswith("/history")
             if path == "/health":
                 self._request_context.auth_outcome = "not_required"

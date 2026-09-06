@@ -62,6 +62,7 @@
                   "invalid_request",
                   "invalid_bot_id",
                   "unknown_bot",
+                  "unknown_reconcile_run",
                   "unknown_template",
                   "missing_api_key",
                   "invalid_api_key",
@@ -104,7 +105,7 @@
         "properties": {
           "schema_version": {
             "type": "integer",
-            "const": 6
+            "const": 7
           },
           "status": {
             "type": "string",
@@ -630,6 +631,479 @@
             "items": {
               "type": "object"
             }
+          }
+        }
+      },
+      "ReconcileRunMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_id",
+          "scope",
+          "requested_bot_id",
+          "source",
+          "force",
+          "reset_restart",
+          "started_at",
+          "finished_at",
+          "outcome",
+          "total",
+          "counts"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "bot",
+              "fleet"
+            ]
+          },
+          "requested_bot_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          },
+          "force": {
+            "type": "boolean"
+          },
+          "reset_restart": {
+            "type": "boolean"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "running",
+              "succeeded",
+              "completed_with_errors",
+              "interrupted"
+            ]
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "counts": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "healthy",
+              "changed",
+              "pending",
+              "action_required",
+              "error",
+              "skipped"
+            ],
+            "properties": {
+              "healthy": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "changed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "pending": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "action_required": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "error": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "skipped": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      },
+      "ReconcileHistoryResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bot_id",
+          "outcome",
+          "desired_state",
+          "observed_status",
+          "pid",
+          "action",
+          "message",
+          "error_code",
+          "event_id",
+          "started_at",
+          "finished_at",
+          "ordinal"
+        ],
+        "properties": {
+          "bot_id": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "changed",
+              "pending",
+              "action_required",
+              "error",
+              "skipped"
+            ]
+          },
+          "desired_state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "running",
+              "stopped",
+              null
+            ]
+          },
+          "observed_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "stopped",
+              "starting",
+              "running",
+              "failed",
+              "unknown",
+              null
+            ]
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "action": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ordinal": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ReconcileRunPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runs",
+          "next_before"
+        ],
+        "properties": {
+          "runs": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/ReconcileRunMetadata"
+            }
+          },
+          "next_before": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 2048
+          }
+        }
+      },
+      "ReconcileRunDetail": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run",
+          "results",
+          "next_after"
+        ],
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/ReconcileRunMetadata"
+          },
+          "results": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/ReconcileHistoryResult"
+            }
+          },
+          "next_after": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          }
+        }
+      },
+      "FleetObservation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_id",
+          "observed_at",
+          "age_seconds",
+          "outcome",
+          "reason",
+          "observed_status",
+          "pid"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "age_seconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "changed",
+              "pending",
+              "action_required",
+              "error",
+              "skipped"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "observed_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          }
+        }
+      },
+      "FleetOverviewItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bot_id",
+          "display_name",
+          "desired_state",
+          "stored_status",
+          "pid",
+          "restart_policy",
+          "restart_attempts",
+          "restart_max_attempts",
+          "restart_budget_remaining",
+          "next_restart_at",
+          "pending_action",
+          "created_at",
+          "stored_state_updated_at",
+          "observation",
+          "freshness",
+          "freshness_source",
+          "needs_attention",
+          "attention_reasons"
+        ],
+        "properties": {
+          "bot_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "desired_state": {
+            "type": "string"
+          },
+          "stored_status": {
+            "type": "string"
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "restart_policy": {
+            "type": "string"
+          },
+          "restart_attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "restart_max_attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "restart_budget_remaining": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "next_restart_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "pending_action": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "stored_state_updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FleetObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "freshness": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "fresh",
+              "stale",
+              "clock_skew"
+            ]
+          },
+          "freshness_source": {"type": "string", "const": "persisted_reconciliation"},
+          "needs_attention": {
+            "type": "boolean"
+          },
+          "attention_reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "FleetOverview": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "next_after",
+          "limit",
+          "attention_only",
+          "generated_at",
+          "stale_after_seconds",
+          "freshness_source",
+          "live_probe"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/FleetOverviewItem"
+            }
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "attention_only": {
+            "type": "boolean"
+          },
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "stale_after_seconds": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 86400
+          },
+          "freshness_source": {
+            "type": "string",
+            "const": "persisted_reconciliation"
+          },
+          "live_probe": {
+            "type": "boolean",
+            "const": false
           }
         }
       }
@@ -1588,6 +2062,435 @@
             "description": "Idempotency storage or capacity unavailable",
             "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          }
+        }
+      }
+    },
+    "/reconcile/runs": {
+      "get": {
+        "summary": "List persisted reconciliation runs, newest first",
+        "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum rows in this page.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "description": "Opaque exclusive cursor from next_before; preserve filters across pages.",
+            "schema": {
+              "type": "string",
+              "maxLength": 2048
+            }
+          },
+          {
+            "name": "outcome",
+            "in": "query",
+            "required": false,
+            "description": "",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "running",
+                "succeeded",
+                "completed_with_errors",
+                "interrupted"
+              ]
+            }
+          },
+          {
+            "name": "bot_id",
+            "in": "query",
+            "required": false,
+            "description": "Include bot-scoped runs requested for this bot and fleet runs containing its result.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List persisted reconciliation runs, newest first",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileRunPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing API key, invalid API key, or API key not configured",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "Retry-After": {
+                "description": "Seconds to wait before retrying authentication.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "API key is not configured or stored evidence is unavailable.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/reconcile/runs/{run_id}": {
+      "get": {
+        "summary": "Read run metadata and results in ordinal order",
+        "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum rows in this page.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "description": "",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "Exclusive ordinal from next_after; omit for the first page.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Read run metadata and results in ordinal order",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileRunDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing API key, invalid API key, or API key not configured",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "Retry-After": {
+                "description": "Seconds to wait before retrying authentication.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "API key is not configured or stored evidence is unavailable.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown reconciliation run.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/fleet": {
+      "get": {
+        "summary": "Read stored fleet state with reconciliation observation freshness",
+        "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum rows in this page.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "Exclusive bot-ID cursor from next_after.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attention_only",
+            "in": "query",
+            "required": false,
+            "description": "Filter before pagination; also accepts 1 or 0.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "stale_after_seconds",
+            "in": "query",
+            "required": false,
+            "description": "Observations older than this threshold need attention; these are not live health probes.",
+            "schema": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 86400,
+              "default": 120
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Read stored fleet state with reconciliation observation freshness",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FleetOverview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing API key, invalid API key, or API key not configured",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "Retry-After": {
+                "description": "Seconds to wait before retrying authentication.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "API key is not configured or stored evidence is unavailable.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }

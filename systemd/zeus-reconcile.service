@@ -5,6 +5,9 @@ After=zeus-api.service
 
 [Service]
 Type=oneshot
+# Zeus owns gateway generations beyond this one-shot's lifetime. Stop them with
+# zeus bot stop; stopping reconciliation must not kill an already registered gateway.
+KillMode=process
 User=zeus
 Group=zeus
 WorkingDirectory=/opt/zeus

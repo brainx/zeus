@@ -5,7 +5,7 @@ per-bot locks, then checks recorded gateway PIDs and enforces desired running
 for bots whose `restart_policy` is `on-failure`. It is designed to be run
 repeatedly by an operator, cron, or the bundled systemd timer.
 
-Each invocation creates a durable schema-v6 run and persists one ordered result
+Each invocation creates a durable reconciliation run and persists one ordered result
 per processed bot. Fleet passes snapshot bot IDs in sorted order, hold one fleet
 lock, and continue after bot-scoped failures. Previously committed bot changes
 are not rolled back when a later bot reports an error. Healthy no-op results are
@@ -15,10 +15,58 @@ Each result append validates the run metadata and counters, the new result, and
 its lifecycle-event link, then commits the result and updated counters in one
 transaction. Appends do not reload earlier results, so persistence work per bot
 does not grow with the number of bots already processed. Complete history is
-validated when a run is finalized, read, or marked interrupted, including result
+validated when a run is finalized, loaded through the full store reader, or marked interrupted, including result
 order, counters, timestamps, and lifecycle-event links. Corruption of previously
 stored results is detected at those boundaries rather than on every subsequent
 append; a failed validation leaves the run unchanged and does not report success.
+
+## Read Previous Runs
+
+`zeus reconcile list [--limit 50] [--before <cursor>] [--outcome <outcome>]
+[--bot-id <bot-id>] [--json]` lists persisted runs newest first, with run ID as
+the tie breaker. Outcomes are `running`, `succeeded`, `completed_with_errors`,
+and `interrupted`. The bot filter includes a bot-scoped request even before its
+first result, and fleet runs that contain a result for that bot.
+
+`zeus reconcile show <run-id> [--limit 50] [--after <ordinal>] [--json]`
+returns run metadata and results in ascending zero-based ordinal order. Omit
+`--after` for the first page. Page sizes are 1–100. List responses contain
+`runs` and `next_before`; detail responses contain `run`, `results`, and
+`next_after`. A null cursor means the page is complete. Preserve filters when
+following a cursor. Sparse bot filters may inspect additional candidate runs,
+using indexed membership checks. Each request reads one SQLite snapshot; a running run may
+accumulate more results between requests.
+
+These commands open existing schema-v7 state read-only. They neither initialize
+or migrate a database nor reconcile or inspect live processes. An absent,
+outdated, or unreadable store returns `not_ready`; an unknown run returns
+`unknown_reconcile_run`. Start the current Zeus service or another normal
+state-initializing command after a backed-up upgrade to apply the additive v7
+indexes. Page readers validate run metadata, selected results, contiguous page
+ordinals, and selected lifecycle links; they do not audit every unreturned row.
+
+## Fleet Evidence
+
+`zeus fleet status [--attention-only] [--limit 50] [--after <bot-id>]
+[--stale-after-seconds 120] [--json]` reads stored bot state and the newest
+reconciliation result from the bot's current incarnation. It includes desired
+and stored status, pending action, restart budget, and observation age. It does
+not refresh bot status or run an application health probe.
+
+Freshness is `unknown` without an observation, `fresh` when its age is at most
+the threshold, `stale` when older, or `clock_skew` when its timestamp is in the
+future. Thresholds accept 0–86400 seconds. Future timestamps report age zero
+and require attention. Missing/stale evidence, pending intent, state mismatch,
+failed/unknown status, exhausted retries, or a nonconverged reconcile outcome
+also require attention. A scheduled final retry still counts as remaining budget.
+Freshness concerns reconciliation evidence; it is not proof that a gateway or
+its upstream provider is currently healthy.
+
+Bots are sorted by ID, and the attention filter applies before pagination.
+Latest-observation lookups use an index, but an attention-only query may still
+inspect all remaining bots to find its page. SQLite readers preserve visibility
+of committed WAL data; SQLite may create coordination sidecars while the logical
+database contents remain unchanged.
 
 ## Recovery Semantics
 

@@ -559,7 +559,9 @@ class ApiBehaviorTests(unittest.TestCase):
             self.assertGreaterEqual(int(limited_headers["retry-after"]), 1)
             self.assertEqual(400, query_status)
             self.assertEqual("invalid_request", query_body["error"]["code"])
-            expected = b'{"schema_version": 6, "status": "ready"}'
+            expected = json.dumps(
+                {"schema_version": SCHEMA_VERSION, "status": "ready"}, sort_keys=True
+            ).encode()
             self.assertEqual((200, expected), (ready_status, ready_body))
             self.assertEqual((200, expected), (alias_status, alias_body))
             self.assertRegex(ready_headers["x-request-id"], r"^[0-9a-f]{32}$")
@@ -615,7 +617,12 @@ class ApiBehaviorTests(unittest.TestCase):
 
         for status, headers, body in responses:
             self.assertEqual(200, status)
-            self.assertEqual(b'{"schema_version": 6, "status": "ready"}', body)
+            self.assertEqual(
+                json.dumps(
+                    {"schema_version": SCHEMA_VERSION, "status": "ready"}, sort_keys=True
+                ).encode(),
+                body,
+            )
             self.assertRegex(headers["x-request-id"], r"^[0-9a-f]{32}$")
 
     def test_exception_status_payload_and_header_contracts(self) -> None:

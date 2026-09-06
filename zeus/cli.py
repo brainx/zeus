@@ -17,6 +17,7 @@ from zeus.doctor import report_to_json, report_to_text, run_doctor
 from zeus.envfile import ENV_KEY_RE
 from zeus.errors import ZeusConflictError
 from zeus.models import BotCreateRequest, BotStatus, BotStatusResponse, RestartPolicy, TemplateError
+from zeus.operator_cli import add_operator_parsers, run_operator_command
 from zeus.process_lock import LockTimeoutError
 from zeus.reconciliation import ReconcileLockTimeoutError, ReconcileRunSummary
 from zeus.state import StateStore
@@ -39,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     sub = parser.add_subparsers(dest="resource", required=True)
+    add_operator_parsers(sub)
 
     serve_description = "Run the local Zeus HTTP API server."
     serve_cmd = sub.add_parser(
@@ -579,6 +581,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.resource == "demo":
         return _run_demo(args, settings)
+
+    if args.resource in {"fleet", "reconcile"}:
+        return run_operator_command(args, settings.database_path)
 
     store, supervisor = _services(settings)
 
