@@ -183,3 +183,15 @@ jobs:
         run: ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh
       - name: Check package metadata
         run: twine check dist/*
+      - name: Generate preview checksums
+        run: sh scripts/generate_checksums.sh dist
+      - name: Upload verified preview artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zeus-preview-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7

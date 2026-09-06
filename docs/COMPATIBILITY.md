@@ -14,7 +14,7 @@ an untested platform or external Hermes release into a support claim.
 | Audit Docker isolation | Linux `ubuntu-24.04` | Python 3.11 | Real Docker containment, including network denial, host-secret exclusion, read-only root, and cleanup |
 | macOS process lifecycle | macOS `macos-26` | Python 3.13 | Focused process, fake-Hermes integration, and gateway-launcher recovery tests |
 | Real Hermes compatibility | Linux `ubuntu-24.04` | Python 3.11 | Hash-locked Hermes Agent 0.20.0 source install, profile rendering, strict diagnostics, sealed audit-broker transcript, loopback gateway readiness, process ownership, and clean shutdown without a model-provider credential |
-| Package build | Linux `ubuntu-24.04` | Python 3.11 | Wheel and source build, installed-wheel smoke test, dependency consistency, and metadata checks |
+| Package build | Linux `ubuntu-24.04` | Python 3.11 | Wheel and source build, installed-wheel smoke test, dependency consistency, metadata checks, and seven-day preview artifacts with checksums |
 | Tagged release build | Linux `ubuntu-24.04` | Python 3.11 | Full release gate, artifact checksums, and GitHub release artifacts |
 
 In short, the focused Linux lifecycle, audit-isolation, and package jobs use
@@ -34,6 +34,11 @@ pins Hermes Agent 0.20.0, whose package metadata requires Python 3.11 through
 The package metadata declares `requires-python = ">=3.11"`, while committed CI
 currently tests the versions listed above. A version absent from that matrix is
 not covered by the current automated compatibility claim.
+
+The package job uploads preview distributions after its checks pass, independently
+of the other CI jobs. Follow the [preview download instructions](RELEASE.md#ci-preview-builds)
+to inspect the full run and verify the downloaded checksums. Preview artifacts
+are retained for seven days and do not carry signed release evidence.
 
 ## SQLite durability compatibility
 
