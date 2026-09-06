@@ -350,6 +350,11 @@ recorded by Zeus as skipped. Check evidence in a finding must resolve to a
 recorded preflight or model check. For configured commands, Zeus derives one
 exact `shlex.join(argv)` script, routes that script to the trusted read-only
 snapshot, and verifies that the named check's isolated receipt tag matches it.
+The broker recognizes the pinned Hermes session wrapper only with its exact
+shell encoding, session ID, and `/workspace` working directory. It binds the
+receipt to the inner command and executes coverage commands directly in the
+trusted container's clean environment, without sourcing the primary container's
+session snapshot.
 A model cannot run `true`, `echo`, a wrapper, a shared-workspace command, or
 another command and relabel the receipt as the configured check.
 
