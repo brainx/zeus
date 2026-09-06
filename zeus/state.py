@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -63,6 +64,9 @@ class StateStore:
 
     def migrate(self) -> None:
         self._schema.migrate()
+
+    def defer_lifecycle_audit(self) -> AbstractContextManager[None]:
+        return self._bot_lifecycle.defer_audit_mirror()
 
     def claim_idempotency(
         self,

@@ -56,7 +56,11 @@ class _SupervisorRegistry(_SupervisorStatus):
     ) -> BotRecord:
         context = self._lifecycle_context(source, request_id)
         bot_id = validate_id(request.bot_id, "bot_id")
-        with self.bot_lock(bot_id), self._bot_process_lock(bot_id):
+        with (
+            self.store.defer_lifecycle_audit(),
+            self.bot_lock(bot_id),
+            self._bot_process_lock(bot_id),
+        ):
             existing = self.store.get_bot(bot_id)
             profile_path = Path(self.adapter.hermes_root) / "profiles" / bot_id
             profile_exists = os.path.lexists(profile_path)
@@ -133,7 +137,11 @@ class _SupervisorRegistry(_SupervisorStatus):
     ) -> BotStatusResponse:
         context = self._lifecycle_context(source, request_id)
         safe_bot_id = validate_id(bot_id, "bot_id")
-        with self.bot_lock(safe_bot_id), self._bot_process_lock(safe_bot_id):
+        with (
+            self.store.defer_lifecycle_audit(),
+            self.bot_lock(safe_bot_id),
+            self._bot_process_lock(safe_bot_id),
+        ):
             record = self._require_bot(safe_bot_id)
             if remove_profile:
                 self._safe_profile_path(safe_bot_id, record.profile_path)
@@ -212,7 +220,11 @@ class _SupervisorRegistry(_SupervisorStatus):
     ) -> dict[str, object]:
         context = self._lifecycle_context(source, request_id)
         safe_bot_id = validate_id(bot_id, "bot_id")
-        with self.bot_lock(safe_bot_id), self._bot_process_lock(safe_bot_id):
+        with (
+            self.store.defer_lifecycle_audit(),
+            self.bot_lock(safe_bot_id),
+            self._bot_process_lock(safe_bot_id),
+        ):
             record = self._require_bot(safe_bot_id)
             try:
                 profile_path = self._safe_profile_path(safe_bot_id, record.profile_path)
