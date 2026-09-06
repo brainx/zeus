@@ -6,7 +6,7 @@ address the same endpoint.
 
 The machine-readable OpenAPI contract is maintained in `docs/openapi.json`.
 
-All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. API keys must contain ASCII characters only; Zeus rejects a non-ASCII configured key at startup. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated low-risk `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose runtime state or logs, including `GET /bots/<bot-id>/logs`, `GET /bots/<bot-id>/inspect`, and `GET /bots/<bot-id>/history`, always require `x-zeus-api-key`.
+All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. API keys must contain ASCII characters only; Zeus rejects a non-ASCII configured key at startup. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated low-risk `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose runtime state or logs, including `GET /bots/<bot-id>/logs`, `GET /bots/<bot-id>/inspect`, `GET /bots/<bot-id>/diagnostics`, and `GET /bots/<bot-id>/history`, always require `x-zeus-api-key`.
 
 At startup Zeus rejects a non-loopback bind without an API key of at least 16
 characters, and rejects `ZEUS_ALLOW_UNAUTH_READS=1` on every non-loopback bind.
@@ -53,6 +53,33 @@ See [reconciliation](RECONCILE.md) for attention and clock-skew semantics.
 All three routes return `400 invalid_request` for invalid parameters and
 `503 not_ready` for unavailable or incompatible stored evidence. Every request
 reads one SQLite snapshot; pages requested later may reflect new runs or state.
+
+## Live Gateway Diagnostics
+
+`GET /bots/<bot-id>/diagnostics` (also `/v1/bots/<bot-id>/diagnostics`) always
+requires `x-zeus-api-key` and accepts no query parameters. It performs one
+bounded request to the launch-recorded Hermes 0.21 loopback API. The response
+contains `bot_id`, `observed_at`, `status`, `reason`, `process` (`pid`, `verified`),
+and `health` (a validated subset of Hermes's detailed readiness and counters,
+or `null`). It does not reconcile, recover pending operations, initialize
+state, signal processes, or update stored lifecycle observations.
+
+| `status` | Meaning |
+| --- | --- |
+| `ok` | The same owned gateway generation returned healthy detailed checks. |
+| `degraded` | The same gateway responded, but Hermes reports degraded readiness. |
+| `unavailable` | Credentials, runtime compatibility, or the health request prevented a valid observation. |
+| `not_running` | No recorded live gateway was observed. |
+| `unverified` | Ownership is unproven, an operation is pending, or state changed during the probe. |
+| `not_configured` | The recorded launch has no supported readiness endpoint. |
+
+An observed bot returns HTTP `200` even when its diagnostic status is not `ok`;
+clients must inspect `status` and `reason`. Invalid parameters return `400`,
+unknown bots `404 unknown_bot`, and unavailable state `503 not_ready`.
+`observed_at` timestamps this check; a later request can observe different state.
+No raw Hermes logs, configuration, free-form error details, or API credentials
+are returned. See [operations](OPERATIONS.md#live-gateway-diagnostics) for
+configuration and the limits of upstream readiness checks.
 
 ## Error Model
 

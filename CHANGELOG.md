@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added explicit live gateway diagnostics through `zeus bot diagnostics` and
+  the authenticated API. Results bind Hermes's detailed health response to
+  the observed gateway generation without changing lifecycle state.
+
 - Updated the real-Hermes baseline and sealed audit protocol to Hermes Agent
   0.21.0. The required broker check fails when the pinned runtime is missing or
   mismatched; runtime and build dependencies remain hash-locked.

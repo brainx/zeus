@@ -1101,7 +1101,8 @@ class RepoContractTests(unittest.TestCase):
                     "Python 3.11",
                     "Hash-locked Hermes Agent 0.21.0 source install, profile rendering, "
                     "strict diagnostics, sealed audit-broker transcript, loopback gateway "
-                    "readiness, process ownership, and clean shutdown without a "
+                    "readiness, authenticated live gateway diagnostics, process ownership, "
+                    "and clean shutdown without a "
                     "model-provider credential",
                 ),
             ),
@@ -1674,6 +1675,7 @@ class RepoContractTests(unittest.TestCase):
             "/bots/{bot_id}/logs",
             "/bots/{bot_id}/history",
             "/bots/{bot_id}/inspect",
+            "/bots/{bot_id}/diagnostics",
             "/bots/{bot_id}/start",
             "/bots/{bot_id}/stop",
             "/bots/{bot_id}/restart",

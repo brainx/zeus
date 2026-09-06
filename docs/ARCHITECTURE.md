@@ -266,3 +266,14 @@ strict authentication and use fixed route templates in access logs. Fleet
 observations are persisted reconciliation evidence with explicit timestamps,
 not live process or application-health probes. Cross-host consumers should
 preserve that distinction rather than treating a fresh row as a rollout gate.
+
+`bot_diagnostics` separately implements explicit live observations through
+`zeus bot diagnostics` and `GET /bots/<bot-id>/diagnostics`. It reads existing
+bot state without initializing it, captures a strict launch marker and owned
+gateway generation, and probes only that launch's loopback endpoint.
+`hermes_diagnostics` authenticates to Hermes 0.21's detailed-health route with a
+private profile credential, applies a total HTTP deadline and response bound,
+and projects only validated readiness fields. A second state and ownership
+check discards results if the generation changed. The probe never writes
+lifecycle state or triggers recovery; unavailable and degraded health remain
+explicit observations. Local API transport shares the trusted-host boundary.

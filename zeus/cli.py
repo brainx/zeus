@@ -13,6 +13,7 @@ from typing import cast
 from zeus import __version__
 from zeus.api import serve, template_to_dict
 from zeus.config import Settings, load_dotenv
+from zeus.diagnostics_cli import run_diagnostics_command
 from zeus.doctor import report_to_json, report_to_text, run_doctor
 from zeus.envfile import ENV_KEY_RE
 from zeus.errors import ZeusConflictError
@@ -313,6 +314,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="as_json",
         help="emit machine-readable JSON",
     )
+    diagnostics = bot_sub.add_parser(
+        "diagnostics", help="probe live gateway health without changing lifecycle state"
+    )
+    diagnostics.add_argument("bot_id", help="bot ID")
+    diagnostics.add_argument("--json", action="store_true", dest="as_json")
     history_description = "Show immutable lifecycle history."
     history = bot_sub.add_parser(
         "history",
@@ -586,6 +592,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.resource in {"fleet", "reconcile"}:
         return run_operator_command(args, settings.database_path)
+
+    if args.resource == "bot" and args.action == "diagnostics":
+        return run_diagnostics_command(args, settings)
 
     store, supervisor = _services(settings)
 

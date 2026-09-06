@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 from http import HTTPStatus
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
 
 from zeus.api_request import parse_query
+from zeus.bot_diagnostics import diagnose_bot
 from zeus.fleet_overview import FleetOverviewReader
 from zeus.reconcile_history import ReconcileHistoryReader
 from zeus.state import StateReadinessError
 
+if TYPE_CHECKING:
+    from zeus.supervisor import Supervisor
+
 
 def is_operator_path(path: str) -> bool:
-    return path == "/fleet" or path == "/reconcile/runs" or path.startswith("/reconcile/runs/")
+    return (
+        path == "/fleet"
+        or path == "/reconcile/runs"
+        or path.startswith("/reconcile/runs/")
+        or (path.startswith("/bots/") and path.endswith("/diagnostics"))
+    )
 
 
 def _integer(value: str | None, default: int | None = None) -> int | None:
@@ -31,8 +39,22 @@ def _error(status: HTTPStatus, code: str, message: str) -> tuple[HTTPStatus, dic
 
 
 def operator_response(
-    path: str, target: str, database_path: Path
+    path: str, target: str, supervisor: Supervisor
 ) -> tuple[HTTPStatus, dict[str, Any]]:
+    if path.startswith("/bots/") and path.endswith("/diagnostics"):
+        parse_query(target, frozenset())
+        parts = path.split("/")
+        if len(parts) != 4 or not parts[2]:
+            raise ValueError("invalid bot diagnostics route")
+        try:
+            bot_id = unquote(parts[2], errors="strict")
+        except UnicodeError as exc:
+            raise ValueError("invalid bot identifier") from exc
+        try:
+            return HTTPStatus.OK, diagnose_bot(supervisor, bot_id)
+        except StateReadinessError:
+            return _error(HTTPStatus.SERVICE_UNAVAILABLE, "not_ready", "bot state is unavailable")
+    database_path = supervisor.store.database_path
     if path == "/fleet":
         allowed = {"limit", "after", "attention_only", "stale_after_seconds"}
     elif path == "/reconcile/runs":

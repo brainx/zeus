@@ -39,8 +39,9 @@ The script:
 Gateway startup is opt-in. When enabled, the script starts the real Hermes
 gateway with the local `api_server` platform, binds it to loopback, passes a
 random per-run `API_SERVER_KEY`, verifies Zeus still reports the bot as running,
-asserts `inspect --json` ownership diagnostics, and probes Hermes `/health`
-before stopping the bot:
+asserts `inspect --json` ownership diagnostics, verifies authenticated
+`bot diagnostics --json` against Hermes 0.21's detailed health and PID, and
+probes Hermes `/health` before stopping the bot:
 
 ```bash
 ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
