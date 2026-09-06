@@ -6,6 +6,8 @@ import inspect
 import json
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +29,7 @@ from zeus.gateway_runtime import (
 )
 from zeus.hermes_adapter import HermesAdapter
 from zeus.models import BotRecord, BotStatus, DesiredState
+from zeus.process_identity import PidState
 from zeus.profile_manager import ProfileManager
 from zeus.state import StateStore
 from zeus.supervisor import Supervisor
@@ -148,6 +151,43 @@ class GatewayRuntimeTests(unittest.TestCase):
             proc_start_fingerprint=process_start,
         )
         return marker, generation
+
+    def test_pid_state_reaps_its_exited_child_before_liveness_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _record, _profile, _hermes = self._fixture(Path(tmp))
+            runtime.pid_alive_fn = None
+            with subprocess.Popen(
+                [sys.executable, "-B", "-c", "pass"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            ) as process:
+                runtime._processes[self.bot_id] = process
+                assert process.stdout is not None
+                process.stdout.read()
+                deadline = time.monotonic() + 1
+                while runtime.pid_state(process.pid) is not PidState.dead:
+                    if time.monotonic() >= deadline:
+                        self.fail("exited child was never reaped during liveness checks")
+                    time.sleep(0.01)
+                self.assertEqual(0, process.returncode)
+
+    def test_reaped_cached_handle_does_not_hide_a_reused_live_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, _record, _profile, _hermes = self._fixture(Path(tmp))
+
+            class ExitedChild:
+                pid = self.pid
+
+                def poll(self):
+                    return 0
+
+                def wait(self, *, timeout):
+                    raise AssertionError("must not wait for an already-exited PID owner")
+
+            runtime._processes[self.bot_id] = ExitedChild()
+
+            self.assertIs(PidState.alive, runtime.pid_state(self.pid))
+            self.assertFalse(runtime.wait_for_exit(self.bot_id, self.pid))
 
     def test_effects_are_frozen_bounded_and_do_not_retain_secret_fields(self) -> None:
         launch = LaunchEffect("failed", reason="x" * 2_000, readiness_message="z" * 2_000)

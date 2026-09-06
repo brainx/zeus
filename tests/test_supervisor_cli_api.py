@@ -2108,7 +2108,7 @@ class SupervisorCliApiTests(unittest.TestCase):
 
             limited = supervisor.reconcile("coder", now=datetime(2026, 1, 1, tzinfo=UTC))[0]
             self.assertEqual(BotStatus.failed, limited.status)
-            self.assertIn("restart limit reached: 1/1", limited.message)
+            self.assertIn("restart pending: attempt 1/1 due at", limited.message)
 
             restarted = supervisor.reconcile(
                 "coder",
