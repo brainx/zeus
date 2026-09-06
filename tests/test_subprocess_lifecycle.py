@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import subprocess
 import sys
 import tempfile
@@ -10,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from tests.host_capabilities import child_process_identity_available
+from zeus.process_identity import PidState, pid_state
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE_HERMES = ROOT / "tests" / "fixtures" / "fake_slow_hermes.py"
@@ -93,6 +95,72 @@ class SubprocessLifecycleTests(unittest.TestCase):
             self.assertEqual(["running", "running"], sorted(statuses))
             markers = self._wait_for_markers(root / "markers", "coder", 1)
             self.assertEqual(1, len(markers))
+
+    def test_cli_stop_completes_while_another_supervisor_holds_exited_gateway_child(self) -> None:
+        FAKE_HERMES.chmod(0o755)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = self._env(root)
+            self._run_cli(env, "bot", "create", "coder", "--template", "coding-bot")
+            parent = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    "import json, subprocess, sys, uuid\n"
+                    "from zeus.cli import _services\n"
+                    "from zeus.config import Settings\n"
+                    "_store, supervisor = _services(Settings.from_env())\n"
+                    "try:\n"
+                    "    result = supervisor.start(\n"
+                    "        'coder', source='api', request_id=uuid.uuid4().hex)\n"
+                    "    print(json.dumps({'pid': result.pid}), flush=True)\n"
+                    "    sys.stdin.read()\n"
+                    "finally:\n"
+                    "    for child in supervisor._runtime._processes.values():\n"
+                    "        if child.poll() is None:\n"
+                    "            child.terminate()\n"
+                    "        try:\n"
+                    "            child.wait(timeout=2)\n"
+                    "        except subprocess.TimeoutExpired:\n"
+                    "            child.kill()\n"
+                    "            child.wait(timeout=2)\n",
+                ],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert parent.stdout is not None
+                readable, _, _ = select.select([parent.stdout], [], [], 10)
+                self.assertTrue(readable, "gateway parent did not finish launch")
+                launched = parent.stdout.readline()
+                if not launched:
+                    _stdout, stderr = parent.communicate("", timeout=5)
+                    self.fail(f"gateway parent exited during launch: {stderr}")
+                child_pid = json.loads(launched)["pid"]
+                self.assertIsInstance(child_pid, int)
+                self.assertIs(PidState.alive, pid_state(child_pid))
+
+                stopped = self._run_cli(env, "bot", "stop", "coder", timeout=10)
+
+                self.assertEqual("stopped", json.loads(stopped.stdout)["status"])
+                self.assertIsNone(parent.poll())
+                # The owning supervisor has not observed or reaped its child.
+                # The separate CLI must recognize native exit state itself.
+                os.kill(child_pid, 0)
+                self.assertIs(PidState.dead, pid_state(child_pid))
+            finally:
+                try:
+                    _stdout, stderr = parent.communicate("", timeout=10)
+                except subprocess.TimeoutExpired:
+                    parent.kill()
+                    parent.communicate(timeout=5)
+                    raise
+            self.assertEqual(0, parent.returncode, stderr)
 
     def test_cli_process_fails_fast_when_lifecycle_lock_is_held(self) -> None:
         FAKE_HERMES.chmod(0o755)

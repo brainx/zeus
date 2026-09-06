@@ -17,6 +17,80 @@ import zeus.supervisor as supervisor_module
 
 
 class ProcessReaderTests(unittest.TestCase):
+    def test_linux_pid_state_uses_native_state_after_complete_command_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp)
+            pid_dir = proc_root / "4321"
+            pid_dir.mkdir()
+            for state in ("R", "S", "D", "T", "t", "I", "Z"):
+                with self.subTest(state=state):
+                    fields = [state, *["0"] * 18, "987654321", "0"]
+                    (pid_dir / "stat").write_text(
+                        f"4321 (a tricky ) Z (name)) {' '.join(fields)}\n",
+                        encoding="utf-8",
+                    )
+                    expected = identity.PidState.dead if state == "Z" else identity.PidState.alive
+                    self.assertIs(expected, identity.read_linux_pid_state(4321, proc_root))
+
+    def test_linux_pid_state_does_not_treat_missing_or_malformed_evidence_as_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc_root = Path(tmp)
+            pid_dir = proc_root / "4321"
+            pid_dir.mkdir()
+            fields = ["Z", *["0"] * 18, "987654321", "0"]
+            for stat in (
+                b"",
+                b"4321 (hermes) Z",
+                b"4321 hermes Z 0",
+                b"\xff",
+                f"4322 (hermes) {' '.join(fields)}".encode(),
+                f"4321 (hermes) {' '.join(['?', *fields[1:]])}".encode(),
+                f"4321 (hermes) {' '.join([*fields[:19], 'invalid'])}".encode(),
+            ):
+                with self.subTest(stat=stat):
+                    (pid_dir / "stat").write_bytes(stat)
+                    self.assertIs(
+                        identity.PidState.unknown, identity.read_linux_pid_state(4321, proc_root)
+                    )
+            self.assertIs(identity.PidState.unknown, identity.read_linux_pid_state(9999, proc_root))
+        with patch.object(Path, "read_text", side_effect=PermissionError):
+            self.assertIs(identity.PidState.unknown, identity.read_linux_pid_state(4321))
+
+    def test_darwin_pid_state_checks_bounded_ps_state_with_modifiers(self) -> None:
+        for state in ("R", "SN", "T+", "Us", "I<", "Z", "Z+", "Zs"):
+            completed = subprocess.CompletedProcess(args=["ps"], returncode=0, stdout=f" {state}\n")
+            with (
+                self.subTest(state=state),
+                patch("zeus.process_identity.subprocess.run", return_value=completed) as run,
+            ):
+                expected = identity.PidState.dead if state[0] == "Z" else identity.PidState.alive
+                self.assertIs(expected, identity.read_darwin_pid_state(4321))
+                run.assert_called_once_with(
+                    ["/bin/ps", "-p", "4321", "-o", "state="],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=1,
+                )
+
+    def test_darwin_pid_state_preserves_unknown_for_failed_or_malformed_probe(self) -> None:
+        for returncode, state in ((1, "Z"), (0, ""), (0, "Zombie"), (0, "Z\nR"), (0, "S?")):
+            completed = subprocess.CompletedProcess(
+                args=["ps"], returncode=returncode, stdout=state
+            )
+            with (
+                self.subTest(returncode=returncode, state=state),
+                patch("zeus.process_identity.subprocess.run", return_value=completed),
+            ):
+                self.assertIs(identity.PidState.unknown, identity.read_darwin_pid_state(4321))
+        for exc in (PermissionError(), subprocess.TimeoutExpired("ps", 1)):
+            with (
+                self.subTest(exc=exc),
+                patch("zeus.process_identity.subprocess.run", side_effect=exc),
+            ):
+                self.assertIs(identity.PidState.unknown, identity.read_darwin_pid_state(4321))
+
     def test_linux_cmdline_parses_proc_bytes_and_handles_missing_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             proc_root = Path(tmp) / "proc"
@@ -308,9 +382,63 @@ class PidStateTests(unittest.TestCase):
                 self.assertIs(expected, identity.pid_state(4321, pid_alive_fn=callback))
 
     def test_pid_state_default_probes_with_signal_zero(self) -> None:
-        with patch("zeus.process_identity.os.kill") as kill:
+        with (
+            patch("zeus.process_identity.os.kill") as kill,
+            patch("zeus.process_identity.platform.system", return_value="Linux"),
+            patch(
+                "zeus.process_identity.read_linux_pid_state", return_value=identity.PidState.alive
+            ),
+        ):
             self.assertIs(identity.PidState.alive, identity.pid_state(4321))
         kill.assert_called_once_with(4321, 0)
+
+    def test_pid_state_defaults_use_native_evidence_but_callbacks_remain_authoritative(
+        self,
+    ) -> None:
+        for system, reader in (
+            ("Linux", "read_linux_pid_state"),
+            ("Darwin", "read_darwin_pid_state"),
+        ):
+            for state in identity.PidState:
+                with (
+                    self.subTest(system=system, state=state),
+                    patch("zeus.process_identity.os.kill") as kill,
+                    patch("zeus.process_identity.platform.system", return_value=system),
+                    patch(f"zeus.process_identity.{reader}", return_value=state) as native,
+                ):
+                    self.assertIs(state, identity.pid_state(4321))
+                    native.assert_called_once_with(4321)
+                    kill.assert_called_once_with(4321, 0)
+                    native.reset_mock()
+                    self.assertIs(
+                        identity.PidState.alive,
+                        identity.pid_state(4321, pid_alive_fn=lambda _: True),
+                    )
+                    self.assertIs(
+                        identity.PidState.dead,
+                        identity.pid_state(4321, pid_alive_fn=lambda _: False),
+                    )
+                    native.assert_not_called()
+                    kill.assert_called_once_with(4321, 0)
+
+    def test_pid_state_signal_errors_never_use_native_evidence(self) -> None:
+        for exc, state in (
+            (ProcessLookupError(), identity.PidState.dead),
+            (PermissionError(), identity.PidState.unknown),
+            (OSError(errno.EIO, "I/O error"), identity.PidState.unknown),
+        ):
+            with (
+                self.subTest(exc=exc),
+                patch("zeus.process_identity.os.kill", side_effect=exc),
+                patch("zeus.process_identity.platform.system") as system,
+            ):
+                self.assertIs(state, identity.pid_state(4321))
+                system.assert_not_called()
+        with (
+            patch("zeus.process_identity.os.kill"),
+            patch("zeus.process_identity.platform.system", return_value="FreeBSD"),
+        ):
+            self.assertIs(identity.PidState.alive, identity.pid_state(4321))
 
 
 class ProcessStartIdentityTests(unittest.TestCase):
@@ -466,7 +594,13 @@ class SupervisorCompatibilityTests(unittest.TestCase):
     def test_supervisor_pid_state_shim_uses_live_callback_or_current_os_kill(self) -> None:
         supervisor = object.__new__(supervisor_module.Supervisor)
         supervisor.pid_alive_fn = None
-        with patch("zeus.supervisor.os.kill") as kill:
+        with (
+            patch("zeus.supervisor.os.kill") as kill,
+            patch("zeus.process_identity.platform.system", return_value="Linux"),
+            patch(
+                "zeus.process_identity.read_linux_pid_state", return_value=identity.PidState.alive
+            ),
+        ):
             self.assertIs(identity.PidState.alive, supervisor._pid_state(4321))
             supervisor.pid_alive_fn = lambda _pid: False
             self.assertIs(identity.PidState.dead, supervisor._pid_state(4321))
@@ -474,6 +608,23 @@ class SupervisorCompatibilityTests(unittest.TestCase):
 
         supervisor.pid_alive_fn = self._permission_denied
         self.assertIs(identity.PidState.unknown, supervisor._pid_state(4321))
+
+    def test_supervisor_fallback_shims_preserve_native_zombie_classification(self) -> None:
+        from zeus.supervisor_runtime import _SupervisorRuntime
+
+        for cls in (supervisor_module.Supervisor, _SupervisorRuntime):
+            supervisor = object.__new__(cls)
+            supervisor.pid_alive_fn = None
+            with (
+                self.subTest(cls=cls),
+                patch("zeus.process_identity.os.kill"),
+                patch("zeus.process_identity.platform.system", return_value="Linux"),
+                patch(
+                    "zeus.process_identity.read_linux_pid_state",
+                    return_value=identity.PidState.dead,
+                ),
+            ):
+                self.assertIs(identity.PidState.dead, supervisor._pid_state(4321))
 
     @staticmethod
     def _permission_denied(_pid: int) -> bool:

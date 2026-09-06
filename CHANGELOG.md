@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed cross-process gateway stops that timed out when the API retained an
+  exited child as a zombie. Native liveness checks distinguish confirmed
+  zombies from running processes while preserving fail-closed ownership checks.
+
 - Added read-only `zeus reconcile list/show` and `zeus fleet status`, with
   authenticated `/reconcile/runs`, `/reconcile/runs/<run-id>`, and `/fleet`
   endpoints. History is paginated; fleet evidence includes observation age,

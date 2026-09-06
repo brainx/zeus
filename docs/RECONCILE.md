@@ -76,8 +76,11 @@ makes at most one launch attempt per bot per pass using the persisted operation
 and revision. Pending stop continues one strictly verified schema-v3 stop
 attempt; an already-dead schema-v3 process is finalized without signaling.
 Restart recovery stops the prior exact schema-v3 generation in one pass and
-launches the pending generation on a later pass. A pending stop or restart that
-still has a schema-v2 or legacy marker fails closed: reconcile leaves the
+launches the pending generation on a later pass. On Linux and macOS, a confirmed
+zombie has already exited and is treated as stopped even while its parent has
+not reaped it. Unreadable or malformed native process state remains unknown;
+Zeus does not use ambiguous evidence to authorize a signal. A pending stop or
+restart that still has a schema-v2 or legacy marker fails closed: reconcile leaves the
 marker, recorded PID, and pending intent unchanged and requires an operator to
 resolve the prior process manually.
 
