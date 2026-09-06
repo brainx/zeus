@@ -389,6 +389,7 @@ class RepoContractTests(unittest.TestCase):
                 "rm -rf dist\npython -m build",
                 "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
                 "twine check dist/*",
+                "sh scripts/generate_checksums.sh dist",
             ),
         }
 
@@ -445,6 +446,52 @@ class RepoContractTests(unittest.TestCase):
             "twine check dist/*",
         ):
             self.assertLess(pip_check_index, package_commands.index(later_command))
+
+    def test_ci_uploads_only_verified_preview_packages_with_read_only_permissions(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        package = _workflow_job_bodies(workflow)["package"]
+        steps = _job_step_bodies(package)
+        uploads = [step for step in steps if "actions/upload-artifact@" in step]
+
+        self.assertEqual(1, len(uploads))
+        upload = uploads[0]
+        self.assertEqual(steps[-1], upload)
+        self.assertRegex(
+            upload,
+            r"(?m)^  uses: actions/upload-artifact@[0-9a-f]{40}(?: #.*)?$",
+        )
+        self.assertRegex(
+            upload,
+            r"(?m)^    name: zeus-preview-\$\{\{ github\.sha \}\}-"
+            r"\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}$",
+        )
+        self.assertEqual(
+            ["dist/*.whl", "dist/*.tar.gz", "dist/SHA256SUMS.txt"],
+            re.findall(r"(?m)^      (\S+)$", upload),
+        )
+        self.assertIn("\n    path: |\n", upload)
+        self.assertRegex(upload, r"(?m)^    if-no-files-found: error$")
+        self.assertRegex(upload, r"(?m)^    retention-days: 7$")
+        self.assertNotIn("include-hidden-files:", upload)
+        self.assertNotIn("overwrite:", upload)
+
+        self.assertEqual(
+            (
+                "rm -rf dist\npython -m build",
+                "ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh",
+                "twine check dist/*",
+                "sh scripts/generate_checksums.sh dist",
+            ),
+            _job_run_commands(package)[-4:],
+        )
+        self.assertNotRegex(package, r"(?m)^ {4,}if:")
+        self.assertNotIn("continue-on-error:", package)
+        self.assertRegex(workflow, r"(?m)^permissions:\n  contents: read\n\n")
+        self.assertNotIn("permissions:", package)
+        self.assertNotIn("secrets.", package)
+        self.assertNotIn("github.token", package)
+        self.assertNotIn("attest-build-provenance", package)
+        self.assertNotIn("action-gh-release", package)
 
     def test_real_hermes_broker_failure_evidence_is_private_and_ordered(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -1060,7 +1107,7 @@ class RepoContractTests(unittest.TestCase):
                     "Linux `ubuntu-24.04`",
                     "Python 3.11",
                     "Wheel and source build, installed-wheel smoke test, dependency "
-                    "consistency, and metadata checks",
+                    "consistency, metadata checks, and seven-day preview artifacts with checksums",
                 ),
             ),
             "release:build": (

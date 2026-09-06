@@ -118,6 +118,44 @@ and includes branch coverage. The threshold records the honest current baseline;
 raise it when coverage improves, and do not lower it to accommodate new uncovered
 production code.
 
+## CI Preview Builds
+
+The CI `package` job uploads the wheel, source archive, and `SHA256SUMS.txt`
+after dependency checks, package build, installed-wheel smoke verification,
+and metadata checks succeed. These artifacts are available for seven days from
+push, pull-request, and manually dispatched runs. Their name is
+`zeus-preview-<commit>-<run-id>-<attempt>`; the commit is the checked-out
+`github.sha`, which is the tested merge commit for pull-request runs. The run
+records the source ref, and the package filenames and metadata record the version.
+
+Use an authenticated GitHub CLI session to select a run and inspect its result:
+
+```bash
+gh run list --repo brainx/zeus --workflow ci.yml --limit 10
+run_id=123456789 # Replace with the selected CI run ID.
+gh run view "$run_id" --repo brainx/zeus
+gh api "repos/brainx/zeus/actions/runs/$run_id/artifacts" \
+  --jq '.artifacts[] | select(.name | startswith("zeus-preview-")) | {name, expired}'
+```
+
+Copy the exact unexpired artifact name from that run, then download and verify
+it in its own directory:
+
+```bash
+artifact_name="zeus-preview-COMMIT-RUN_ID-ATTEMPT" # Replace with the listed name.
+preview_dir=".tmp/$artifact_name"
+gh run download "$run_id" --repo brainx/zeus \
+  --name "$artifact_name" --dir "$preview_dir"
+(cd "$preview_dir" && sha256sum -c SHA256SUMS.txt)
+```
+
+On macOS, use `(cd "$preview_dir" && shasum -a 256 -c SHA256SUMS.txt)`.
+The upload establishes that the package job passed; other jobs may still be
+running or may have failed, so check the complete run before evaluating a
+preview. Checksums detect changed downloads. Preview packages are unsigned,
+have no release provenance attestation, and do not establish the signed-tag and
+verified-commit evidence required for tagged releases.
+
 ## Artifact Verification
 
 After downloading release assets into one directory, verify checksums before
