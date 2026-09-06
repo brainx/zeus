@@ -34,7 +34,7 @@ from zeus.private_io import (
     validate_private_directory,
 )
 
-HERMES_VERSION = "0.20.0"
+HERMES_VERSION = "0.21.0"
 
 _Decision = Decision
 _DockerExecutionError = DockerExecutionError

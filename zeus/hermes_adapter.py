@@ -11,7 +11,10 @@ from zeus.hermes_profile_config import (
     load_hermes_legacy_gateway_config,
     load_hermes_profile_config,
 )
-from zeus.hermes_profile_environment import load_hermes_profile_environment
+from zeus.hermes_profile_environment import (
+    HERMES_SUPERVISOR_ENV_KEYS,
+    load_hermes_profile_environment,
+)
 from zeus.hermes_security import validate_hermes_profile_security
 from zeus.models import ID_RE
 from zeus.readiness import ReadinessProbe
@@ -62,6 +65,8 @@ class HermesAdapter:
             validate_hermes_profile_security(legacy_gateway, env)
         env.setdefault("FEISHU_CONNECTION_MODE", "websocket")
         env["HERMES_HOME"] = str(self.hermes_root)
+        # Zeus owns restart policy and the exact gateway PID, including under s6.
+        env.update(dict.fromkeys(HERMES_SUPERVISOR_ENV_KEYS, "1"))
         return [self.hermes_bin, "-p", bot_id, *args], env
 
     def launcher_command(self, payload_fd: int, ack_fd: int) -> list[str]:

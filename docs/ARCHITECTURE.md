@@ -81,7 +81,7 @@ loads settings without repository `.env`, and stores only private configuration
 and report artifacts. The packaged `zeus.bundled_skills.audit` instruction is
 the sole audit skill; general skill loading remains unavailable.
 
-The audit path accepts only Hermes Agent 0.20.0 and an already preloaded,
+The audit path accepts only Hermes Agent 0.21.0 and an already preloaded,
 digest-qualified Docker image. A broker seals a writable primary command
 container and, when configured controls exist, a second trusted container over
 the committed snapshot mounted read-only. Both use network mode `none`, fixed

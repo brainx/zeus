@@ -333,7 +333,7 @@ JSON `503 server_busy` response with `Retry-After: 1`. Timeouts release their sl
 On orderly shutdown, Zeus keeps the listener available only to reject new work with
 `503 server_draining` while active requests finish, then closes it when the drain completes or its
 deadline expires. The drain setting accepts 0 to 300 seconds. Keep the service manager's stop
-timeout longer than the drain deadline; the provided systemd unit allows 30 seconds for the
+timeout longer than the drain deadline; the provided systemd unit allows 90 seconds for the
 default 20-second drain. When the deadline expires, shutdown proceeds even if a handler has not
 finished, so configure it to cover the longest expected API operation.
 
@@ -526,9 +526,16 @@ closed at load time: `PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`,
 are only ever resolved against the daemon's base environment, so profile
 content cannot substitute the executable Zeus launches.
 
+Zeus also reserves `HERMES_GATEWAY_EXTERNAL_SUPERVISOR` and
+`HERMES_GATEWAY_NO_SUPERVISE`. Both are set by the adapter so Hermes returns
+restart decisions to Zeus and stays in the foreground under s6. Templates
+cannot supply those environment keys, and stored profile assignments are
+rejected before launch. This prevents Hermes's dotenv loader from undoing
+Zeus's process ownership policy.
+
 ### Feishu connection mode
 
-Hermes Agent 0.20.0 must use Feishu WebSocket mode under Zeus. Do not configure
+Hermes Agent 0.21.0 must use Feishu WebSocket mode under Zeus. Do not configure
 Feishu webhook mode while `GHSA-pmqc-57g8-c22c` remains unfixed in the pinned
 Hermes baseline. Profile preflight rejects both
 `FEISHU_CONNECTION_MODE=webhook` and
@@ -577,6 +584,22 @@ supported platforms. Hermes owns cleanup of any children it starts. If the
 gateway does not exit before the grace period, Zeus marks the bot failed and
 does not send SIGKILL by default.
 
+`ZEUS_STOP_GRACE_SECONDS` sets the per-gateway grace period (default `60`, finite
+seconds from `0` to `300`). This leaves time for Hermes 0.21's default 30-second
+cron drain and subsequent cleanup. A shorter explicit override remains available;
+`0` checks for immediate exit. Allow clients enough time for this grace period
+plus lock acquisition and, for restart, readiness checks. With
+`ZEUS_STOP_KILL_AFTER_TIMEOUT=1`, Zeus may wait up to one additional grace period
+after revalidating ownership and sending SIGKILL.
+
+The API request-read timeout only bounds receipt of request headers and body;
+it does not interrupt a running stop operation. The separate
+`ZEUS_API_SHUTDOWN_DRAIN_SECONDS` setting (default `20`) limits how long API
+shutdown waits for in-flight handlers. Increase it when shutdown must retain a
+long-running lifecycle request, and keep the service manager's stop deadline
+above that drain budget. Service-manager cgroup termination is independent of
+Zeus's per-bot stop policy; see [systemd deployment](SYSTEMD.md).
+
 Schema-v2 and legacy markers remain readable for compatibility inspection, but
 Zeus never signals a process or deletes a marker pathname while either format is
 active. Stop and restart return action-required and preserve the marker, PID
@@ -616,7 +639,7 @@ zeus audit doctor
 
 Every audit command discovers the containing Git repository and state context.
 `audit doctor` is the non-mutating readiness preflight: it reports the selected
-provider and model and whether Docker, the exact Hermes Agent 0.20.0 executable,
+provider and model and whether Docker, the exact Hermes Agent 0.21.0 executable,
 configured credentials, and the preloaded digest-qualified image are ready. It
 does not create a run or download dependencies. A run requires an explicit
 lowercase provider, model, and one or more provider-prefixed names from the

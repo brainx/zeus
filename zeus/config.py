@@ -50,6 +50,7 @@ class Settings:
     api_log_enabled: bool = True
     sqlite_synchronous: SQLiteSynchronous = SQLiteSynchronous.NORMAL
     restart_stability_seconds: float = 30.0
+    stop_grace_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if self.api_key is not None and not self.api_key.isascii():
@@ -127,6 +128,9 @@ class Settings:
                 maximum=1000,
             ),
             stop_kill_after_timeout=merged.get("ZEUS_STOP_KILL_AFTER_TIMEOUT") == "1",
+            stop_grace_seconds=_float_env(
+                merged, "ZEUS_STOP_GRACE_SECONDS", default=60.0, minimum=0.0, maximum=300.0
+            ),
             lock_timeout_seconds=_float_env(
                 merged, "ZEUS_LOCK_TIMEOUT_SECONDS", default=30.0, minimum=0.1, maximum=300.0
             ),

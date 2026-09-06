@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from importlib import metadata
+from unittest.mock import Mock
 
 from scripts.check_hermes_dependency_overrides import (
     EXPECTED_DEPENDENCY_OVERRIDES,
     DependencyConflict,
     DependencyValidationError,
+    collect_conflicts,
     validate_conflicts,
 )
 
@@ -17,19 +20,13 @@ class HermesDependencyOverrideTests(unittest.TestCase):
                 {
                     DependencyConflict(
                         dependent="hermes-agent",
-                        dependent_version="0.20.0",
-                        requirement="cryptography==48.0.1",
-                        installed_version="50.0.0",
-                    ),
-                    DependencyConflict(
-                        dependent="hermes-agent",
-                        dependent_version="0.20.0",
+                        dependent_version="0.21.0",
                         requirement="requests==2.33.0",
                         installed_version="2.34.2",
                     ),
                     DependencyConflict(
                         dependent="hermes-agent",
-                        dependent_version="0.20.0",
+                        dependent_version="0.21.0",
                         requirement="rich==14.3.3",
                         installed_version="15.0.0",
                     ),
@@ -38,6 +35,55 @@ class HermesDependencyOverrideTests(unittest.TestCase):
             EXPECTED_DEPENDENCY_OVERRIDES,
         )
         validate_conflicts(EXPECTED_DEPENDENCY_OVERRIDES)
+
+    def test_upstream_cryptography_pin_requires_no_override(self) -> None:
+        distributions = [
+            Mock(
+                spec=metadata.Distribution,
+                metadata={"Name": "hermes-agent"},
+                version="0.21.0",
+                requires=["cryptography==50.0.0", "requests==2.33.0", "rich==14.3.3"],
+            ),
+            Mock(
+                spec=metadata.Distribution,
+                metadata={"Name": "cryptography"},
+                version="50.0.0",
+                requires=[],
+            ),
+            Mock(
+                spec=metadata.Distribution,
+                metadata={"Name": "requests"},
+                version="2.34.2",
+                requires=[],
+            ),
+            Mock(
+                spec=metadata.Distribution,
+                metadata={"Name": "rich"},
+                version="15.0.0",
+                requires=[],
+            ),
+        ]
+
+        validate_conflicts(collect_conflicts(distributions))
+        distributions[1].version = "48.0.1"
+        with self.assertRaisesRegex(DependencyValidationError, "cryptography==50.0.0"):
+            validate_conflicts(collect_conflicts(distributions))
+
+    def test_missing_new_core_dependency_is_not_an_override(self) -> None:
+        hermes = Mock(
+            spec=metadata.Distribution,
+            metadata={"Name": "hermes-agent"},
+            version="0.21.0",
+            requires=["firecrawl-anydoc==0.2.4"],
+        )
+
+        conflicts = collect_conflicts([hermes])
+        self.assertEqual(
+            conflicts,
+            {DependencyConflict("hermes-agent", "0.21.0", "firecrawl-anydoc==0.2.4", "<missing>")},
+        )
+        with self.assertRaisesRegex(DependencyValidationError, "unexpected conflicts"):
+            validate_conflicts(conflicts | EXPECTED_DEPENDENCY_OVERRIDES)
 
     def test_missing_dependency_override_fails_closed(self) -> None:
         with self.assertRaisesRegex(

@@ -143,7 +143,7 @@ class _SupervisorCore:
         pid_alive_fn: PidAliveFn | None = None,
         cmdline_reader: CmdlineReader | None = None,
         startup_grace_seconds: float = 0.25,
-        stop_grace_seconds: float = 15.0,
+        stop_grace_seconds: float = 60.0,
         kill_after_timeout: bool = False,
         lock_timeout_seconds: float = 30.0,
         readiness_timeout_seconds: float = 30.0,

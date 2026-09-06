@@ -237,6 +237,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         store,
         settings.hermes_bin,
         settings.hermes_root,
+        stop_grace_seconds=settings.stop_grace_seconds,
         kill_after_timeout=settings.stop_kill_after_timeout,
         lock_timeout_seconds=settings.lock_timeout_seconds,
         readiness_timeout_seconds=settings.readiness_timeout_seconds,

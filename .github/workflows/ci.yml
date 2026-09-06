@@ -142,10 +142,12 @@ jobs:
       - name: Verify real Hermes without provider credentials
         run: |
           ZEUS_VERIFY_START_GATEWAY=1 \
-          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \
+          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.21.0 \
           ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \
           sh scripts/verify_real_hermes.sh
       - name: Verify pinned Hermes audit broker transcript
+        env:
+          ZEUS_REQUIRE_PINNED_HERMES: "1"
         run: |
           mkdir -p .tmp/real-hermes-evidence
           chmod 0700 .tmp/real-hermes-evidence

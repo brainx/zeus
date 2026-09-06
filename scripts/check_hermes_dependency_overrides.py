@@ -27,19 +27,13 @@ EXPECTED_DEPENDENCY_OVERRIDES = frozenset(
     {
         DependencyConflict(
             dependent="hermes-agent",
-            dependent_version="0.20.0",
-            requirement="cryptography==48.0.1",
-            installed_version="50.0.0",
-        ),
-        DependencyConflict(
-            dependent="hermes-agent",
-            dependent_version="0.20.0",
+            dependent_version="0.21.0",
             requirement="requests==2.33.0",
             installed_version="2.34.2",
         ),
         DependencyConflict(
             dependent="hermes-agent",
-            dependent_version="0.20.0",
+            dependent_version="0.21.0",
             requirement="rich==14.3.3",
             installed_version="15.0.0",
         ),
@@ -116,8 +110,7 @@ def main() -> int:
         print(f"Hermes dependency validation failed: {exc}")
         return 1
     print(
-        "Hermes dependency overrides verified: cryptography 50.0.0, "
-        "requests 2.34.2, and rich 15.0.0; "
+        "Hermes dependency overrides verified: requests 2.34.2 and rich 15.0.0; "
         "no other installed dependency conflicts"
     )
     return 0

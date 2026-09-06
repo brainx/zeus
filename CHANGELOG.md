@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Updated the real-Hermes baseline and sealed audit protocol to Hermes Agent
+  0.21.0. The required broker check fails when the pinned runtime is missing or
+  mismatched; runtime and build dependencies remain hash-locked.
+- Made Zeus ownership explicit to Hermes gateway supervision and added a
+  configurable shutdown grace period for active cron work. Existing bot process
+  identity checks, delegation limits, and Feishu WebSocket restriction remain.
+
 - Fixed cross-process gateway stops that timed out when the API retained an
   exited child as a zombie. Native liveness checks distinguish confirmed
   zombies from running processes while preserving fail-closed ownership checks.
