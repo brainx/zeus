@@ -186,6 +186,157 @@ class LifecycleRegressionTests(unittest.TestCase):
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.write_text(json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8")
 
+    def test_stop_after_another_supervisor_restart_waits_for_current_gateway(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, profile = self._store_with_bot(root)
+            hermes = self._fake_hermes(root)
+            children = []
+            signals = []
+
+            class Child(_FakePopen):
+                def __init__(self, *args, **kwargs):
+                    self.pid = 4321 + len(children)
+                    self.wait_calls = 0
+                    super().__init__(*args, **kwargs)
+                    children.append(self)
+
+                def wait(self, timeout):
+                    self.wait_calls += 1
+                    if self.returncode is None:
+                        raise subprocess.TimeoutExpired("hermes", timeout)
+                    return self.returncode
+
+            def send_signal(pid, sig):
+                signals.append((pid, sig))
+                if pid == 4321:
+                    children[0].returncode = 0
+
+            def supervisor():
+                return Supervisor(
+                    store,
+                    hermes,
+                    root / "hermes",
+                    popen_factory=Child,
+                    kill_fn=send_signal,
+                    pid_alive_fn=lambda pid: any(
+                        child.pid == pid and child.returncode is None for child in children
+                    ),
+                    cmdline_reader=lambda pid: self._gateway_argv(hermes),
+                    proc_start_fingerprint_reader=lambda pid: f"test-process-start:{pid}",
+                    startup_grace_seconds=0,
+                    stop_grace_seconds=0,
+                )
+
+            daemon = supervisor()
+            cli = supervisor()
+            self.assertEqual(4321, daemon.start("coder").pid)
+            self.assertEqual(4322, cli.restart("coder").pid)
+
+            stopped = daemon.stop("coder")
+
+            self.assertEqual(BotStatus.failed, stopped.status)
+            self.assertIn("did not stop before grace period expired", stopped.message)
+            self.assertEqual(0, children[0].wait_calls)
+            self.assertIsNone(children[1].returncode)
+            self.assertEqual([(4321, signal.SIGTERM), (4322, signal.SIGTERM)], signals)
+            saved = store.get_bot("coder")
+            assert saved is not None
+            self.assertEqual(4322, saved.pid)
+            self.assertEqual("stop", saved.pending_action)
+            self.assertTrue(daemon.pid_marker_path(str(profile)).exists())
+
+    def test_status_and_reconcile_reap_exited_owned_gateway(self) -> None:
+        for operation in ("status", "reconcile"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store, profile = self._store_with_bot(root, restart_policy=RestartPolicy.on_failure)
+                hermes = self._fake_hermes(root)
+                children = []
+
+                class ZombieChild(_FakePopen):
+                    def __init__(self, *args, _children=children, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.exited = False
+                        self.reaped = False
+                        _children.append(self)
+
+                    def poll(self):
+                        if self.exited:
+                            self.reaped = True
+                            self.returncode = 1
+                        return self.returncode
+
+                supervisor = Supervisor(
+                    store,
+                    hermes,
+                    root / "hermes",
+                    popen_factory=ZombieChild,
+                    pid_alive_fn=lambda pid, children=children: not children[0].reaped,
+                    cmdline_reader=lambda pid, hermes=hermes: self._gateway_argv(hermes),
+                    proc_start_fingerprint_reader=lambda pid: f"test-process-start:{pid}",
+                    startup_grace_seconds=0,
+                )
+                self.assertEqual(BotStatus.running, supervisor.start("coder").status)
+                children[0].exited = True
+
+                response = (
+                    supervisor.status("coder")
+                    if operation == "status"
+                    else supervisor.reconcile("coder")[0]
+                )
+
+                self.assertTrue(children[0].reaped)
+                self.assertIsNone(response.pid)
+                self.assertNotIn("ownership", response.message)
+                self.assertFalse(supervisor.pid_marker_path(str(profile)).exists())
+                if operation == "reconcile":
+                    self.assertIn("restart scheduled: attempt 1/5", response.message)
+
+    def test_reconcile_runs_final_scheduled_retry_then_enforces_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, _profile = self._store_with_bot(
+                root, status=BotStatus.failed, restart_policy=RestartPolicy.on_failure
+            )
+            record = store.get_bot("coder")
+            assert record is not None
+            store.upsert_bot(replace(record, restart_max_attempts=1))
+            hermes = self._fake_hermes(root)
+            children = []
+
+            def launch(*args, **kwargs):
+                child = _FakePopen(*args, **kwargs)
+                children.append(child)
+                return child
+
+            supervisor = Supervisor(
+                store,
+                hermes,
+                root / "hermes",
+                popen_factory=launch,
+                pid_alive_fn=lambda pid: bool(children) and children[-1].returncode is None,
+                cmdline_reader=lambda pid: self._gateway_argv(hermes),
+                proc_start_fingerprint_reader=lambda pid: f"test-process-start:{pid}",
+                startup_grace_seconds=0,
+            )
+            now = datetime(2026, 1, 1, tzinfo=UTC)
+
+            scheduled = supervisor.reconcile("coder", now=now)[0]
+            pending = supervisor.reconcile("coder", now=now)[0]
+            started = supervisor.reconcile("coder", now=now + timedelta(seconds=1))[0]
+
+            self.assertIn("restart scheduled: attempt 1/1", scheduled.message)
+            self.assertIn("restart pending: attempt 1/1", pending.message)
+            self.assertEqual(BotStatus.running, started.status)
+            self.assertEqual(1, len(children))
+            children[0].returncode = 1
+
+            exhausted = supervisor.reconcile("coder", now=now + timedelta(seconds=2))[0]
+
+            self.assertIn("restart limit reached: 1/1", exhausted.message)
+            self.assertEqual(1, len(children))
+
     def test_status_preserves_failed_and_unknown_for_on_failure_reconcile(self) -> None:
         for persisted_status in (BotStatus.failed, BotStatus.unknown):
             with self.subTest(status=persisted_status), tempfile.TemporaryDirectory() as tmp:

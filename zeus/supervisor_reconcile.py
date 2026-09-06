@@ -490,7 +490,11 @@ class _SupervisorReconcile(_SupervisorStop):
                 message="manual policy: not restarting",
             )
 
-        if record.restart_attempts >= record.restart_max_attempts:
+        completed_attempts = record.restart_attempts
+        if record.next_restart_at is not None:
+            # Scheduling already counted the pending attempt; it must still run.
+            completed_attempts = max(0, completed_attempts - 1)
+        if completed_attempts >= record.restart_max_attempts:
             self._update_restart(
                 context,
                 record.bot_id,

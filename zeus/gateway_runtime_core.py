@@ -374,6 +374,11 @@ class _GatewayRuntimeCore:
         return ReadinessResult(False, f"readiness timeout: {last.message}", last.payload)
 
     def pid_state(self, pid: int) -> process_identity.PidState:
+        # Reap our matching child before kill(pid, 0), which reports zombies as
+        # alive. Still probe the OS afterward: a cached handle may outlive PID reuse.
+        for process in tuple(self._processes.values()):
+            if process.pid == pid:
+                process.poll()
         if self.pid_alive_fn is not None:
             return process_identity.pid_state(pid, pid_alive_fn=self.pid_alive_fn)
 
@@ -549,7 +554,12 @@ class _GatewayRuntimeCore:
 
     def wait_for_exit(self, bot_id: str, pid: int) -> bool:
         process = self._processes.get(bot_id)
-        if process is not None and hasattr(process, "wait"):
+        if (
+            process is not None
+            and process.pid == pid
+            and process.poll() is None
+            and hasattr(process, "wait")
+        ):
             try:
                 process.wait(timeout=self.stop_grace_seconds)
                 return True
