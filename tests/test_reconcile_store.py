@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
@@ -117,6 +118,26 @@ def _statement_index(statements: list[str], prefix: str, *, start: int = 0) -> i
         for index, statement in enumerate(statements[start:], start=start)
         if statement.lstrip().upper().startswith(prefix)
     )
+
+
+def _selects_from(trace: list[tuple[int, str]], table: str) -> list[str]:
+    statements = [" ".join(sql.upper().split()) for sql in _statements(trace)]
+    return [sql for sql in statements if sql.startswith("SELECT ") and f"FROM {table}" in sql]
+
+
+def _insert_event(database_path: Path, bot_id: str) -> int:
+    with closing(sqlite3.connect(database_path)) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO lifecycle_events (
+                bot_id, operation_id, occurred_at, source, action, outcome
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (bot_id, "a" * 32, RUN_STARTED_AT.isoformat(), "cli", "bot.create", "success"),
+        )
+        assert cursor.lastrowid is not None
+        conn.commit()
+        return cursor.lastrowid
 
 
 def _run_bytes(database_path: Path, run_id: str) -> tuple[object, ...] | None:
@@ -277,7 +298,8 @@ class ReconcileStoreTests(unittest.TestCase):
         result_selects = [
             index
             for index, sql in enumerate(finish_sql)
-            if sql.lstrip().upper().startswith("SELECT * FROM RECONCILE_RESULTS")
+            if sql.lstrip().upper().startswith("SELECT ")
+            and "FROM RECONCILE_RESULTS" in " ".join(sql.upper().split())
         ]
         self.assertEqual(2, len(run_selects))
         self.assertEqual(2, len(result_selects))
@@ -303,6 +325,152 @@ class ReconcileStoreTests(unittest.TestCase):
         ]
         self.assertEqual(2, len(interrupt_updates))
         self.assertLess(interrupt_updates[-1], _statement_index(interrupt_sql, "COMMIT"))
+
+    def test_append_and_history_query_counts_do_not_grow_with_prior_results(self) -> None:
+        database = _TracingSQLiteDatabase(self.database_path.with_name("scaling.db"))
+        SchemaManager(database).init()
+        store = ReconcileStore(database)
+        for size in (1, 16, 64):
+            with self.subTest(size=size):
+                run = _run(f"run-{size}")
+                store.begin_reconcile_run(run)
+                results = []
+                for index in range(size):
+                    bot_id = f"bot-{index}"
+                    event_id = _insert_event(database.database_path, bot_id)
+                    result = _result(
+                        bot_id,
+                        outcome=tuple(ReconcileOutcome)[index % len(ReconcileOutcome)],
+                        event_id=event_id,
+                    )
+                    database.traces.clear()
+                    store.append_reconcile_result(run.run_id, result)
+                    self.assertEqual([], _selects_from(database.traces, "RECONCILE_RESULTS"))
+                    self.assertEqual(1, len(_selects_from(database.traces, "RECONCILE_RUNS")))
+                    self.assertEqual(1, len(_selects_from(database.traces, "LIFECYCLE_EVENTS")))
+                    self.assertEqual(
+                        ["BEGIN IMMEDIATE", "COMMIT"], _control_statements(database.traces)
+                    )
+                    results.append(result)
+
+                database.traces.clear()
+                finished = store.finish_reconcile_run(_summary(run, results))
+                self.assertEqual(2, len(_selects_from(database.traces, "RECONCILE_RESULTS")))
+                self.assertEqual([], _selects_from(database.traces, "LIFECYCLE_EVENTS"))
+                self.assertEqual(tuple(results), finished.results)
+                self.assertEqual(size, finished.total)
+                self.assertEqual(dict(_summary(run, results).counts), dict(finished.counts))
+
+                database.traces.clear()
+                self.assertEqual(finished, store.get_reconcile_run(run.run_id))
+                self.assertEqual(1, len(_selects_from(database.traces, "RECONCILE_RESULTS")))
+                self.assertEqual([], _selects_from(database.traces, "LIFECYCLE_EVENTS"))
+
+    def test_append_rejects_invalid_run_header_without_partial_results(self) -> None:
+        mutations = (
+            ("source = ?", ""),
+            ("scope = ?", "invalid"),
+            ("requested_bot_id = ?", "unexpected"),
+            ("force = ?", 2),
+            ("reset_restart = ?", 2),
+            ("started_at = ?", "invalid"),
+            ("finished_at = ?", RUN_FINISHED_AT.isoformat()),
+            ("total = ?", -1),
+            ("healthy_count = ?", -1),
+            ("total = ?", 1),
+            ("total = ?, healthy_count = 1.5", 1.5),
+        )
+        for index, (assignment, value) in enumerate(mutations):
+            with self.subTest(assignment=assignment, value=value):
+                run = _run(f"invalid-{index}")
+                self.store.begin_reconcile_run(run)
+                with closing(sqlite3.connect(self.database_path)) as conn:
+                    conn.execute("PRAGMA ignore_check_constraints=ON")
+                    conn.execute(
+                        f"UPDATE reconcile_runs SET {assignment} WHERE run_id = ?",
+                        (value, run.run_id),
+                    )
+                    conn.commit()
+                before = _run_bytes(self.database_path, run.run_id)
+
+                with self.assertRaises(ValueError):
+                    self.store.append_reconcile_result(run.run_id, _result())
+
+                self.assertEqual(before, _run_bytes(self.database_path, run.run_id))
+                with closing(sqlite3.connect(self.database_path)) as conn:
+                    self.assertEqual(
+                        0,
+                        conn.execute(
+                            "SELECT COUNT(*) FROM reconcile_results WHERE run_id = ?",
+                            (run.run_id,),
+                        ).fetchone()[0],
+                    )
+
+    def test_append_preserves_run_scope_time_and_duplicate_checks(self) -> None:
+        with self.assertRaises(KeyError):
+            self.store.append_reconcile_result("unknown", _result())
+        run = _run(scope="bot", requested_bot_id="coder")
+        self.store.begin_reconcile_run(run)
+        for result in (
+            _result("other"),
+            replace(_result(), started_at=RUN_STARTED_AT - timedelta(seconds=1)),
+        ):
+            with self.subTest(result=result), self.assertRaises(ValueError):
+                self.store.append_reconcile_result(run.run_id, result)
+        result = _result()
+        self.store.append_reconcile_result(run.run_id, result)
+        before = _run_bytes(self.database_path, run.run_id)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.append_reconcile_result(run.run_id, result)
+        self.assertEqual(before, _run_bytes(self.database_path, run.run_id))
+        self.store.finish_reconcile_run(_summary(run, [result]))
+        with self.assertRaisesRegex(RuntimeError, "not running"):
+            self.store.append_reconcile_result(run.run_id, result)
+
+    def test_prior_corruption_is_rejected_on_finish_read_and_interruption(self) -> None:
+        corruptions = {
+            "missing-event": "UPDATE reconcile_results SET event_id = 999",
+            "wrong-event-bot": (
+                "UPDATE reconcile_results SET event_id = "
+                "(SELECT event_id FROM lifecycle_events WHERE bot_id = 'other')"
+            ),
+            "ordinal-gap": "UPDATE reconcile_results SET ordinal = 2",
+            "invalid-pid": "UPDATE reconcile_results SET pid = 1.5",
+            "early-result": (
+                "UPDATE reconcile_results SET started_at = '2026-07-12T11:58:00+00:00'"
+            ),
+            "counter-mismatch": "UPDATE reconcile_runs SET total = 2, healthy_count = 2",
+        }
+        for name, mutation in corruptions.items():
+            with self.subTest(corruption=name):
+                database = _TracingSQLiteDatabase(self.database_path.with_name(f"{name}.db"))
+                SchemaManager(database).init()
+                store = ReconcileStore(database)
+                run = _run()
+                result = _result(event_id=_insert_event(database.database_path, "coder"))
+                _insert_event(database.database_path, "other")
+                store.begin_reconcile_run(run)
+                store.append_reconcile_result(run.run_id, result)
+                with closing(sqlite3.connect(database.database_path)) as conn:
+                    conn.execute(mutation)
+                    conn.commit()
+
+                next_result = _result("next")
+                # Append checks the header and new result, not previously stored history.
+                store.append_reconcile_result(run.run_id, next_result)
+                before = _run_bytes(database.database_path, run.run_id)
+                for operation in ("finish", "read", "interrupt"):
+                    with self.subTest(operation=operation):
+                        database.traces.clear()
+                        with self.assertRaises((ValueError, RuntimeError)):
+                            if operation == "finish":
+                                store.finish_reconcile_run(_summary(run, [result, next_result]))
+                            elif operation == "read":
+                                store.get_reconcile_run(run.run_id)
+                            else:
+                                store.interrupt_stale_reconcile_runs(interrupted_at=RUN_FINISHED_AT)
+                        self.assertEqual("ROLLBACK", _control_statements(database.traces)[-1])
+                        self.assertEqual(before, _run_bytes(database.database_path, run.run_id))
 
     def test_result_insert_and_counter_update_roll_back_together(self) -> None:
         database = _TracingSQLiteDatabase(self.database_path.with_name("append-rollback.db"))

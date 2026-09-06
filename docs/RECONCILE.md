@@ -11,6 +11,15 @@ lock, and continue after bot-scoped failures. Previously committed bot changes
 are not rolled back when a later bot reports an error. Healthy no-op results are
 recorded without adding lifecycle-ledger noise.
 
+Each result append validates the run metadata and counters, the new result, and
+its lifecycle-event link, then commits the result and updated counters in one
+transaction. Appends do not reload earlier results, so persistence work per bot
+does not grow with the number of bots already processed. Complete history is
+validated when a run is finalized, read, or marked interrupted, including result
+order, counters, timestamps, and lifecycle-event links. Corruption of previously
+stored results is detected at those boundaries rather than on every subsequent
+append; a failed validation leaves the run unchanged and does not report success.
+
 ## Recovery Semantics
 
 Pending start/restart with an exact owned schema-v3 marker is adopted and
