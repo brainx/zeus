@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -21,6 +22,35 @@ from zeus.request_context import new_request_id
 
 HandlerFactory = Callable[[Settings], type[BaseHTTPRequestHandler]]
 ServerFactory = Callable[[tuple[str, int], type[BaseHTTPRequestHandler]], Any]
+
+
+class _RequestReadDeadlineSocket(socket.socket):
+    """Bound SocketIO reads across an entire HTTP request, including trickled data."""
+
+    def __init__(self, request: socket.socket, timeout_seconds: float) -> None:
+        family, kind, protocol = request.family, request.type, request.proto
+        descriptor = request.detach()
+        try:
+            super().__init__(family, kind, protocol, fileno=descriptor)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._request_read_deadline = time.monotonic() + timeout_seconds
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        remaining = self._request_read_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("API request read deadline expired")
+        previous_timeout = self.gettimeout()
+        self.settimeout(remaining if previous_timeout is None else min(remaining, previous_timeout))
+        try:
+            received = super().recv_into(buffer, nbytes, flags)
+            if time.monotonic() >= self._request_read_deadline:
+                raise TimeoutError("API request read deadline expired")
+            return received
+        finally:
+            # Handler execution and response writes retain their normal timeout.
+            self.settimeout(previous_timeout)
 
 
 class ThreadingHTTPServer(_ThreadingHTTPServer):
@@ -53,6 +83,10 @@ class ThreadingHTTPServer(_ThreadingHTTPServer):
         self._graceful_shutdown_thread: threading.Thread | None = None
         self._graceful_shutdown_result: bool | None = None
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+
+    def get_request(self) -> tuple[socket.socket, Any]:
+        request, address = super().get_request()
+        return _RequestReadDeadlineSocket(request, self.api_request_timeout_seconds), address
 
     def process_request(self, request: Any, client_address: Any) -> None:
         # Slots are acquired before the request is parsed or authenticated, so a
