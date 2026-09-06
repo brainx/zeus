@@ -307,7 +307,7 @@ class Drill:
             # Prefer Zeus's full marker/lock checks; partial startup can require
             # the narrower fixture-only fallback below.
             with contextlib.suppress(subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                self.cli("bot", "stop", "recovery-bot", "--json")
+                self.cli("bot", "stop", "recovery-bot")
         self.terminate_owned_gateways()
         for unit in owned:
             active = self.systemctl("show", unit, "--property=ActiveState", "--value")
@@ -473,7 +473,7 @@ class Drill:
                     "restore reused a stale gateway generation",
                 )
                 self.phase = "stop restored gateway"
-                self.cli("bot", "stop", "recovery-bot", "--json")
+                self.cli("bot", "stop", "recovery-bot")
                 wait_for(lambda: not self.processes(), "exact-ownership gateway stop")
                 require(
                     self.bot()["desired_state"] == "stopped"
@@ -500,7 +500,7 @@ class Drill:
     def backup_restore(self) -> None:
         require(self.state == self.root / "state", "restore refused non-disposable state")
         require_plain_tree(self.state)
-        self.cli("bot", "stop", "recovery-bot", "--json")
+        self.cli("bot", "stop", "recovery-bot")
         wait_for(lambda: not self.processes(), "gateway stop before backup")
         backup = self.root / "backup"
         backup.mkdir(mode=0o700)

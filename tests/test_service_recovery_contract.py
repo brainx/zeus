@@ -20,6 +20,7 @@ from tests.fixtures.service_recovery_drill import (
     validate_root,
 )
 from tests.test_repo_contracts import _job_run_commands, _workflow_job_bodies
+from zeus.cli import build_parser
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/verify_service_recovery.sh"
@@ -217,7 +218,9 @@ class ServiceRecoveryContractTests(unittest.TestCase):
                 connection.execute("INSERT INTO lifecycle_events VALUES (1, 'start')")
 
             def stop(*args: str) -> dict[str, object]:
-                self.assertEqual(args, ("bot", "stop", "recovery-bot", "--json"))
+                parsed = build_parser().parse_args(args)
+                self.assertEqual((parsed.resource, parsed.action), ("bot", "stop"))
+                self.assertEqual(parsed.bot_id, "recovery-bot")
                 self.assertFalse((root / "backup").exists())
                 with closing(sqlite3.connect(database)) as connection, connection:
                     connection.execute("UPDATE bots SET desired_state = 'stopped'")
