@@ -365,6 +365,33 @@ def _cleanup_owned_empty_staging(
         return
 
 
+def _withdraw_owned_publication(
+    parent_fd: int,
+    run_id: str,
+    staging_name: str,
+    staging_fd: int,
+    identity: os.stat_result,
+) -> bool:
+    """Move an unacknowledged publication out of the readable run namespace."""
+    moved = False
+    try:
+        _validate_staging_binding(parent_fd, run_id, staging_fd, identity)
+        _rename_directory_noreplace(parent_fd, run_id, staging_name)
+        moved = True
+        _validate_staging_binding(parent_fd, staging_name, staging_fd, identity)
+    except (AuditStoreError, OSError, TypeError, ValueError):
+        if moved:
+            # Preserve a replacement moved during the rename window without
+            # overwriting any new occupant of the public run name.
+            with suppress(OSError, TypeError, ValueError):
+                _rename_directory_noreplace(parent_fd, staging_name, run_id)
+                os.fsync(parent_fd)
+        return False
+    with suppress(OSError, TypeError, ValueError):
+        os.fsync(parent_fd)
+    return True
+
+
 def _strict_private_directory_exists(path: Path) -> bool:
     exists = inspect_private_directory(path, missing_ok=True)
     if not exists:
@@ -428,6 +455,7 @@ class AuditStore:
         ):
             staging_fd, staging_identity = _open_created_staging(audits.fd, staging_name)
             staging_exists = True
+            publication_attempted = False
             leaves: dict[str, os.stat_result] = {}
             try:
                 json_path = staging_path / _REPORT_JSON
@@ -486,6 +514,7 @@ class AuditStore:
                 )
                 state.validate_at(self.state_dir)
                 audits.validate_at(self.audits_dir)
+                publication_attempted = True
                 try:
                     _rename_directory_noreplace(
                         audits.fd,
@@ -509,6 +538,16 @@ class AuditStore:
                 os.fsync(audits.fd)
                 audits.validate_at(self.audits_dir)
                 state.validate_at(self.state_dir)
+            except BaseException:
+                if publication_attempted and _withdraw_owned_publication(
+                    audits.fd,
+                    report.run_id,
+                    staging_name,
+                    staging_fd,
+                    staging_identity,
+                ):
+                    staging_exists = True
+                raise
             finally:
                 if staging_exists:
                     _cleanup_owned_staging(

@@ -219,6 +219,134 @@ class AuditStoreTests(unittest.TestCase):
 
         self.assertEqual([], list((self.state_dir / "audits").iterdir()))
 
+    def test_final_parent_fsync_failure_withdraws_the_published_run(self) -> None:
+        run_id = "38383838383838383838383838383838"
+        real_fsync = os.fsync
+        failed_once = False
+
+        def fail_publication_fsync(fd: int) -> None:
+            nonlocal failed_once
+            parent = (self.state_dir / "audits").stat()
+            opened = os.fstat(fd)
+            if (parent.st_dev, parent.st_ino) == (opened.st_dev, opened.st_ino):
+                if not failed_once:
+                    self.assertTrue(self._artifact_path(run_id, "report.json").is_file())
+                    failed_once = True
+                raise OSError(errno.EIO, "injected publication fsync failure")
+            real_fsync(fd)
+
+        with (
+            patch.object(os, "fsync", side_effect=fail_publication_fsync),
+            self.assertRaises(OSError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertFalse((self.state_dir / "audits" / run_id).exists())
+        self.assertEqual((), self.store.list_reports())
+        self.assertEqual([], list((self.state_dir / "audits").iterdir()))
+
+    def test_interrupted_publication_rename_withdraws_the_exact_owned_run(self) -> None:
+        run_id = "39393939393939393939393939393939"
+        real_rename = audit_store._rename_directory_noreplace
+
+        def interrupted_rename(parent_fd: int, source: str, destination: str) -> None:
+            real_rename(parent_fd, source, destination)
+            if destination == run_id:
+                raise KeyboardInterrupt
+
+        with (
+            patch.object(
+                audit_store, "_rename_directory_noreplace", side_effect=interrupted_rename
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual((), self.store.list_reports())
+        self.assertEqual([], list((self.state_dir / "audits").iterdir()))
+
+    def test_failed_publication_is_hidden_even_when_staging_cleanup_fails(self) -> None:
+        run_id = "40404040404040404040404040404040"
+        real_fsync = os.fsync
+
+        def fail_publication_fsync(fd: int) -> None:
+            parent = (self.state_dir / "audits").stat()
+            opened = os.fstat(fd)
+            if (parent.st_dev, parent.st_ino) == (opened.st_dev, opened.st_ino):
+                raise OSError(errno.EIO, "injected publication fsync failure")
+            real_fsync(fd)
+
+        with (
+            patch.object(os, "fsync", side_effect=fail_publication_fsync),
+            patch.object(audit_store, "_cleanup_owned_staging"),
+            self.assertRaises(OSError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual((), self.store.list_reports())
+        remnants = list((self.state_dir / "audits").iterdir())
+        self.assertEqual(1, len(remnants))
+        self.assertTrue(remnants[0].name.startswith(f".staging-{run_id}-"))
+
+    def test_failed_publication_does_not_withdraw_a_replacement_directory(self) -> None:
+        run_id = "41414141414141414141414141414141"
+        run_path = self.state_dir / "audits" / run_id
+        displaced = self.root / "displaced-publication"
+        real_fsync = os.fsync
+
+        def replace_publication_then_fail(fd: int) -> None:
+            parent = (self.state_dir / "audits").stat()
+            opened = os.fstat(fd)
+            if (parent.st_dev, parent.st_ino) == (opened.st_dev, opened.st_ino):
+                run_path.rename(displaced)
+                run_path.mkdir(mode=0o700)
+                (run_path / "unrelated.txt").write_text("preserve\n")
+                raise OSError(errno.EIO, "injected publication fsync failure")
+            real_fsync(fd)
+
+        with (
+            patch.object(os, "fsync", side_effect=replace_publication_then_fail),
+            self.assertRaises(OSError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual("preserve\n", (run_path / "unrelated.txt").read_text())
+        self.assertTrue((displaced / "report.json").is_file())
+
+    def test_withdrawal_restores_a_directory_replaced_during_rename(self) -> None:
+        run_id = "42424242424242424242424242424242"
+        run_path = self.state_dir / "audits" / run_id
+        displaced = self.root / "displaced-during-withdrawal"
+        real_fsync = os.fsync
+        real_rename = audit_store._rename_directory_noreplace
+
+        def fail_publication_fsync(fd: int) -> None:
+            parent = (self.state_dir / "audits").stat()
+            opened = os.fstat(fd)
+            if (parent.st_dev, parent.st_ino) == (opened.st_dev, opened.st_ino):
+                raise OSError(errno.EIO, "injected publication fsync failure")
+            real_fsync(fd)
+
+        def replace_before_withdrawal(parent_fd: int, source: str, destination: str) -> None:
+            if source == run_id:
+                run_path.rename(displaced)
+                run_path.mkdir(mode=0o700)
+                (run_path / "unrelated.txt").write_text("preserve\n")
+            real_rename(parent_fd, source, destination)
+
+        with (
+            patch.object(os, "fsync", side_effect=fail_publication_fsync),
+            patch.object(
+                audit_store, "_rename_directory_noreplace", side_effect=replace_before_withdrawal
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.store.install(_report(run_id))
+
+        self.assertEqual("preserve\n", (run_path / "unrelated.txt").read_text())
+        self.assertTrue((displaced / "report.json").is_file())
+        self.assertEqual([run_id], [path.name for path in (self.state_dir / "audits").iterdir()])
+
     def test_foreign_same_name_leaf_after_writer_failure_is_not_adopted_or_removed(
         self,
     ) -> None:
