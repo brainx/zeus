@@ -193,7 +193,7 @@ class _SupervisorRuntime(_SupervisorCore):
                     pid=pid,
                     ready_at=datetime.now(UTC),
                     last_transition_reason="gateway process is running without readiness probe",
-                    reset_restart=True,
+                    reset_restart=self.restart_stability_seconds == 0,
                 )
                 return BotStatusResponse(
                     bot_id=record.bot_id,
@@ -211,7 +211,7 @@ class _SupervisorRuntime(_SupervisorCore):
                     pid=pid,
                     ready_at=datetime.now(UTC),
                     last_transition_reason="gateway readiness probe passed",
-                    reset_restart=True,
+                    reset_restart=self.restart_stability_seconds == 0,
                 )
                 self.store.append_audit_event(
                     "bot.readiness_ready",
@@ -241,10 +241,29 @@ class _SupervisorRuntime(_SupervisorCore):
                 profile_path=record.profile_path,
                 message=record.last_error or f"gateway process state is {record.status.value}",
             )
+        now = datetime.now(UTC)
+        # Only the current running generation's first healthy observation counts.
+        # Reusing it across polls also keeps the window intact across supervisors.
+        ready_at = record.ready_at if record.status is BotStatus.running else None
+        ready_at = ready_at or now
+        reset_restart = (
+            record.restart_attempts != 0
+            and (now - ready_at).total_seconds() >= self.restart_stability_seconds
+        )
+        if record.next_restart_at is not None and not reset_restart:
+            self._update_restart(
+                context,
+                record.bot_id,
+                status=record.status,
+                pid=pid,
+                restart_attempts=record.restart_attempts,
+                next_restart_at=None,
+                action="bot.restart.cancel",
+                reason="gateway is running; pending restart canceled",
+            )
         needs_running_projection_update = (
             record.status is not BotStatus.running
-            or record.restart_attempts != 0
-            or record.next_restart_at is not None
+            or reset_restart
             or record.ready_at is None
             or record.last_error is not None
             or record.last_exit_code is not None
@@ -255,9 +274,13 @@ class _SupervisorRuntime(_SupervisorCore):
                 record.bot_id,
                 BotStatus.running,
                 pid=pid,
-                ready_at=datetime.now(UTC),
-                last_transition_reason="gateway process is running",
-                reset_restart=True,
+                ready_at=ready_at,
+                last_transition_reason=(
+                    "gateway remained healthy for restart stability window"
+                    if reset_restart
+                    else "gateway process is running"
+                ),
+                reset_restart=reset_restart,
             )
         return BotStatusResponse(
             bot_id=record.bot_id,

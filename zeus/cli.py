@@ -426,6 +426,7 @@ def _services(settings: Settings) -> tuple[StateStore, Supervisor]:
         lock_timeout_seconds=settings.lock_timeout_seconds,
         readiness_timeout_seconds=settings.readiness_timeout_seconds,
         readiness_interval_seconds=settings.readiness_interval_seconds,
+        restart_stability_seconds=settings.restart_stability_seconds,
         allow_legacy_pid_markers=settings.allow_legacy_pid_markers,
     )
 
@@ -448,6 +449,7 @@ def _demo_services(settings: Settings, bot_id: str) -> tuple[StateStore, Supervi
             lock_timeout_seconds=settings.lock_timeout_seconds,
             readiness_timeout_seconds=settings.readiness_timeout_seconds,
             readiness_interval_seconds=settings.readiness_interval_seconds,
+            restart_stability_seconds=settings.restart_stability_seconds,
             allow_legacy_pid_markers=settings.allow_legacy_pid_markers,
             cmdline_reader=_demo_cmdline_reader(settings, fake_hermes, bot_id),
         ),

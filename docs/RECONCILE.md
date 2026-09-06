@@ -44,6 +44,30 @@ that intent completes, later process death under the manual restart policy
 returns `manual policy: not restarting`; an operator must issue start or
 restart explicitly.
 
+## Restart Stability
+
+Automatic restart attempts remain consecutive until the gateway has been
+observed running for `ZEUS_RESTART_STABILITY_SECONDS` (default `30`, range
+`0`–`86400`). A gateway that becomes ready briefly and crashes again keeps its
+retry count and exponential backoff, so repeated brief recoveries cannot bypass
+`restart_max_attempts`.
+
+The window starts at the persisted `ready_at`: the successful readiness check,
+or the first running observation when no readiness probe is configured. Each
+new launch or recovered policy-start adoption starts a fresh window. Status
+and reconcile observations preserve that timestamp and clear the retry count
+once the window has elapsed and the gateway is still alive and owned. Later
+healthy polls do not add lifecycle events. Zeus checks readiness during startup;
+the stability window does not add continuous HTTP health probing.
+
+The setting is shared by CLI and API supervisors; use the same value in every
+process managing the state directory. `0` restores immediate reset on a healthy
+observation. Directly completed operator starts/restarts and
+`reconcile --reset-restart` continue to grant a fresh retry budget. Adopting an
+interrupted start retains retry history until stable, including when the start
+was requested by an operator; recovered explicit restarts reset the budget.
+There is no database migration.
+
 ## Install The Timer
 
 The sample service assumes the same layout as `systemd/zeus-api.service`:

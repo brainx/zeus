@@ -42,6 +42,8 @@ def _pending_record(
 
 
 class _StrictRecoveryHost:
+    restart_stability_seconds = 30.0
+
     def __init__(self, recovery: PendingIntentRecovery) -> None:
         self.recovery = recovery
         self.probe: ReadinessProbe | None = None

@@ -588,9 +588,13 @@ class GatewayRuntimeTests(unittest.TestCase):
                 "allow_legacy_pid_markers",
                 "restart_backoff_cap_seconds",
                 "proc_start_fingerprint_reader",
+                "restart_stability_seconds",
             ],
             list(inspect.signature(Supervisor.__init__).parameters),
         )
+        stability = inspect.signature(Supervisor.__init__).parameters["restart_stability_seconds"]
+        self.assertEqual(30.0, stability.default)
+        self.assertIs(inspect.Parameter.POSITIONAL_OR_KEYWORD, stability.kind)
         self.assertEqual(
             ["self", "bot_id", "wait", "timeout_seconds", "source", "request_id"],
             list(inspect.signature(Supervisor.start).parameters),

@@ -49,6 +49,7 @@ class Settings:
     api_max_connections_per_client: int = 16
     api_log_enabled: bool = True
     sqlite_synchronous: SQLiteSynchronous = SQLiteSynchronous.NORMAL
+    restart_stability_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if self.api_key is not None and not self.api_key.isascii():
@@ -167,6 +168,13 @@ class Settings:
             ),
             api_log_enabled=merged.get("ZEUS_API_LOG_ENABLED", "1") == "1",
             sqlite_synchronous=sqlite_synchronous,
+            restart_stability_seconds=_float_env(
+                merged,
+                "ZEUS_RESTART_STABILITY_SECONDS",
+                default=30.0,
+                minimum=0.0,
+                maximum=86_400.0,
+            ),
         )
 
     def ensure_dirs(self) -> None:

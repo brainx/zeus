@@ -592,7 +592,9 @@ observed states; pending or failed transitions are not converged.
 Bots default to manual restart policy. Create a bot with `--restart-policy on-failure`
 plus `--restart-backoff-seconds` and `--restart-max-attempts` to let
 `zeus bot reconcile [bot-id]` restart unexpectedly stopped gateways with exponential
-backoff.
+backoff. Retry history resets after a gateway remains running for
+`ZEUS_RESTART_STABILITY_SECONDS` (default `30`); brief recoveries retain the
+retry budget. See [reconcile scheduling](docs/RECONCILE.md) for details.
 
 Reconcile stores a schema-v6 run and one ordered result per bot. Fleet passes hold
 one fleet lock, continue after bot-scoped errors, and preserve each earlier committed

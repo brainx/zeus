@@ -326,6 +326,7 @@ class _SupervisorStart(_SupervisorRuntime):
                     status=BotStatus.starting,
                     pid=pid,
                     last_error=effect.readiness_message,
+                    reset_restart=reset_restart,
                     reason="readiness probe timed out",
                 )
             except Exception:
@@ -351,6 +352,7 @@ class _SupervisorStart(_SupervisorRuntime):
                     context=context,
                     status=BotStatus.starting,
                     pid=pid,
+                    reset_restart=reset_restart,
                     reason="gateway process started; readiness probe pending",
                 )
             except Exception:

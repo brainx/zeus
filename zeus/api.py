@@ -240,6 +240,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         lock_timeout_seconds=settings.lock_timeout_seconds,
         readiness_timeout_seconds=settings.readiness_timeout_seconds,
         readiness_interval_seconds=settings.readiness_interval_seconds,
+        restart_stability_seconds=settings.restart_stability_seconds,
         allow_legacy_pid_markers=settings.allow_legacy_pid_markers,
     )
     idempotency_owner_instance_id = _process_idempotency_owner_id()
