@@ -25,6 +25,7 @@ from zeus.audit_docker_broker import (
     invoke_audit_docker_broker,
     read_audit_docker_broker_state,
 )
+from zeus.audit_docker_broker_protocol import _terminal_command_script
 from zeus.audit_models import HARD_LIMITS, AuditCommandReceipt
 from zeus.audit_receipts import expected_command_receipt_tag
 from zeus.audit_trusted_snapshot_attest import TRUSTED_EXEC_ENV
@@ -38,6 +39,29 @@ TRUSTED_CONTAINER_ID = "9" * 64
 OTHER_CONTAINER_ID = "d" * 64
 TARGET_COMMIT = "e" * 40
 SNAPSHOT_DIGEST = "f" * 64
+
+
+def _wrapped_terminal_script(command: str, session_id: str = "0123456789ab") -> str:
+    # Terminal grammar from the Hermes commit pinned by install_pinned_hermes.sh.
+    snapshot = f"/tmp/hermes-snap-{session_id}.sh"
+    marker = f"__HERMES_CWD_{session_id}__"
+    escaped = command.replace("'", "'\\''")
+    return "\n".join(
+        [
+            f"source {snapshot} >/dev/null 2>&1 || true",
+            "builtin cd -- /workspace || exit 126",
+            f"eval '{escaped}'",
+            "__hermes_ec=$?",
+            "umask 077",
+            f"__hermes_snap_tmp=$(mktemp {snapshot}.tmp.XXXXXXXXXX) && "
+            "{ { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+            'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp" '
+            f'&& mv -f "$__hermes_snap_tmp" {snapshot}; }} '
+            '2>/dev/null || rm -f "$__hermes_snap_tmp" 2>/dev/null || true',
+            f"printf '\\n{marker}%s{marker}\\n' \"$(pwd -P)\"",
+            "exit $__hermes_ec",
+        ]
+    )
 
 
 def _bootstrap_script(session_id: str) -> str:
@@ -781,6 +805,77 @@ class AuditDockerBrokerTests(unittest.TestCase):
         state_bytes = self.prepared.state_path.read_bytes()
         self.assertNotIn(b"printf audited", state_bytes)
         self.assertNotIn(b"ok\\n", state_bytes)
+
+    def test_wrapped_coverage_command_runs_only_inner_command_in_trusted_snapshot(self) -> None:
+        runner = MutatingWorkspaceDockerRunner(self.snapshot_dir)
+        self._install(trusted_command_scripts=("cat tracked.txt",))
+        self._advance_to_terminal(runner=runner)
+        script = _wrapped_terminal_script("cat tracked.txt")
+        result = self._invoke("exec", CONTAINER_ID, "bash", "-c", script, runner=runner)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(b"committed\n", result.stdout)
+        terminal_calls = [call[0] for call in runner.calls if call[0][-3:-1] == ("bash", "-c")]
+        self.assertEqual(1, len(terminal_calls))
+        self.assertIn(TRUSTED_CONTAINER_ID, terminal_calls[0])
+        self.assertEqual("cat tracked.txt", terminal_calls[0][-1])
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        receipt = state.terminal_receipts[0]
+        assert state.receipt_hmac_key is not None
+        self.assertEqual(
+            receipt.command_tag,
+            expected_command_receipt_tag(
+                key_hex=state.receipt_hmac_key,
+                run_id=RUN_ID,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
+                image_id=IMAGE_ID,
+                command_script="cat tracked.txt",
+                receipt=receipt,
+                isolated_workspace=True,
+            ),
+        )
+
+    def test_terminal_wrapper_requires_exact_session_cwd_and_shell_encoding(self) -> None:
+        for command in ("cat tracked.txt", "printf '%s\\n' \"it's quoted\"\nprintf done", ""):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    command,
+                    _terminal_command_script(_wrapped_terminal_script(command), "0123456789ab"),
+                )
+        script = _wrapped_terminal_script("cat tracked.txt")
+        for changed in (
+            script.replace("0123456789ab", "abcdef012345"),
+            script.replace("cd -- /workspace", "cd -- /tmp"),
+            script.replace("eval 'cat tracked.txt'", "eval 'cat tracked.txt'; printf extra #"),
+            script + "\nprintf extra",
+            "printf extra\n" + script,
+            script.replace("exit $__hermes_ec", "exit 0"),
+        ):
+            with self.subTest(script=changed):
+                self.assertEqual(changed, _terminal_command_script(changed, "0123456789ab"))
+        self.assertEqual(script, _terminal_command_script(script, None))
+
+    def test_wrapped_ordinary_command_keeps_wrapper_but_binds_inner_command(self) -> None:
+        self._install()
+        self._advance_to_terminal()
+        script = _wrapped_terminal_script("printf audited")
+        self._invoke("exec", CONTAINER_ID, "bash", "-c", script)
+        self.assertEqual(script, self.runner.calls[-1][0][-1])
+        state = read_audit_docker_broker_state(self.prepared.state_path)
+        receipt = state.terminal_receipts[0]
+        assert state.receipt_hmac_key is not None
+        self.assertEqual(
+            receipt.command_tag,
+            expected_command_receipt_tag(
+                key_hex=state.receipt_hmac_key,
+                run_id=RUN_ID,
+                target_commit=TARGET_COMMIT,
+                snapshot_digest=SNAPSHOT_DIGEST,
+                image_id=IMAGE_ID,
+                command_script="printf audited",
+                receipt=receipt,
+            ),
+        )
 
     def test_coverage_command_uses_fresh_read_only_snapshot_after_ad_hoc_mutation(self) -> None:
         runner = MutatingWorkspaceDockerRunner(self.snapshot_dir)

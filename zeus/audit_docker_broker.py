@@ -616,9 +616,13 @@ def invoke_audit_docker_broker(
     try:
         command_deadline = _command_deadline(decision.state, decision.kind, clock())
         if decision.kind == "terminal" and decision.isolated_workspace:
+            if decision.command_script is None:
+                _error("trusted command identity is unavailable")
+            # Execute the configured command in the clean trusted environment,
+            # never Hermes' mutable primary-container snapshot wrapper.
             result = _run_isolated_terminal(
                 decision.state,
-                arguments[4],
+                decision.command_script,
                 runner=active_runner,
                 deadline=command_deadline,
                 output_limit=output_limit,

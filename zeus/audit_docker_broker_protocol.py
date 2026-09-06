@@ -52,6 +52,36 @@ def _bootstrap_session_id(script: str) -> str | None:
     return session_id
 
 
+def _terminal_command_script(script: str, session_id: str | None) -> str:
+    """Recognize only the pinned Hermes wrapper at the audit workspace root."""
+    if session_id is None or _SESSION_ID_RE.fullmatch(session_id) is None:
+        return script
+    snapshot = f"{_CONTAINER_TEMP}/hermes-snap-{session_id}.sh"
+    marker = f"__HERMES_CWD_{session_id}__"
+    prefix = (
+        f"source {snapshot} >/dev/null 2>&1 || true\nbuiltin cd -- /workspace || exit 126\neval '"
+    )
+    suffix = (
+        "'\n__hermes_ec=$?\numask 077\n"
+        f"__hermes_snap_tmp=$(mktemp {snapshot}.tmp.XXXXXXXXXX) && "
+        "{ { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp" '
+        f'&& mv -f "$__hermes_snap_tmp" {snapshot}; }} '
+        '2>/dev/null || rm -f "$__hermes_snap_tmp" 2>/dev/null || true\n'
+        f"""printf '\\n{marker}%s{marker}\\n' "$(pwd -P)"\n"""
+        "exit $__hermes_ec"
+    )
+    if not script.startswith(prefix) or not script.endswith(suffix):
+        return script
+    escaped = script[len(prefix) : -len(suffix)]
+    command = escaped.replace("'\\''", "'")
+    # Reject alternate shell syntax: the eval operand must be exactly Hermes'
+    # single-quote encoding, including embedded quotes and newlines.
+    if command.replace("'", "'\\''") != escaped:
+        return script
+    return command
+
+
 def _expected_cgroup_probe(state: AuditDockerBrokerState) -> tuple[str, ...]:
     return (
         "run",
@@ -228,6 +258,7 @@ def _decide(
             )
             receipt_id: str | None = None
             isolated_workspace = False
+            command_script = _terminal_command_script(arguments[4], state.session_id)
             if state.schema_version >= 2:
                 if state.receipt_hmac_key is None:
                     return _Decision("breach", _breached(state, "receipt binding drift"))
@@ -246,7 +277,7 @@ def _decide(
                     snapshot_digest=state.snapshot_digest,
                     image_id=state.image_id,
                     sequence=sequence,
-                    command_script=arguments[4],
+                    command_script=command_script,
                     isolated_workspace=False,
                 )
                 if state.trusted_command_tags:
@@ -256,7 +287,7 @@ def _decide(
                         target_commit=state.target_commit,
                         snapshot_digest=state.snapshot_digest,
                         image_id=state.image_id,
-                        command_script=arguments[4],
+                        command_script=command_script,
                     )
                     isolated_workspace = any(
                         hmac.compare_digest(selector, trusted_tag)
@@ -277,7 +308,7 @@ def _decide(
                             snapshot_digest=state.snapshot_digest,
                             image_id=state.image_id,
                             sequence=sequence,
-                            command_script=arguments[4],
+                            command_script=command_script,
                             isolated_workspace=True,
                         )
                 updated = replace(
@@ -305,5 +336,6 @@ def _decide(
                 receipt_id=receipt_id,
                 started_at=now,
                 isolated_workspace=isolated_workspace,
+                command_script=command_script,
             )
     return _Decision("breach", _breached(state, "protocol drift"))

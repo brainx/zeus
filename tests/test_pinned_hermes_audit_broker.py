@@ -19,6 +19,7 @@ from zeus.audit_docker_broker import (
     read_audit_docker_broker_state,
 )
 from zeus.audit_models import HARD_LIMITS
+from zeus.audit_receipts import expected_command_receipt_tag
 
 RUN_ID = "2" * 32
 PROFILE = f"audit-{RUN_ID}"
@@ -187,6 +188,20 @@ class PinnedHermesAuditBrokerTests(unittest.TestCase):
             self.assertFalse(state.limit_breach)
             self.assertEqual("complete", state.cleanup_state)
             self.assertEqual("off", state.hermes_labels["hermes-egress"])
+            assert state.receipt_hmac_key is not None
+            receipt = state.terminal_receipts[0]
+            self.assertEqual(
+                receipt.command_tag,
+                expected_command_receipt_tag(
+                    key_hex=state.receipt_hmac_key,
+                    run_id=RUN_ID,
+                    target_commit=TARGET_COMMIT,
+                    snapshot_digest=SNAPSHOT_DIGEST,
+                    image_id=IMAGE_ID,
+                    command_script="printf AUDIT_BROKER_OK",
+                    receipt=receipt,
+                ),
+            )
 
             real_calls = [
                 json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()

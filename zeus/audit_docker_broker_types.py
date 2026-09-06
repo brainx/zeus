@@ -90,3 +90,4 @@ class Decision:
     receipt_id: str | None = None
     started_at: float | None = None
     isolated_workspace: bool = False
+    command_script: str | None = None
