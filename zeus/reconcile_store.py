@@ -135,9 +135,16 @@ class ReconcileStore:
                     raise KeyError(f"unknown reconciliation run: {safe_run_id}")
                 if run_row["outcome"] != "running":
                     raise RuntimeError("reconciliation run is not running")
-                current_run = self._materialize_reconcile_run(conn, safe_run_id)
-                if current_run is None:
-                    raise sqlite3.IntegrityError("reconciliation run disappeared")
+                current_run = self._reconcile_run_start_from_row(run_row)
+                if run_row["finished_at"] is not None:
+                    raise ValueError("running reconciliation must not have finished_at")
+                total = _validate_stored_nonnegative_integer(run_row["total"], "total")
+                counts = self._reconcile_counts_from_run_row(run_row)
+                if sum(counts.values()) != total:
+                    raise ValueError("reconciliation counters must sum to total")
+                # Earlier results were validated when appended. Revalidate the
+                # complete history on finish, read, and interruption, keeping
+                # this write transaction independent of the fleet's size.
                 if current_run.scope == "bot" and result.bot_id != current_run.requested_bot_id:
                     raise ValueError("reconciliation result must match the requested bot")
                 if result.started_at < current_run.started_at:
@@ -172,7 +179,7 @@ class ReconcileStore:
                     (
                         safe_run_id,
                         result.bot_id,
-                        current_run.total,
+                        total,
                         result.outcome.value,
                         result.desired_state,
                         result.observed_status,
@@ -368,9 +375,30 @@ class ReconcileStore:
         ).fetchone()
         if row is None:
             return None
+        run = self._reconcile_run_start_from_row(row)
         results = self._reconcile_results_in_transaction(conn, run_id)
         finished_at = row["finished_at"]
         return PersistedReconcileRun(
+            run_id=run.run_id,
+            scope=run.scope,
+            requested_bot_id=run.requested_bot_id,
+            source=run.source,
+            force=run.force,
+            reset_restart=run.reset_restart,
+            started_at=run.started_at,
+            finished_at=(
+                _parse_reconcile_timestamp(finished_at, "run finish timestamp")
+                if finished_at is not None
+                else None
+            ),
+            outcome=str(row["outcome"]),
+            total=_validate_stored_nonnegative_integer(row["total"], "total"),
+            counts=self._reconcile_counts_from_run_row(row),
+            results=results,
+        )
+
+    def _reconcile_run_start_from_row(self, row: sqlite3.Row) -> ReconcileRunStart:
+        return ReconcileRunStart(
             run_id=str(row["run_id"]),
             scope=str(row["scope"]),
             requested_bot_id=(
@@ -383,15 +411,6 @@ class ReconcileStore:
                 "reset-restart flag",
             ),
             started_at=_parse_reconcile_timestamp(row["started_at"], "run start timestamp"),
-            finished_at=(
-                _parse_reconcile_timestamp(finished_at, "run finish timestamp")
-                if finished_at is not None
-                else None
-            ),
-            outcome=str(row["outcome"]),
-            total=_validate_stored_nonnegative_integer(row["total"], "total"),
-            counts=self._reconcile_counts_from_run_row(row),
-            results=results,
         )
 
     def _reconcile_results_in_transaction(
@@ -400,7 +419,13 @@ class ReconcileStore:
         run_id: str,
     ) -> tuple[BotReconcileResult, ...]:
         rows = conn.execute(
-            "SELECT * FROM reconcile_results WHERE run_id = ? ORDER BY ordinal",
+            """
+            SELECT results.*, events.bot_id AS linked_event_bot_id
+            FROM reconcile_results AS results
+            LEFT JOIN lifecycle_events AS events ON events.event_id = results.event_id
+            WHERE results.run_id = ?
+            ORDER BY results.ordinal
+            """,
             (run_id,),
         ).fetchall()
         results: list[BotReconcileResult] = []
@@ -413,15 +438,10 @@ class ReconcileStore:
                 row["event_id"],
                 "result event id",
             )
-            if event_id is not None:
-                event_row = conn.execute(
-                    "SELECT bot_id FROM lifecycle_events WHERE event_id = ?",
-                    (event_id,),
-                ).fetchone()
-                if event_row is None or event_row["bot_id"] != bot_id:
-                    raise ValueError(
-                        "stored reconciliation lifecycle event does not match the result bot"
-                    )
+            if event_id is not None and row["linked_event_bot_id"] != bot_id:
+                raise ValueError(
+                    "stored reconciliation lifecycle event does not match the result bot"
+                )
             results.append(
                 BotReconcileResult(
                     bot_id=bot_id,
