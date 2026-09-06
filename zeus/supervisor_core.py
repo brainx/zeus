@@ -151,7 +151,10 @@ class _SupervisorCore:
         allow_legacy_pid_markers: bool = True,
         restart_backoff_cap_seconds: float = 3600.0,
         proc_start_fingerprint_reader: ProcStartFingerprintReader | None = None,
+        restart_stability_seconds: float = 30.0,
     ) -> None:
+        if not 0.0 <= restart_stability_seconds <= 86_400.0:
+            raise ValueError("restart_stability_seconds must be between 0 and 86400")
         self.store = store
         configured_hermes_root = _nofollow_absolute_path(Path(hermes_root))
         self.adapter = HermesAdapter(
@@ -169,6 +172,7 @@ class _SupervisorCore:
         self.readiness_interval_seconds = readiness_interval_seconds
         self.allow_legacy_pid_markers = allow_legacy_pid_markers
         self.restart_backoff_cap_seconds = restart_backoff_cap_seconds
+        self.restart_stability_seconds = restart_stability_seconds
         self._cleanup_process_group = os.name == "posix" and popen_factory is subprocess.Popen
         self._runtime = GatewayRuntime(
             self.adapter,

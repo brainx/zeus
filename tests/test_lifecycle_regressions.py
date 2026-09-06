@@ -478,7 +478,7 @@ class LifecycleRegressionTests(unittest.TestCase):
             self.assertEqual(event.event_id, result.event_id)
             self.assertEqual("bot.reconcile.stopped", result.action)
 
-    def test_reconcile_one_resets_stale_running_metadata_then_becomes_true_noop(self) -> None:
+    def test_reconcile_one_repairs_stale_metadata_without_erasing_retry_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             hermes_bin = self._fake_hermes(root)
@@ -518,7 +518,7 @@ class LifecycleRegressionTests(unittest.TestCase):
             self.assertIsNotNone(changed.event_id)
             loaded = store.get_bot("coder")
             assert loaded is not None
-            self.assertEqual(0, loaded.restart_attempts)
+            self.assertEqual(2, loaded.restart_attempts)
             self.assertIsNone(loaded.next_restart_at)
             self.assertIsNotNone(loaded.ready_at)
             event_count = len(store.list_lifecycle_events("coder", limit=10, before=None))

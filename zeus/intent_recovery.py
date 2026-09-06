@@ -19,6 +19,8 @@ _ContextT = TypeVar("_ContextT")
 
 
 class _RecoveryHost(Protocol[_ContextT]):
+    restart_stability_seconds: float
+
     def _recovery_lifecycle_context(
         self,
         operation_id: str,
@@ -298,7 +300,10 @@ class PendingIntentRecovery:
                     status=status,
                     pid=marker_pid,
                     ready_at=ready_at,
-                    reset_restart=True,
+                    reset_restart=(
+                        action == "restart"
+                        or (status is BotStatus.running and host.restart_stability_seconds == 0)
+                    ),
                     reason="recovery adopted registered gateway",
                 )
             except Exception:
