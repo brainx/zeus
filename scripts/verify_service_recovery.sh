@@ -11,7 +11,9 @@ fail() {
 [ "${ZEUS_SERVICE_RECOVERY_DRILL:-}" = "1" ] || fail "explicit CI opt-in is required"
 [ "${GITHUB_ACTIONS:-}" = "true" ] || fail "GitHub Actions is required"
 [ "${RUNNER_ENVIRONMENT:-}" = "github-hosted" ] || fail "a disposable GitHub-hosted runner is required"
-[ "${RUNNER_OS:-}" = "Linux" ] && [ "$(uname -s)" = "Linux" ] || fail "Linux is required"
+if [ "${RUNNER_OS:-}" != "Linux" ] || [ "$(uname -s)" != "Linux" ]; then
+  fail "Linux is required"
+fi
 [ "$(id -u)" = "0" ] || fail "run through sudo on the disposable runner"
 case "${SUDO_UID:-}:${SUDO_GID:-}" in
   *[!0-9:]*|:*|*:) fail "the invoking non-root runner identity is required" ;;
@@ -20,15 +22,21 @@ esac
 # This is an OS-owned configuration file, never a repository input.
 # shellcheck disable=SC1091
 . /etc/os-release
-[ "$ID" = "ubuntu" ] && [ "$VERSION_ID" = "24.04" ] || fail "Ubuntu 24.04 is required"
+if [ "$ID" != "ubuntu" ] || [ "$VERSION_ID" != "24.04" ]; then
+  fail "Ubuntu 24.04 is required"
+fi
 [ "$(cat /proc/1/comm)" = "systemd" ] || fail "systemd must be PID 1"
 [ -d /run/systemd/system ] || fail "the runtime unit directory is unavailable"
 repo_root=$(pwd -P)
 [ "$repo_root" = "${GITHUB_WORKSPACE:-}" ] || fail "run from the checked-out CI workspace"
-[ "$#" = 1 ] && [ -x "$1" ] || fail "provide the CI Python executable"
+if [ "$#" != 1 ] || [ ! -x "$1" ]; then
+  fail "provide the CI Python executable"
+fi
 build_python=$1
 set -- "$repo_root"/dist/*.whl
-[ "$#" = 1 ] && [ -f "$1" ] && [ ! -L "$1" ] || fail "expected exactly one built regular wheel"
+if [ "$#" != 1 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
+  fail "expected exactly one built regular wheel"
+fi
 wheel_path=$1
 
 umask 077
@@ -56,8 +64,10 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Only traversal is shared; the state, working directory, and environment are private.
-chmod 0711 "$drill_root"
+# Zeus opens ancestor directory descriptors read-only, so its service group
+# needs read and traversal here. State, work, and environment remain private.
+chgrp "$SUDO_GID" "$drill_root"
+chmod 0750 "$drill_root"
 "$build_python" -m venv "$drill_root/venv"
 PIP_NO_INDEX=1 "$venv_python" -m pip install --no-deps "$wheel_path"
 chmod -R a+rX "$drill_root/venv"

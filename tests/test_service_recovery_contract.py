@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from tests.fixtures.service_recovery_drill import (
     Drill,
+    command_failure_details,
     render_unit,
     require_plain_tree,
     validate_root,
@@ -185,6 +186,17 @@ class ServiceRecoveryContractTests(unittest.TestCase):
         self.assertEqual(arguments[4:7], (str(drill.root / "venv/bin/python"), "-I", "-c"))
         self.assertIn(str(drill.database), arguments)
         self.assertNotIn("immutable=1", arguments[7])
+
+    def test_command_diagnostics_are_bounded_and_redact_the_fixture_key(self) -> None:
+        error = subprocess.CalledProcessError(
+            1, ["runuser"], output="x" * 5000 + "fixture-key", stderr="\x1bproblem fixture-key"
+        )
+        details = command_failure_details(error, "fixture-key")
+        self.assertNotIn("fixture-key", details)
+        self.assertNotIn("\x1b", details)
+        self.assertIn("[redacted]", details)
+        self.assertIn("stderr: problem", details)
+        self.assertLessEqual(len(details), 2 * 2048 + len("stdout: \nstderr: "))
 
     def test_backup_restore_round_trip_is_quiesced_and_preserves_ledger_and_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -47,6 +47,16 @@ def require(condition: object, message: str) -> None:
         raise RuntimeError(message)
 
 
+def command_failure_details(exc: subprocess.CalledProcessError, key: str) -> str:
+    details = []
+    for name, output in (("stdout", exc.stdout), ("stderr", exc.stderr)):
+        if output:
+            redacted = output.replace(key, "[redacted]") if key else output
+            safe = "".join(char for char in redacted if char.isprintable() or char in "\n\t")
+            details.append(f"{name}: {safe[-2048:]}")
+    return "\n".join(details)
+
+
 def validate_root(root: Path, uid: int) -> None:
     require(root.parent == Path("/run"), "temporary root must be directly beneath /run")
     require(re.fullmatch(r"zeus-service-recovery\.[A-Za-z0-9]{8}", root.name), "invalid root name")
@@ -109,6 +119,7 @@ class Drill:
         self.ready = threading.Event()
         self.key = ""
         self.port = 0
+        self.phase = "setup"
 
     def command(
         self, *argv: str, check: bool = True, timeout: float = 25, cwd: Path | None = None
@@ -278,6 +289,7 @@ class Drill:
         self.systemctl("daemon-reload")
 
     def cleanup(self) -> None:
+        self.phase = "cleanup"
         owned = []
         for unit in self.units:
             path = Path("/run/systemd/system") / unit
@@ -342,6 +354,7 @@ class Drill:
             worker.start()
             try:
                 self.install_units(health.server_port)
+                self.phase = "create fixture bot"
                 self.cli(
                     "bot",
                     "create",
@@ -354,6 +367,7 @@ class Drill:
                     "0",
                     "--json",
                 )
+                self.phase = "start API"
                 self.systemctl("start", self.api)
                 wait_for(self.api_ready, "API readiness")
                 initial_api_pid = self.systemctl("show", self.api, "--property=MainPID", "--value")
@@ -364,6 +378,7 @@ class Drill:
                             "POST", "/bots/recovery-bot/start?wait=true&timeout=60", timeout=65
                         )
 
+                self.phase = "interrupt pending API start"
                 request_worker = threading.Thread(target=blocked_start, daemon=True)
                 request_worker.start()
                 wait_for(
@@ -396,6 +411,7 @@ class Drill:
                     "API cgroup gateway cleanup",
                 )
                 self.ready.set()
+                self.phase = "recover pending intent"
                 self.systemctl("start", self.reconcile)
                 recovered_pid = self.assert_converged()
                 require(
@@ -418,6 +434,7 @@ class Drill:
                 count = self.rows(
                     "SELECT count(*) AS count FROM reconcile_runs WHERE outcome = 'succeeded'"
                 )[0]["count"]
+                self.phase = "verify timer passes"
                 self.systemctl("start", self.timer)
                 wait_for(
                     lambda: (
@@ -437,11 +454,13 @@ class Drill:
                 self.systemctl("stop", self.timer, self.reconcile, self.api)
                 recovered_identity = self.process_identity(recovered_pid)
                 require(recovered_identity, "stopping reconciliation killed its gateway")
+                self.phase = "quiesced backup and restore"
                 self.backup_restore()
                 require(
                     self.bot()["desired_state"] == "stopped" and not self.processes(),
                     "restored stopped snapshot launched a gateway",
                 )
+                self.phase = "start restored bot"
                 self.systemctl("start", self.api)
                 wait_for(self.api_ready, "restored API readiness")
                 self.request("POST", "/bots/recovery-bot/start?wait=true&timeout=10", timeout=15)
@@ -453,6 +472,7 @@ class Drill:
                     != (recovered_pid, recovered_identity),
                     "restore reused a stale gateway generation",
                 )
+                self.phase = "stop restored gateway"
                 self.cli("bot", "stop", "recovery-bot", "--json")
                 wait_for(lambda: not self.processes(), "exact-ownership gateway stop")
                 require(
@@ -534,7 +554,9 @@ if __name__ == "__main__":
         getattr(drill, sys.argv[1])()
     except subprocess.CalledProcessError as exc:
         print(
-            f"service recovery command failed: {exc.cmd[0]} (exit {exc.returncode})",
+            f"service recovery command failed during {drill.phase}: "
+            f"{exc.cmd[0]} (exit {exc.returncode})",
             file=sys.stderr,
         )
+        print(command_failure_details(exc, drill.key), file=sys.stderr)
         raise SystemExit(1) from None
