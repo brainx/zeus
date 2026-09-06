@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import zeus.profile_manager as profile_manager_module
 from zeus.errors import BotArchiveError, BotDeleteError
+from zeus.lifecycle import LifecycleEventInput
 from zeus.models import BotCreateRequest, BotRecord
 from zeus.profile_manager import ProfileArchive, ProfileDeletion, ProfileManager
 from zeus.state import StateStore
@@ -110,6 +111,138 @@ class ProfileManagerTests(unittest.TestCase):
             self.assertEqual(original_inode, profile.stat().st_ino)
             self.assertEqual(before, after)
             self.assertEqual(["coder"], sorted(path.name for path in profile.parent.iterdir()))
+
+    def test_supervisor_keeps_committed_profile_when_audit_mirror_is_cancelled(self) -> None:
+        for replace_existing in (False, True):
+            for interruption in (KeyboardInterrupt(), SystemExit(23)):
+                with (
+                    self.subTest(replace=replace_existing, interruption=type(interruption)),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = Path(tmp)
+                    if replace_existing:
+                        store, supervisor, profile = self._supervisor_with_bot(root)
+                    else:
+                        store = StateStore(root / "zeus.db")
+                        store.init()
+                        supervisor = Supervisor(store, "hermes", root / "hermes")
+                        profile = self._profile(root)
+                    template = replace(TemplateStore().get("coding-bot"), soul="new profile")
+                    with (
+                        patch.object(
+                            store._bot_lifecycle,
+                            "_append_lifecycle_audit",
+                            side_effect=interruption,
+                        ),
+                        self.assertRaises(type(interruption)) as raised,
+                    ):
+                        supervisor.create_bot(
+                            BotCreateRequest(bot_id="coder", template_id="coding-bot"),
+                            template,
+                            replace_existing=replace_existing,
+                        )
+                    self.assertIs(interruption, raised.exception)
+                    record = store.get_bot("coder")
+                    self.assertIsNotNone(record)
+                    self.assertEqual("new profile\n", (profile / "SOUL.md").read_text())
+                    self.assertEqual(
+                        ["coder"], sorted(path.name for path in profile.parent.iterdir())
+                    )
+                    action = "bot.replace" if replace_existing else "bot.create"
+                    events = store.list_lifecycle_events("coder", limit=10, before=None)
+                    self.assertEqual([action], [event.action for event in events])
+
+    def test_supervisor_rolls_back_profile_when_cancelled_before_registry_commit(self) -> None:
+        for interruption in (KeyboardInterrupt(), SystemExit(23)):
+            with (
+                self.subTest(interruption=type(interruption)),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                store, supervisor, profile = self._supervisor_with_bot(root)
+                previous = store.get_bot("coder")
+                with (
+                    patch.object(
+                        store._bot_lifecycle,
+                        "_insert_lifecycle_event",
+                        side_effect=interruption,
+                    ),
+                    self.assertRaises(type(interruption)) as raised,
+                ):
+                    supervisor.create_bot(
+                        BotCreateRequest(bot_id="coder", template_id="coding-bot"),
+                        TemplateStore().get("coding-bot"),
+                        replace_existing=True,
+                    )
+                self.assertIs(interruption, raised.exception)
+                self.assertEqual(previous, store.get_bot("coder"))
+                self.assertEqual("original\n", (profile / "sentinel.txt").read_text())
+                self.assertFalse((profile / "SOUL.md").exists())
+
+    def test_supervisor_keeps_committed_removal_when_audit_mirror_is_cancelled(self) -> None:
+        for action in ("delete", "archive"):
+            for interruption in (KeyboardInterrupt(), SystemExit(23)):
+                with (
+                    self.subTest(action=action, interruption=type(interruption)),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = Path(tmp)
+                    store, supervisor, profile = self._supervisor_with_bot(root)
+                    with (
+                        patch.object(
+                            store._bot_lifecycle,
+                            "_append_lifecycle_audit",
+                            side_effect=interruption,
+                        ),
+                        self.assertRaises(type(interruption)) as raised,
+                    ):
+                        if action == "delete":
+                            supervisor.delete_bot("coder", remove_profile=True)
+                        else:
+                            supervisor.archive_bot("coder")
+                    self.assertIs(interruption, raised.exception)
+                    self.assertIsNone(store.get_bot("coder"))
+                    self.assertFalse(profile.exists())
+                    self.assertEqual([], list(profile.parent.iterdir()))
+                    if action == "archive":
+                        archives = list((root / "archive").iterdir())
+                        self.assertEqual(1, len(archives))
+                        self.assertEqual("original\n", (archives[0] / "sentinel.txt").read_text())
+                    events = store.list_lifecycle_events("coder", limit=10, before=None)
+                    self.assertEqual([f"bot.{action}"], [event.action for event in events])
+
+    def test_deferred_mirror_flushes_failed_operations_without_masking_the_error(self) -> None:
+        for mirror_error in (None, KeyboardInterrupt(), SystemExit(23)):
+            with (
+                self.subTest(mirror_error=type(mirror_error)),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                store, _supervisor, _profile = self._supervisor_with_bot(root)
+                record = store.get_bot("coder")
+                assert record is not None
+                operation_error = RuntimeError("operation failed after a committed event")
+                with (
+                    patch.object(
+                        store._bot_lifecycle, "_append_lifecycle_audit", side_effect=mirror_error
+                    ) as mirror,
+                    self.assertRaises(RuntimeError) as raised,
+                    store.defer_lifecycle_audit(),
+                ):
+                    store.upsert_bot_with_event(
+                        record,
+                        event=LifecycleEventInput(
+                            bot_id="coder",
+                            operation_id="a" * 32,
+                            source="cli",
+                            action="bot.replace",
+                            outcome="success",
+                        ),
+                    )
+                    mirror.assert_not_called()
+                    raise operation_error
+                self.assertIs(operation_error, raised.exception)
+                mirror.assert_called_once()
 
     def test_delete_stage_rollback_and_finish_use_a_pinned_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

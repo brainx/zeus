@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -34,6 +36,26 @@ def _sanitize_optional_persisted_text(value: str | None) -> str | None:
 class BotLifecycleStore:
     def __init__(self, database: SQLiteDatabase) -> None:
         self._database = database
+        self._audit_events = ContextVar[list[LifecycleEvent] | None]("audit_events", default=None)
+
+    @contextmanager
+    def defer_audit_mirror(self) -> Iterator[None]:
+        """Keep post-commit mirroring outside callers' filesystem rollback regions."""
+        if self._audit_events.get() is not None:
+            yield
+            return
+        events: list[LifecycleEvent] = []
+        token = self._audit_events.set(events)
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            self._audit_events.reset(token)
+            # Preserve the original failure even if mirroring is cancelled.
+            for event in events:
+                with nullcontext() if succeeded else suppress(BaseException):
+                    self._append_lifecycle_audit_fail_open(event)
 
     def begin_lifecycle_intent(
         self,
@@ -1005,6 +1027,10 @@ class BotLifecycleStore:
         return self._row_to_lifecycle_event(row)
 
     def _append_lifecycle_audit_fail_open(self, event: LifecycleEvent) -> None:
+        deferred = self._audit_events.get()
+        if deferred is not None:
+            deferred.append(event)
+            return
         try:
             self._append_lifecycle_audit(event)
         except Exception:
