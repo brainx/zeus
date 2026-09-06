@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added opt-in operator messaging through `zeus message send/retry/status/cancel/list`,
+  with durable schema-v8 receipts, bounded authenticated Hermes runs requests,
+  launch-bound profile limits and explicit recovery after uncertain dispatch.
+
 - Added explicit live gateway diagnostics through `zeus bot diagnostics` and
   the authenticated API. Results bind Hermes's detailed health response to
   the observed gateway generation without changing lifecycle state.

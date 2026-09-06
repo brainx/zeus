@@ -242,7 +242,15 @@ The v2-to-v3 migration is also one transaction. It creates a
 the projection/event invariant, and advances the schema version only after all
 steps succeed. Additive v3-to-v4 and v4-to-v5 upgrades add durable idempotency
 and desired/pending intent in forward-only transactions. Databases newer than
-schema v7 are rejected rather than downgraded.
+schema v8 are rejected rather than downgraded.
+
+Schema v8 adds operator-message receipts without rewriting bot projections or
+events. A FULL-synchronous transaction reserves a stable upstream idempotency key
+before an HTTP request; no database lock spans network I/O. Attempt leases and
+compare-and-swap versions prevent overlapping retries or stale acknowledgements.
+One unresolved/nonterminal receipt is admitted per bot incarnation. The captured
+process generation and launch-bound messaging policy are checked around network
+operations. See [operator messaging](MESSAGING.md) for recovery and its limits.
 
 `$ZEUS_STATE_DIR/logs/audit.jsonl` remains a best-effort compatibility mirror.
 It is written only after the SQLite transaction commits and is not imported into

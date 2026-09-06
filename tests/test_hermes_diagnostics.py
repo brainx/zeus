@@ -176,7 +176,7 @@ class HermesDiagnosticsTests(unittest.TestCase):
             " http://127.0.0.1:8642/health",
             "http://127.0.0.1:8642/health\n",
         )
-        with patch("zeus.hermes_diagnostics.socket.socket") as connect:
+        with patch("zeus.gateway_http.socket.socket") as connect:
             for url in urls:
                 with self.subTest(url=url):
                     self.assertEqual(
@@ -339,12 +339,12 @@ class HermesDiagnosticsTests(unittest.TestCase):
                 )
 
     def test_unavailable_network_and_invalid_budgets_return_fixed_reasons(self) -> None:
-        with patch("zeus.hermes_diagnostics.socket.socket", side_effect=OSError(_KEY)):
+        with patch("zeus.gateway_http.socket.socket", side_effect=OSError(_KEY)):
             self.assertEqual(
                 ("health_unavailable", None),
                 probe_gateway_health("http://127.0.0.1:8642/health", _KEY, _PID),
             )
-        with patch("zeus.hermes_diagnostics.socket.socket") as connect:
+        with patch("zeus.gateway_http.socket.socket") as connect:
             for timeout in (0, -1, float("nan"), float("inf")):
                 with self.subTest(timeout=timeout):
                     self.assertEqual(
@@ -414,8 +414,8 @@ class HermesDiagnosticsTests(unittest.TestCase):
 
         with (
             _Server(_http(json.dumps(_payload()).encode())) as server,
-            patch("zeus.hermes_diagnostics.threading.Timer", side_effect=record_timer),
-            patch("zeus.hermes_diagnostics.json.loads", side_effect=KeyboardInterrupt),
+            patch("zeus.gateway_http.threading.Timer", side_effect=record_timer),
+            patch("zeus.gateway_http.json.loads", side_effect=KeyboardInterrupt),
             self.assertRaises(KeyboardInterrupt),
         ):
             probe_gateway_health(server.url, _KEY, _PID)

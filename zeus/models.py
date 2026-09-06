@@ -197,15 +197,47 @@ class HermesTerminalConfig:
 
 
 @dataclass(frozen=True)
+class HermesApiServerConfig:
+    max_concurrent_runs: int = 1
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> HermesApiServerConfig:
+        if set(data) - {"max_concurrent_runs"}:
+            raise TemplateError("hermes.gateway.api_server contains unsupported settings")
+        return cls(
+            max_concurrent_runs=_int(
+                data.get("max_concurrent_runs"),
+                "hermes.gateway.api_server.max_concurrent_runs",
+                default=1,
+                minimum=1,
+                maximum=32,
+            )
+        )
+
+
+@dataclass(frozen=True)
 class HermesGatewayConfig:
     enabled: bool = True
+    api_server: HermesApiServerConfig | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> HermesGatewayConfig:
-        return cls(enabled=_bool(data.get("enabled"), "hermes.gateway.enabled", default=True))
+        return cls(
+            enabled=_bool(data.get("enabled"), "hermes.gateway.enabled", default=True),
+            api_server=(
+                HermesApiServerConfig.from_dict(
+                    _mapping(data["api_server"], "hermes.gateway.api_server")
+                )
+                if "api_server" in data
+                else None
+            ),
+        )
 
     def to_config(self) -> dict[str, Any]:
-        return {"enabled": self.enabled}
+        config: dict[str, Any] = {"enabled": self.enabled}
+        if self.api_server is not None:
+            config["api_server"] = {"max_concurrent_runs": self.api_server.max_concurrent_runs}
+        return config
 
 
 @dataclass(frozen=True)

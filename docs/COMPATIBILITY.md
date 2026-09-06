@@ -44,13 +44,15 @@ are retained for seven days and do not carry signed release evidence.
 
 Unset or empty `ZEUS_SQLITE_SYNCHRONOUS` configuration remains NORMAL, as do
 direct `StateStore(path)` and `SQLiteDatabase(path)` calls. Upgrading therefore
-does not silently change local commit latency. FULL is an explicit
+does not silently change the durability policy for ordinary state commits. FULL is an explicit
 higher-durability option for deployments that accept its additional commit
-latency.
+latency. Operator-message receipt writes always use FULL, independently of this
+setting, to persist dispatch intent before submitting a job.
 
 The synchronous policy itself does not change database structure. Zeus v0.6
 adds an independent forward-only migration from schema v6 to schema v7 for
-operator-query indexes. Existing v6 databases upgrade during normal startup;
+operator-query indexes. Schema v8 then adds durable operator-message receipts.
+Existing v6/v7 databases upgrade during normal startup;
 read-only history/fleet commands require the current schema. Keep all writers
 on the same Zeus version and retain a quiesced backup for rollback.
 

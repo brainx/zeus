@@ -1,15 +1,9 @@
 from __future__ import annotations
 
-import contextlib
-import io
-import json
 import math
-import re
-import socket
-import threading
-import time
-from http.client import HTTPException, HTTPResponse
 from typing import cast
+
+from .gateway_http import GatewayHTTPError, request_json
 
 MAX_HEALTH_RESPONSE_BYTES = 64 * 1024
 MAX_HEALTH_COUNTER = 2**63 - 1
@@ -36,27 +30,10 @@ GATEWAY_STATES = frozenset(
 )
 _HEALTH_STATES = frozenset({"ok", "degraded"})
 _SESSION_STATES = frozenset({"ok", "unavailable", "retrying"})
-_ENDPOINT = re.compile(r"http://(127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})/health", re.I)
 
 
 class _InvalidHealth(ValueError):
     pass
-
-
-class _HeaderReader(io.BufferedReader):
-    """Bound aggregate headers as well as the HTTP parser's individual lines."""
-
-    remaining = MAX_HEALTH_RESPONSE_BYTES
-
-    def readline(self, size: int | None = -1) -> bytes:
-        limit = self.remaining + 1
-        if size is not None and size >= 0:
-            limit = min(limit, size)
-        line = super().readline(limit)
-        self.remaining -= len(line)
-        if self.remaining < 0:
-            raise _InvalidHealth
-        return line
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -150,35 +127,6 @@ def _project(payload: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise _InvalidHealth
-        result[key] = value
-    return result
-
-
-def _reject_constant(value: str) -> object:
-    raise _InvalidHealth
-
-
-def _validate_headers(response: HTTPResponse) -> None:
-    lengths = response.headers.get_all("Content-Length", [])
-    if any(re.fullmatch(r"[0-9]+", value) is None for value in lengths):
-        raise _InvalidHealth
-    if lengths:
-        parsed = {int(value) for value in lengths}
-        if len(parsed) != 1 or max(parsed) > MAX_HEALTH_RESPONSE_BYTES:
-            raise _InvalidHealth
-    encodings = response.headers.get_all("Transfer-Encoding", [])
-    if encodings and (lengths or encodings != ["chunked"]):
-        raise _InvalidHealth
-    content_encoding = response.headers.get_all("Content-Encoding", [])
-    if content_encoding and content_encoding != ["identity"]:
-        raise _InvalidHealth
-
-
 def probe_gateway_health(
     url: str,
     api_key: str,
@@ -187,85 +135,26 @@ def probe_gateway_health(
     timeout_seconds: float = 2.0,
 ) -> tuple[str, dict[str, object] | None]:
     """Observe one pinned gateway; this never proves provider health or safe shutdown."""
-    match = _ENDPOINT.fullmatch(url)
-    if match is None or not 1 <= int(match[2]) <= 65535:
-        return "invalid_endpoint", None
-    if not 16 <= len(api_key) <= 4096 or any(not 33 <= ord(char) <= 126 for char in api_key):
-        return "credentials_unavailable", None
     try:
         _count(expected_pid, positive=True)
     except _InvalidHealth:
         return "pid_mismatch", None
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        return "timeout", None
-    host = match[1].lower()
-    if host == "localhost":
-        host = "127.0.0.1"
-    family = socket.AF_INET6 if host == "[::1]" else socket.AF_INET
-    address = "::1" if family == socket.AF_INET6 else host
-    deadline = time.monotonic() + timeout_seconds
-    expired = threading.Event()
-    connection: socket.socket | None = None
-    response: HTTPResponse | None = None
-    timer: threading.Timer | None = None
-
-    def expire() -> None:
-        expired.set()
-        if connection is not None:
-            # Closing a socket alone does not interrupt its buffered file reads.
-            with contextlib.suppress(OSError):
-                connection.shutdown(socket.SHUT_RDWR)
-
     try:
-        connection = socket.socket(family, socket.SOCK_STREAM)
-        timer = threading.Timer(max(0.0, deadline - time.monotonic()), expire)
-        timer.daemon = True
-        timer.start()
-        # Numeric addresses avoid DNS; direct sockets use no ambient proxy settings.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return "timeout", None
-        connection.settimeout(remaining)
-        connection.connect((address, int(match[2])))
-        if expired.is_set() or time.monotonic() >= deadline:
-            return "timeout", None
-        request = (
-            "GET /health/detailed HTTP/1.1\r\n"
-            f"Host: {host}:{int(match[2])}\r\n"
-            f"Authorization: Bearer {api_key}\r\n"
-            "Accept: application/json\r\nConnection: close\r\n\r\n"
+        status, payload = request_json(
+            url,
+            api_key,
+            "/health/detailed",
+            max_bytes=MAX_HEALTH_RESPONSE_BYTES,
+            timeout_seconds=timeout_seconds,
         )
-        connection.sendall(request.encode("ascii"))
-        response = HTTPResponse(connection, method="GET")
-        if not isinstance(response.fp, io.BufferedReader):
-            raise _InvalidHealth
-        # Reuse the raw socket reader: nesting buffered readers can wait for a
-        # full buffer even when a complete fixed-length response has arrived.
-        response.fp = _HeaderReader(response.fp.detach())
-        response.begin()
-        _validate_headers(response)
-        if expired.is_set() or time.monotonic() >= deadline:
-            return "timeout", None
-        if response.status in {401, 403}:
+        if status in {401, 403}:
             return "authentication_failed", None
-        if response.status == 404:
+        if status == 404:
             return "unsupported_runtime", None
-        if response.status != 200:
+        if status != 200:
             return "health_unavailable", None
-        # HTTPResponse honors fixed lengths/chunks; the timer also interrupts
-        # slow-drip headers, chunk framing, and bodies that defeat idle timeouts.
-        body = response.read(MAX_HEALTH_RESPONSE_BYTES + 1)
-        if expired.is_set() or time.monotonic() >= deadline:
-            return "timeout", None
-        if len(body) > MAX_HEALTH_RESPONSE_BYTES or response.length not in {0, None}:
+        if payload is None:
             return "invalid_health", None
-        payload = _mapping(
-            json.loads(
-                body.decode("utf-8"),
-                object_pairs_hook=_json_object,
-                parse_constant=_reject_constant,
-            )
-        )
         if not isinstance(payload["platform"], str) or not isinstance(payload["version"], str):
             return "invalid_health", None
         if payload["platform"] != "hermes-agent" or payload["version"] != HERMES_VERSION:
@@ -273,26 +162,13 @@ def probe_gateway_health(
         if _count(payload["pid"], positive=True) != expected_pid:
             return "pid_mismatch", None
         projected = _project(payload)
-        if expired.is_set() or time.monotonic() >= deadline:
-            return "timeout", None
         return str(projected["status"]), projected
-    except TimeoutError:
-        return "timeout", None
-    except OSError:
-        if expired.is_set() or time.monotonic() >= deadline:
-            return "timeout", None
-        return "health_unavailable", None
-    except (HTTPException, ValueError, KeyError, RecursionError):
-        if expired.is_set() or time.monotonic() >= deadline:
-            return "timeout", None
+    except GatewayHTTPError as exc:
+        reason = {
+            "gateway_unavailable": "health_unavailable",
+            "invalid_response": "invalid_health",
+            "invalid_request": "invalid_health",
+        }.get(exc.code, exc.code)
+        return reason, None
+    except (ValueError, KeyError, RecursionError):
         return "invalid_health", None
-    finally:
-        if timer is not None:
-            timer.cancel()
-            timer.join()
-        if response is not None:
-            with contextlib.suppress(OSError):
-                response.close()
-        if connection is not None:
-            with contextlib.suppress(OSError):
-                connection.close()

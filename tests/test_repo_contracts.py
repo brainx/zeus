@@ -205,6 +205,7 @@ class RepoContractTests(unittest.TestCase):
             "docs/SYSTEMD.md",
             "docs/OPERATIONS.md",
             "docs/RECONCILE.md",
+            "docs/MESSAGING.md",
             "docs/RELEASE.md",
             "docs/COMPATIBILITY.md",
             "docs/openapi.json",
@@ -226,6 +227,7 @@ class RepoContractTests(unittest.TestCase):
             "scripts/repo_check.sh",
             "scripts/check_hermes_dependency_overrides.py",
             "scripts/install_pinned_hermes.sh",
+            "scripts/verify_pinned_hermes_runs.py",
             "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
@@ -239,6 +241,7 @@ class RepoContractTests(unittest.TestCase):
             "zeus/bundled_templates/kimi-k3-coding-bot.toml",
             "zeus/bundled_templates/docs-writer-bot.toml",
             "zeus/bundled_templates/gateway-operator.toml",
+            "zeus/bundled_templates/message-bot.toml",
             "zeus/bundled_templates/log-triage-bot.toml",
             "zeus/bundled_templates/research-bot.toml",
             "zeus/bundled_templates/support-gateway.toml",
@@ -246,6 +249,7 @@ class RepoContractTests(unittest.TestCase):
             "templates/kimi-k3-coding-bot.toml",
             "templates/docs-writer-bot.toml",
             "templates/gateway-operator.toml",
+            "templates/message-bot.toml",
             "templates/log-triage-bot.toml",
         ]
 
@@ -371,6 +375,11 @@ class RepoContractTests(unittest.TestCase):
                 "sh scripts/install_pinned_hermes.sh",
                 "python -m pip install -e .",
                 "python scripts/check_hermes_dependency_overrides.py",
+                "umask 077\n"
+                "printf '%s\\n' 'result=failed' \\\n"
+                "  'failure_stage=pinned_hermes_runs' \\\n"
+                "  > .tmp/real-hermes-evidence/summary.txt\n"
+                "python scripts/verify_pinned_hermes_runs.py",
                 "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
                 "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.21.0 \\\n"
                 "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
@@ -765,6 +774,7 @@ class RepoContractTests(unittest.TestCase):
             "kimi-k3-coding-bot",
             "docs-writer-bot",
             "gateway-operator",
+            "message-bot",
             "log-triage-bot",
             "research-bot",
             "support-gateway",

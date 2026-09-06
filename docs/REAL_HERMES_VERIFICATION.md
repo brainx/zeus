@@ -21,6 +21,22 @@ a missing or mismatched Hermes installation fails instead of skipping the test.
 The gate does not run the remote installer or make a
 model-provider request.
 
+The same pinned environment must also pass:
+
+```sh
+python scripts/verify_pinned_hermes_runs.py
+```
+
+This required check runs the actual capabilities, submission, status and stop
+handlers with Hermes's durable SQLite idempotency store. A test agent supplies
+deterministic output without provider/tool execution. It checks authentication,
+replay/conflict, the startup concurrency limit, cooperative cancellation and
+replay after a fresh worker process. Disposable homes, a minimal environment
+and a non-loopback connection guard isolate the test. A missing or mismatched
+Hermes version fails the check. Full gateway startup is covered separately by
+the separate compatibility check; this handler test does not establish a tool
+sandbox, hard runtime deadline or exactly-once external effects.
+
 Before a release, verify against a real Hermes install:
 
 ```bash

@@ -17,6 +17,7 @@ from zeus.diagnostics_cli import run_diagnostics_command
 from zeus.doctor import report_to_json, report_to_text, run_doctor
 from zeus.envfile import ENV_KEY_RE
 from zeus.errors import ZeusConflictError
+from zeus.messaging_cli import add_messaging_parsers, run_messaging_command
 from zeus.models import BotCreateRequest, BotStatus, BotStatusResponse, RestartPolicy, TemplateError
 from zeus.operator_cli import add_operator_parsers, run_operator_command
 from zeus.process_lock import LockTimeoutError
@@ -42,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="resource", required=True)
     add_operator_parsers(sub)
+    add_messaging_parsers(sub)
 
     serve_description = "Run the local Zeus HTTP API server."
     serve_cmd = sub.add_parser(
@@ -595,6 +597,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.resource == "bot" and args.action == "diagnostics":
         return run_diagnostics_command(args, settings)
+
+    if args.resource == "message":
+        return run_messaging_command(args, settings)
 
     store, supervisor = _services(settings)
 
