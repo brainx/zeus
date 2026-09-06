@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import call, patch
 
 from tests.host_capabilities import child_process_identity_available
+from tests.test_api import api_server
 from zeus import __version__
 from zeus.api import main as api_main
 from zeus.api import make_handler
@@ -5181,49 +5182,33 @@ raise SystemExit(0)
         self.assertEqual(1, len(created))
 
     def test_api_non_health_endpoints_require_configured_api_key(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            settings = Settings.from_env(
-                {
-                    "ZEUS_STATE_DIR": str(root / ".zeus"),
-                    "ZEUS_HOST": "127.0.0.1",
-                    "ZEUS_PORT": "0",
-                }
+        with (
+            api_server() as port,
+            closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as conn,
+        ):
+            conn.request("GET", "/health")
+            response = conn.getresponse()
+            self.assertEqual(200, response.status)
+            response.read()
+
+            conn.request("GET", "/bots")
+            response = conn.getresponse()
+            self.assertEqual(503, response.status)
+            body = json.loads(response.read())
+            self.assertEqual("missing_api_key", body["error"]["code"])
+            self.assertIn("ZEUS_API_KEY", body["error"]["message"])
+
+            conn.request(
+                "POST",
+                "/bots",
+                body=b"{}",
+                headers={"content-type": "application/json", "x-zeus-api-key": "anything"},
             )
-            handler = make_handler(settings)
-            from http.server import ThreadingHTTPServer
-
-            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            try:
-                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-                conn.request("GET", "/health")
-                response = conn.getresponse()
-                self.assertEqual(200, response.status)
-                response.read()
-
-                conn.request("GET", "/bots")
-                response = conn.getresponse()
-                self.assertEqual(503, response.status)
-                body = json.loads(response.read())
-                self.assertEqual("missing_api_key", body["error"]["code"])
-                self.assertIn("ZEUS_API_KEY", body["error"]["message"])
-
-                conn.request(
-                    "POST",
-                    "/bots",
-                    body=b"{}",
-                    headers={"content-type": "application/json", "x-zeus-api-key": "anything"},
-                )
-                response = conn.getresponse()
-                self.assertEqual(503, response.status)
-                body = json.loads(response.read())
-                self.assertEqual("missing_api_key", body["error"]["code"])
-                self.assertIn("ZEUS_API_KEY", body["error"]["message"])
-            finally:
-                server.shutdown()
-                server.server_close()
+            response = conn.getresponse()
+            self.assertEqual(503, response.status)
+            body = json.loads(response.read())
+            self.assertEqual("missing_api_key", body["error"]["code"])
+            self.assertIn("ZEUS_API_KEY", body["error"]["message"])
 
     def test_api_allow_unauth_reads_keeps_mutations_locked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
