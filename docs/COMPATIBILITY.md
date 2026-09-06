@@ -77,8 +77,11 @@ The deterministic CI baseline is Hermes Agent 0.21.0 on Ubuntu 24.04 with Python
 archive and verifies SHA-256
 `76b99a8be9b77d66833c3cfe2b35c6d6f6a58e4ff9637ef8effcfc1f420ab35a`
 before installation. [`requirements-hermes-ci.txt`](../requirements-hermes-ci.txt)
-pins the complete 64-package Linux x86_64 runtime and build closure and its
-selected SHA-256 hashes. CI installs that closure with dependency resolution
+pins the complete 72-package Linux x86_64 runtime and build closure and its
+selected SHA-256 hashes. This includes the API adapter's optional upstream
+`aiohttp==3.14.3` dependency and its required packages; Hermes's core FastAPI
+dependency serves its Web UI and does not replace that adapter dependency.
+CI installs that closure with dependency resolution
 disabled, pip hash checking, and binary-only artifacts, then extracts the
 verified archive into a retained CI source checkout and installs it editable
 with dependencies and build isolation disabled. This follows Hermes 0.21's

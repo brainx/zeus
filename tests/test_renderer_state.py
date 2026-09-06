@@ -166,7 +166,7 @@ class RendererStateTests(unittest.TestCase):
             self.assertEqual(1, count)
             self.assertEqual(SCHEMA_VERSION, version)
 
-    def test_state_v3_to_v7_migration_is_exact_additive_and_idempotent(self) -> None:
+    def test_state_v3_to_v8_migration_is_exact_additive_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
@@ -187,6 +187,7 @@ class RendererStateTests(unittest.TestCase):
                 ),
             )
             with closing(sqlite3.connect(database)) as conn:
+                conn.execute("DROP TABLE message_receipts")
                 conn.execute("DROP TABLE reconcile_results")
                 conn.execute("DROP TABLE reconcile_runs")
                 conn.execute("DROP TABLE idempotency_records")
@@ -236,6 +237,7 @@ class RendererStateTests(unittest.TestCase):
             store = StateStore(database)
             store.init()
             with closing(sqlite3.connect(database)) as conn:
+                conn.execute("DROP TABLE message_receipts")
                 conn.execute("DROP TABLE idempotency_records")
                 conn.execute("UPDATE schema_version SET version = 3")
                 conn.execute("CREATE VIEW idempotency_records AS SELECT 1 AS value")
@@ -252,13 +254,13 @@ class RendererStateTests(unittest.TestCase):
             self.assertEqual(3, version)
             self.assertEqual("view", object_type)
 
-    def test_state_rejects_v8_without_mutating_database(self) -> None:
+    def test_state_rejects_v9_without_mutating_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
             store.init()
             with closing(sqlite3.connect(database)) as conn:
-                conn.execute("UPDATE schema_version SET version = 8")
+                conn.execute("UPDATE schema_version SET version = 9")
                 conn.commit()
                 before = list(conn.iterdump())
 
@@ -268,7 +270,7 @@ class RendererStateTests(unittest.TestCase):
             with closing(sqlite3.connect(database)) as conn:
                 self.assertEqual(before, list(conn.iterdump()))
 
-    def test_fresh_v7_reconciliation_schema_matches_contract(self) -> None:
+    def test_fresh_v8_reconciliation_schema_matches_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
@@ -340,7 +342,7 @@ class RendererStateTests(unittest.TestCase):
             self.assertIn("length(message) <= 2048", result_sql)
             self.assertEqual(1, foreign_keys_enabled)
 
-    def test_v5_to_v7_reconciliation_migration_is_additive_and_idempotent(self) -> None:
+    def test_v5_to_v8_reconciliation_migration_is_additive_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
@@ -354,6 +356,7 @@ class RendererStateTests(unittest.TestCase):
                 )
             )
             with closing(sqlite3.connect(database)) as conn:
+                conn.execute("DROP TABLE message_receipts")
                 conn.execute("DROP TABLE reconcile_results")
                 conn.execute("DROP TABLE reconcile_runs")
                 conn.execute("UPDATE schema_version SET version = 5")
@@ -373,6 +376,7 @@ class RendererStateTests(unittest.TestCase):
             self.assertEqual(SCHEMA_VERSION, version)
             self.assertIn("reconcile_runs", tables)
             self.assertIn("reconcile_results", tables)
+            self.assertIn("message_receipts", tables)
             self.assertIsNotNone(store.get_bot("coder"))
 
     def test_v6_reconciliation_constraints_reject_invalid_or_orphaned_rows(self) -> None:
@@ -403,12 +407,13 @@ class RendererStateTests(unittest.TestCase):
                         ),
                     )
 
-    def test_v5_to_v7_failure_rolls_back_version_and_all_ddl(self) -> None:
+    def test_v5_to_v8_failure_rolls_back_version_and_all_ddl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
             store.init()
             with closing(sqlite3.connect(database)) as conn:
+                conn.execute("DROP TABLE message_receipts")
                 conn.execute("DROP TABLE reconcile_results")
                 conn.execute("DROP TABLE reconcile_runs")
                 conn.execute("UPDATE schema_version SET version = 5")

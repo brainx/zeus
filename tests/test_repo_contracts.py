@@ -1164,7 +1164,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("Debian and Ubuntu", compatibility_text)
         self.assertIn("Hermes Agent 0.21.0", compatibility_text)
         self.assertIn(
-            "complete 64-package Linux x86_64 runtime and build closure", compatibility_text
+            "complete 72-package Linux x86_64 runtime and build closure", compatibility_text
         )
         self.assertIn("no model-provider credential", compatibility_text)
         self.assertIn("whichever `hermes` executable is installed", compatibility_text)
@@ -1296,10 +1296,22 @@ class RepoContractTests(unittest.TestCase):
         )
         hashes = re.findall(r"(?m)^    --hash=sha256:([0-9a-f]{64})(?: \\)?$", requirements)
 
-        self.assertEqual(64, len(entries))
-        self.assertEqual(64, len({name for name, _version in entries}))
+        self.assertEqual(72, len(entries))
+        self.assertEqual(72, len({name for name, _version in entries}))
         self.assertGreaterEqual(len(hashes), len(entries))
         self.assertNotIn("hermes-agent", {name for name, _version in entries})
+        self.assertTrue(
+            {
+                ("aiohttp", "3.14.3"),
+                ("aiohappyeyeballs", "2.7.1"),
+                ("aiosignal", "1.4.0"),
+                ("attrs", "26.1.0"),
+                ("frozenlist", "1.8.0"),
+                ("multidict", "6.7.1"),
+                ("propcache", "0.5.2"),
+                ("yarl", "1.24.5"),
+            }.issubset(entries)
+        )
         self.assertIn(("cryptography", "50.0.0"), entries)
         self.assertIn(("fastapi", "0.140.0"), entries)
         self.assertIn(("firecrawl-anydoc", "0.2.4"), entries)

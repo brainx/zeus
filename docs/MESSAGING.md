@@ -7,8 +7,10 @@ Zeus does not forward bot output or impersonate another bot.
 
 ## Enable one profile
 
-Use the `message-bot` template with the pinned Hermes 0.21.0 installation and
-Docker available for its terminal tools. Import profile-local environment values
+Use the `message-bot` template with the pinned Hermes 0.21.0 installation,
+its API adapter's `aiohttp` dependency, and Docker available for its terminal
+tools. The [verified CI lock](REAL_HERMES_VERIFICATION.md) includes the API
+dependency; a core-only Hermes install does not. Import profile-local environment values
 from your shell or private project `.env`:
 
 ```sh

@@ -383,6 +383,7 @@ class ReconcileHistoryTests(unittest.TestCase):
             results = conn.execute("SELECT * FROM reconcile_results").fetchall()
             for index in INDEXES:
                 conn.execute(f"DROP INDEX {index}")
+            conn.execute("DROP TABLE message_receipts")
             conn.execute("UPDATE schema_version SET version = 6")
             conn.commit()
         with self.assertRaises(StateReadinessError):
@@ -391,7 +392,7 @@ class ReconcileHistoryTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as conn:
             self.assertEqual(before, conn.execute("SELECT * FROM reconcile_runs").fetchall())
             self.assertEqual(results, conn.execute("SELECT * FROM reconcile_results").fetchall())
-            self.assertEqual(7, conn.execute("SELECT version FROM schema_version").fetchone()[0])
+            self.assertEqual(8, conn.execute("SELECT version FROM schema_version").fetchone()[0])
             indexes = {
                 row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
             }
@@ -404,6 +405,7 @@ class ReconcileHistoryTests(unittest.TestCase):
             before = conn.execute("SELECT * FROM reconcile_runs").fetchall()
             for index in INDEXES:
                 conn.execute(f"DROP INDEX {index}")
+            conn.execute("DROP TABLE message_receipts")
             conn.execute("UPDATE schema_version SET version = 6")
             conn.execute(f"CREATE TABLE {INDEXES[1]} (marker TEXT)")
             conn.commit()

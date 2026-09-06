@@ -8,7 +8,10 @@ official `v2026.8.31` release through the commit-addressed archive for
 `29112bef099274229cadff79cdff7bf7b99c4b77`, with archive SHA-256
 `76b99a8be9b77d66833c3cfe2b35c6d6f6a58e4ff9637ef8effcfc1f420ab35a`.
 The release tag is unsigned; this is a source pin and digest check.
-The lock contains the complete Linux x86_64 runtime and build closure and uses
+The lock contains the complete 72-package Linux x86_64 runtime and build closure,
+including the API adapter's upstream `aiohttp==3.14.3` pin and its seven additional
+dependencies. The core Hermes install alone omits this optional API dependency;
+the locked FastAPI/Uvicorn packages serve Hermes's Web UI. The lock uses
 the upstream `cryptography==50.0.0` pin and reviewed Requests and Rich overrides while
 retaining upstream-compatible Pillow, FastAPI, pydantic-core, and tqdm pins. CI
 installs the lock with dependency resolution disabled, then permits only the
