@@ -47,14 +47,18 @@ _FORBIDDEN_DETAIL_NAMES = frozenset(
     }
 )
 
-_SECRET_KV_RE = re.compile(
+_ASSIGNMENT_NAME_RE = re.compile(
     r"""(?ix)
     (?P<prefix>["']?)
-    (?P<name>
-        [A-Z0-9_.-]*(?:API[_-]?KEY|KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_.-]*
-    )
+    (?<![A-Z0-9_.-])
+    (?P<name>[A-Z0-9_.-]+)
     (?P=prefix)
     (?P<sep>\s*[:=]\s*)
+    """
+)
+_SECRET_NAME_RE = re.compile(r"(?i)KEY|TOKEN|SECRET|PASSWORD")
+_ASSIGNMENT_VALUE_RE = re.compile(
+    r"""(?x)
     (?P<value>
         "(?:[^"\\]|\\.)*" |
         '(?:[^'\\]|\\.)*' |
@@ -80,6 +84,25 @@ _AUTHORIZATION_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]+)")
 
 
+def _redact_secret_assignments(text: str) -> str:
+    # Scan each complete name once. Searching for a secret substring inside a
+    # greedy name at every input position makes long ordinary identifiers costly.
+    parts: list[str] = []
+    consumed = 0
+    for assignment in _ASSIGNMENT_NAME_RE.finditer(text):
+        if assignment.start() < consumed:
+            continue
+        if _SECRET_NAME_RE.search(assignment.group("name")) is None:
+            continue
+        value = _ASSIGNMENT_VALUE_RE.match(text, assignment.end())
+        if value is None:
+            continue
+        parts.extend((text[consumed : assignment.end()], REDACTED_VALUE))
+        consumed = value.end()
+    parts.append(text[consumed:])
+    return "".join(parts)
+
+
 def redact_secrets(text: str) -> str:
     """Redact common secret assignments and bearer credentials from free text."""
 
@@ -91,13 +114,7 @@ def redact_secrets(text: str) -> str:
         text,
     )
     redacted = _BEARER_RE.sub(r"\1[redacted]", redacted)
-    return _SECRET_KV_RE.sub(
-        lambda match: (
-            f"{match.group('prefix')}{match.group('name')}{match.group('prefix')}"
-            f"{match.group('sep')}[redacted]"
-        ),
-        redacted,
-    )
+    return _redact_secret_assignments(redacted)
 
 
 def _escape_control_characters(value: str) -> str:
