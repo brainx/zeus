@@ -11,8 +11,12 @@ from zeus.hermes_profile_config import (
     load_hermes_legacy_gateway_config,
     load_hermes_profile_config,
 )
-from zeus.hermes_profile_environment import load_hermes_profile_environment
+from zeus.hermes_profile_environment import (
+    HERMES_SUPERVISOR_ENV_KEYS,
+    load_hermes_profile_environment,
+)
 from zeus.hermes_security import validate_hermes_profile_security
+from zeus.messaging_policy import MessagePolicyError, load_message_policy
 from zeus.models import ID_RE
 from zeus.readiness import ReadinessProbe
 
@@ -62,6 +66,8 @@ class HermesAdapter:
             validate_hermes_profile_security(legacy_gateway, env)
         env.setdefault("FEISHU_CONNECTION_MODE", "websocket")
         env["HERMES_HOME"] = str(self.hermes_root)
+        # Zeus owns restart policy and the exact gateway PID, including under s6.
+        env.update(dict.fromkeys(HERMES_SUPERVISOR_ENV_KEYS, "1"))
         return [self.hermes_bin, "-p", bot_id, *args], env
 
     def launcher_command(self, payload_fd: int, ack_fd: int) -> list[str]:
@@ -107,6 +113,13 @@ class HermesAdapter:
             "command_fingerprint": command_fingerprint(exec_argv),
             "readiness_probe": readiness_probe_to_payload(readiness_probe),
         }
+        if env.get("ZEUS_MESSAGES_ENABLED") == "1":
+            if "HERMES_MANAGED_DIR" in env:
+                raise MessagePolicyError("managed_policy_unsupported")
+            policy = load_message_policy(profile_path)
+            if policy.api_key != env.get("API_SERVER_KEY"):
+                raise MessagePolicyError("configuration_invalid")
+            marker["messaging_policy_fingerprint"] = policy.fingerprint
         return {
             "profile_path": str(profile_path),
             "marker_path": str(marker_path),

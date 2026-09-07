@@ -237,6 +237,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         store,
         settings.hermes_bin,
         settings.hermes_root,
+        stop_grace_seconds=settings.stop_grace_seconds,
         kill_after_timeout=settings.stop_kill_after_timeout,
         lock_timeout_seconds=settings.lock_timeout_seconds,
         readiness_timeout_seconds=settings.readiness_timeout_seconds,
@@ -282,7 +283,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             path = self._normalized_path()
             if is_operator_path(path):
                 self._require_key(read=False)
-                status, payload = operator_response(path, self.path, settings.database_path)
+                status, payload = operator_response(path, self.path, supervisor)
                 if status >= 400:
                     error = payload["error"]
                     self._json_error_response(status, error["code"], error["message"])

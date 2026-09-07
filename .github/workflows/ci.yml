@@ -139,13 +139,22 @@ jobs:
         run: python -m pip install -e .
       - name: Check pinned dependency overrides
         run: python scripts/check_hermes_dependency_overrides.py
+      - name: Verify pinned Hermes run submission contract
+        run: |
+          umask 077
+          printf '%s\n' 'result=failed' \
+            'failure_stage=pinned_hermes_runs' \
+            > .tmp/real-hermes-evidence/summary.txt
+          python scripts/verify_pinned_hermes_runs.py
       - name: Verify real Hermes without provider credentials
         run: |
           ZEUS_VERIFY_START_GATEWAY=1 \
-          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \
+          ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.21.0 \
           ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \
           sh scripts/verify_real_hermes.sh
       - name: Verify pinned Hermes audit broker transcript
+        env:
+          ZEUS_REQUIRE_PINNED_HERMES: "1"
         run: |
           mkdir -p .tmp/real-hermes-evidence
           chmod 0700 .tmp/real-hermes-evidence

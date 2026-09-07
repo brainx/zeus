@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from zeus.envfile import dump_env
+from zeus.hermes_profile_environment import HERMES_SUPERVISOR_ENV_KEYS
 from zeus.hermes_security import (
     UnsupportedFeishuWebhookModeError,
     validate_hermes_profile_security,
@@ -298,6 +299,9 @@ def _remove_path(path: Path) -> None:
 
 
 def validate_request_env(request: BotCreateRequest, template: HermesTemplate) -> None:
+    reserved = sorted(set(request.env) & HERMES_SUPERVISOR_ENV_KEYS)
+    if reserved:
+        raise TemplateError(f"env contains Zeus-managed supervisor key(s): {', '.join(reserved)}")
     allowed = set(template.hermes.required_env)
     unknown = sorted(set(request.env) - allowed)
     if unknown:

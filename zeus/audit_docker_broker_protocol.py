@@ -24,6 +24,7 @@ def _expected_bootstrap_script(session_id: str) -> str:
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {temporary}) || exit 1\n"
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT "
         'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp"\n'
         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
         '[ -n "$__hermes_fns" ] && declare -f $__hermes_fns >> "$__hermes_snap_tmp" '
@@ -59,12 +60,16 @@ def _terminal_command_script(script: str, session_id: str | None) -> str:
     snapshot = f"{_CONTAINER_TEMP}/hermes-snap-{session_id}.sh"
     marker = f"__HERMES_CWD_{session_id}__"
     prefix = (
-        f"source {snapshot} >/dev/null 2>&1 || true\nbuiltin cd -- /workspace || exit 126\neval '"
+        f"source {snapshot} >/dev/null 2>&1 || true\n"
+        'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"\n'
+        'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"\n'
+        "builtin cd -- /workspace || exit 126\neval '"
     )
     suffix = (
         "'\n__hermes_ec=$?\numask 077\n"
         f"__hermes_snap_tmp=$(mktemp {snapshot}.tmp.XXXXXXXXXX) && "
         "{ { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT "
         'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp" '
         f'&& mv -f "$__hermes_snap_tmp" {snapshot}; }} '
         '2>/dev/null || rm -f "$__hermes_snap_tmp" 2>/dev/null || true\n'

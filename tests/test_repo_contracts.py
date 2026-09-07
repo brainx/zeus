@@ -205,6 +205,7 @@ class RepoContractTests(unittest.TestCase):
             "docs/SYSTEMD.md",
             "docs/OPERATIONS.md",
             "docs/RECONCILE.md",
+            "docs/MESSAGING.md",
             "docs/RELEASE.md",
             "docs/COMPATIBILITY.md",
             "docs/openapi.json",
@@ -226,6 +227,7 @@ class RepoContractTests(unittest.TestCase):
             "scripts/repo_check.sh",
             "scripts/check_hermes_dependency_overrides.py",
             "scripts/install_pinned_hermes.sh",
+            "scripts/verify_pinned_hermes_runs.py",
             "scripts/check_verified_release_ref.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
@@ -239,6 +241,7 @@ class RepoContractTests(unittest.TestCase):
             "zeus/bundled_templates/kimi-k3-coding-bot.toml",
             "zeus/bundled_templates/docs-writer-bot.toml",
             "zeus/bundled_templates/gateway-operator.toml",
+            "zeus/bundled_templates/message-bot.toml",
             "zeus/bundled_templates/log-triage-bot.toml",
             "zeus/bundled_templates/research-bot.toml",
             "zeus/bundled_templates/support-gateway.toml",
@@ -246,6 +249,7 @@ class RepoContractTests(unittest.TestCase):
             "templates/kimi-k3-coding-bot.toml",
             "templates/docs-writer-bot.toml",
             "templates/gateway-operator.toml",
+            "templates/message-bot.toml",
             "templates/log-triage-bot.toml",
         ]
 
@@ -371,8 +375,13 @@ class RepoContractTests(unittest.TestCase):
                 "sh scripts/install_pinned_hermes.sh",
                 "python -m pip install -e .",
                 "python scripts/check_hermes_dependency_overrides.py",
+                "umask 077\n"
+                "printf '%s\\n' 'result=failed' \\\n"
+                "  'failure_stage=pinned_hermes_runs' \\\n"
+                "  > .tmp/real-hermes-evidence/summary.txt\n"
+                "python scripts/verify_pinned_hermes_runs.py",
                 "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
-                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \\\n"
+                "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.21.0 \\\n"
                 "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
                 "sh scripts/verify_real_hermes.sh",
                 "mkdir -p .tmp/real-hermes-evidence\n"
@@ -504,7 +513,7 @@ class RepoContractTests(unittest.TestCase):
         commands = _job_run_commands(_workflow_job_bodies(workflow)["real-hermes"])
         verifier = (
             "ZEUS_VERIFY_START_GATEWAY=1 \\\n"
-            "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.20.0 \\\n"
+            "ZEUS_VERIFY_EXPECTED_HERMES_VERSION=0.21.0 \\\n"
             "ZEUS_VERIFY_EVIDENCE_DIR=.tmp/real-hermes-evidence \\\n"
             "sh scripts/verify_real_hermes.sh"
         )
@@ -541,6 +550,7 @@ class RepoContractTests(unittest.TestCase):
         )
 
         self.assertEqual(1, len(broker_indexes))
+        self.assertIn('  env:\n    ZEUS_REQUIRE_PINNED_HERMES: "1"', steps[broker_indexes[0]])
         upload_index = broker_indexes[0] + 1
         self.assertLess(upload_index, len(steps))
         self.assertEqual(expected_upload, steps[upload_index])
@@ -764,6 +774,7 @@ class RepoContractTests(unittest.TestCase):
             "kimi-k3-coding-bot",
             "docs-writer-bot",
             "gateway-operator",
+            "message-bot",
             "log-triage-bot",
             "research-bot",
             "support-gateway",
@@ -875,7 +886,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("zeus audit run", run_docs)
         for prerequisite in (
             "Docker",
-            "Hermes Agent 0.20.0",
+            "Hermes Agent 0.21.0",
             "provider credentials",
             "preloaded",
         ):
@@ -903,7 +914,7 @@ class RepoContractTests(unittest.TestCase):
         for text in (readme, security, audit, architecture, operations, compatibility, roadmap):
             with self.subTest(document=text[:24]):
                 self.assertIn("committed `HEAD`", text)
-                self.assertIn("Hermes Agent 0.20.0", text)
+                self.assertIn("Hermes Agent 0.21.0", text)
                 self.assertIn("cross-host", text)
 
         self.assertIn("preloaded", readme)
@@ -1098,9 +1109,10 @@ class RepoContractTests(unittest.TestCase):
                 (
                     "Linux `ubuntu-24.04`",
                     "Python 3.11",
-                    "Hash-locked Hermes Agent 0.20.0 source install, profile rendering, "
+                    "Hash-locked Hermes Agent 0.21.0 source install, profile rendering, "
                     "strict diagnostics, sealed audit-broker transcript, loopback gateway "
-                    "readiness, process ownership, and clean shutdown without a "
+                    "readiness, authenticated live gateway diagnostics, process ownership, "
+                    "and clean shutdown without a "
                     "model-provider credential",
                 ),
             ),
@@ -1150,9 +1162,9 @@ class RepoContractTests(unittest.TestCase):
             compatibility_text,
         )
         self.assertIn("Debian and Ubuntu", compatibility_text)
-        self.assertIn("Hermes Agent 0.20.0", compatibility_text)
+        self.assertIn("Hermes Agent 0.21.0", compatibility_text)
         self.assertIn(
-            "complete 61-package Linux x86_64 runtime and build closure", compatibility_text
+            "complete 72-package Linux x86_64 runtime and build closure", compatibility_text
         )
         self.assertIn("no model-provider credential", compatibility_text)
         self.assertIn("whichever `hermes` executable is installed", compatibility_text)
@@ -1284,25 +1296,40 @@ class RepoContractTests(unittest.TestCase):
         )
         hashes = re.findall(r"(?m)^    --hash=sha256:([0-9a-f]{64})(?: \\)?$", requirements)
 
-        self.assertEqual(61, len(entries))
-        self.assertEqual(61, len({name for name, _version in entries}))
+        self.assertEqual(72, len(entries))
+        self.assertEqual(72, len({name for name, _version in entries}))
         self.assertGreaterEqual(len(hashes), len(entries))
         self.assertNotIn("hermes-agent", {name for name, _version in entries})
+        self.assertTrue(
+            {
+                ("aiohttp", "3.14.3"),
+                ("aiohappyeyeballs", "2.7.1"),
+                ("aiosignal", "1.4.0"),
+                ("attrs", "26.1.0"),
+                ("frozenlist", "1.8.0"),
+                ("multidict", "6.7.1"),
+                ("propcache", "0.5.2"),
+                ("yarl", "1.24.5"),
+            }.issubset(entries)
+        )
         self.assertIn(("cryptography", "50.0.0"), entries)
         self.assertIn(("fastapi", "0.140.0"), entries)
+        self.assertIn(("firecrawl-anydoc", "0.2.4"), entries)
         self.assertIn(("pillow", "12.3.0"), entries)
-        self.assertIn(("nemo-relay", "0.6.0"), entries)
+        self.assertIn(("nemo-relay", "0.7.2"), entries)
         self.assertIn(("pydantic-core", "2.46.4"), entries)
         self.assertIn(("requests", "2.34.2"), entries)
         self.assertIn(("rich", "15.0.0"), entries)
         self.assertIn(("setuptools", "83.0.0"), entries)
+        self.assertIn(("snowballstemmer", "3.1.1"), entries)
         self.assertIn(("tqdm", "4.70.0"), entries)
+        self.assertIn(("wheel", "0.48.0"), entries)
         self.assertIn(
             "b42a28c1844fd9de8f3f7d540e36b66f3a9c83fceac7170ebc7a6a19edd9dcae",
             hashes,
         )
         self.assertIn(
-            "849daa9e45158ac581e54506e0fcc7a24f557d1ed06dbdc074f5de7a00393cbc",
+            "0ce7103aec546766649c182619d16aa6ad07439e4d0ebd16d95c5004afb3e56a",
             hashes,
         )
         self.assertIn(
@@ -1310,20 +1337,20 @@ class RepoContractTests(unittest.TestCase):
             hashes,
         )
         self.assertIn("REVIEWED OVERRIDES", requirements)
-        self.assertIn("v2026.8.3", requirements)
-        self.assertIn("3c27eb6234bf91b8ceee9e9071591b31e9b148cb", requirements)
+        self.assertIn("v2026.8.31", requirements)
+        self.assertIn("29112bef099274229cadff79cdff7bf7b99c4b77", requirements)
         self.assertNotIn("--index-url", requirements)
         self.assertNotIn("git+", requirements)
 
     def test_real_hermes_source_installer_verifies_official_release_before_install(self) -> None:
         script = Path("scripts/install_pinned_hermes.sh").read_text(encoding="utf-8")
 
-        self.assertIn("v2026.8.3", script)
-        self.assertIn("7de39e700d2c329e15d32eb0b96e2f7cdd9fbdb2", script)
-        self.assertIn("3c27eb6234bf91b8ceee9e9071591b31e9b148cb", script)
-        self.assertIn("370542c7219faba6300905c3b419e14e6508a31ac698a1a5174e0386990834be", script)
+        self.assertIn("v2026.8.31", script)
+        self.assertIn("6e8f8418e6378eb2617e4de074e13dedd091b8af", script)
+        self.assertIn("29112bef099274229cadff79cdff7bf7b99c4b77", script)
+        self.assertIn("76b99a8be9b77d66833c3cfe2b35c6d6f6a58e4ff9637ef8effcfc1f420ab35a", script)
         self.assertIn(
-            "https://codeload.github.com/NousResearch/hermes-agent/tar.gz/refs/tags/",
+            "https://codeload.github.com/NousResearch/hermes-agent/tar.gz/${hermes_commit}",
             script,
         )
         digest_check = script.index("sha256sum")
@@ -1353,7 +1380,7 @@ class RepoContractTests(unittest.TestCase):
             commands = {
                 "curl": "#!/bin/sh\nexit 0\n",
                 "sha256sum": "#!/bin/sh\nexit 0\n",
-                "tar": ("#!/bin/sh\n: > .tmp/hermes-agent-v2026.8.3/pyproject.toml\n"),
+                "tar": ("#!/bin/sh\n: > .tmp/hermes-agent-v2026.8.31/pyproject.toml\n"),
                 "python": (
                     "#!/bin/sh\n"
                     'if [ "${1-}" = "-m" ] && [ "${2-}" = "pip" ]; then exit 0; fi\n'
@@ -1387,7 +1414,7 @@ class RepoContractTests(unittest.TestCase):
             )
 
         self.assertNotEqual(0, result.returncode)
-        self.assertIn("expected Hermes Agent 0.20.0, found 99.0.0", result.stderr)
+        self.assertIn("expected Hermes Agent 0.21.0, found 99.0.0", result.stderr)
 
     def test_fresh_vps_verifier_bootstraps_and_captures_evidence(self) -> None:
         script = Path("scripts/fresh_vps_verify.sh").read_text(encoding="utf-8")
@@ -1670,6 +1697,7 @@ class RepoContractTests(unittest.TestCase):
             "/bots/{bot_id}/logs",
             "/bots/{bot_id}/history",
             "/bots/{bot_id}/inspect",
+            "/bots/{bot_id}/diagnostics",
             "/bots/{bot_id}/start",
             "/bots/{bot_id}/stop",
             "/bots/{bot_id}/restart",

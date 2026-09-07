@@ -223,7 +223,7 @@ class _GatewayRuntimeCore:
         cmdline_reader: CmdlineReader,
         proc_start_fingerprint_reader: ProcStartFingerprintReader,
         startup_grace_seconds: float = 0.25,
-        stop_grace_seconds: float = 15.0,
+        stop_grace_seconds: float = 60.0,
         kill_after_timeout: bool = False,
         lock_timeout_seconds: float = 30.0,
         readiness_timeout_seconds: float = 30.0,
@@ -232,6 +232,12 @@ class _GatewayRuntimeCore:
         cleanup_process_group: bool = False,
         hooks_provider: Callable[[], RuntimeHooks] = default_runtime_hooks,
     ) -> None:
+        if (
+            isinstance(stop_grace_seconds, bool)
+            or not isinstance(stop_grace_seconds, (int, float))
+            or not 0.0 <= stop_grace_seconds <= 300.0
+        ):
+            raise ValueError("stop_grace_seconds must be between 0 and 300")
         self.adapter = adapter
         self.profile_manager = profile_manager
         self.marker_profiles_root = marker_profiles_root

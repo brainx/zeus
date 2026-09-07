@@ -11,7 +11,10 @@ HERMES_PROFILE_ENV_MAX_BYTES = 64 * 1024
 _FEISHU_MODE = "FEISHU_CONNECTION_MODE"
 _INVALID_ENV_MESSAGE = "Hermes profile environment could not be validated safely"
 _UNQUOTED_MODE_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
-_RESERVED_PROFILE_KEYS = frozenset({"HERMES_HOME"})
+HERMES_SUPERVISOR_ENV_KEYS = frozenset(
+    {"HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "HERMES_GATEWAY_NO_SUPERVISE"}
+)
+_RESERVED_PROFILE_KEYS = HERMES_SUPERVISOR_ENV_KEYS | {"HERMES_HOME"}
 # Profile dotenv files carry bot secrets (API keys). They must never steer
 # executable/library resolution or interpreter startup of Zeus or its child
 # processes, otherwise a writable profile .env could substitute binaries or

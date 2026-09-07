@@ -91,3 +91,15 @@ The sample unit enables `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
 Zeus stops bot gateways by sending SIGTERM to verified gateway PIDs. Hermes is
 responsible for cleaning up its own child processes; Zeus marks a gateway failed
 instead of force-killing it when graceful shutdown times out.
+
+`ZEUS_STOP_GRACE_SECONDS` defaults to `60` seconds per gateway, allowing Hermes
+0.21's default 30-second cron drain plus cleanup; accepted values are finite
+seconds from `0` to `300`. The sample API unit uses `TimeoutStopSec=90s` for
+systemd's service shutdown deadline. Its default cgroup termination also reaches
+gateways started by the API, independently of Zeus's per-bot ownership checks
+and optional SIGKILL policy.
+
+The API's own in-flight request drain remains `20` seconds by default
+(`ZEUS_API_SHUTDOWN_DRAIN_SECONDS`). Increase that budget if API shutdown must
+wait for a long stop or restart request, and raise `TimeoutStopSec` above the
+chosen drain budget. The request-read timeout does not limit handler execution.

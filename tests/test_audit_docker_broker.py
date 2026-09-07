@@ -49,12 +49,15 @@ def _wrapped_terminal_script(command: str, session_id: str = "0123456789ab") -> 
     return "\n".join(
         [
             f"source {snapshot} >/dev/null 2>&1 || true",
+            'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
+            'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
             "builtin cd -- /workspace || exit 126",
             f"eval '{escaped}'",
             "__hermes_ec=$?",
             "umask 077",
             f"__hermes_snap_tmp=$(mktemp {snapshot}.tmp.XXXXXXXXXX) && "
             "{ { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+            "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT "
             'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp" '
             f'&& mv -f "$__hermes_snap_tmp" {snapshot}; }} '
             '2>/dev/null || rm -f "$__hermes_snap_tmp" 2>/dev/null || true',
@@ -72,6 +75,7 @@ def _bootstrap_script(session_id: str) -> str:
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {temporary}) || exit 1\n"
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT "
         'HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > "$__hermes_snap_tmp"\n'
         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
         '[ -n "$__hermes_fns" ] && declare -f $__hermes_fns >> "$__hermes_snap_tmp" '
@@ -850,6 +854,15 @@ class AuditDockerBrokerTests(unittest.TestCase):
             script + "\nprintf extra",
             "printf extra\n" + script,
             script.replace("exit $__hermes_ec", "exit 0"),
+            script.replace("${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT ", ""),
+            script.replace("${AI_AGENT:-hermes-agent}", "${AI_AGENT:-other-agent}"),
+            script.replace("${GIT_PAGER:-cat}", "${GIT_PAGER:-less}"),
+            script.replace(
+                'export AI_AGENT="${AI_AGENT:-hermes-agent}" '
+                'HERMES_AGENT="${HERMES_AGENT:-true}"\n',
+                "",
+            ),
+            script.replace('export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"\n', ""),
         ):
             with self.subTest(script=changed):
                 self.assertEqual(changed, _terminal_command_script(changed, "0123456789ab"))
@@ -1545,7 +1558,7 @@ class AuditDockerBrokerTests(unittest.TestCase):
                     self.runner.calls[-1][0][1:],
                 )
 
-    def test_bootstrap_script_must_match_the_pinned_0200_shape(self) -> None:
+    def test_bootstrap_script_must_match_the_pinned_0210_shape(self) -> None:
         mutations = (
             _bootstrap_script("0123456789ab").replace("/workspace", "/root"),
             _bootstrap_script("0123456789ab").replace("umask 077", "umask 022"),
@@ -1553,6 +1566,10 @@ class AuditDockerBrokerTests(unittest.TestCase):
                 "hermes-snap-0123456789ab", "hermes-snap-fedcba987654", 1
             ),
             _bootstrap_script("0123456789ab") + "true\n",
+            _bootstrap_script("0123456789ab").replace(
+                "${!HERMES_BROWSER_CONTROL_*} AI_AGENT HERMES_AGENT ", ""
+            ),
+            _bootstrap_script("0123456789ab").replace("AI_AGENT HERMES_AGENT", "AI_AGENT"),
         )
         for script in mutations:
             with self.subTest(script=script[-80:]):

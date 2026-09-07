@@ -54,6 +54,11 @@ run summaries at that boundary.
 
 ## Operator Evidence
 
+Explicit operator jobs are available through `zeus message send/retry/status/cancel/release/list`.
+The opt-in `message-bot` template sets finite turn and API concurrency limits;
+durable receipts support recovery from uncertain submissions. See
+[operator messaging](docs/MESSAGING.md) for setup, retries and permission boundaries.
+
 Inspect previous reconciliation work without starting another pass:
 
 ```bash
@@ -101,7 +106,7 @@ Run the non-mutating readiness preflight:
 zeus audit doctor
 ```
 
-`audit doctor` reports whether Docker, the exact Hermes Agent 0.20.0 executable,
+`audit doctor` reports whether Docker, the exact Hermes Agent 0.21.0 executable,
 configured provider credentials, and the preloaded digest-qualified image are
 ready. It also discloses the configured provider and model, creates no run, and
 downloads nothing.
@@ -343,6 +348,7 @@ zeus bot start coder
 zeus bot status coder
 zeus bot history coder --limit 50
 zeus bot inspect coder --json
+zeus bot diagnostics coder --json
 zeus bot logs coder
 zeus bot logs coder --json
 zeus bot reconcile coder
@@ -353,6 +359,10 @@ zeus bot stop coder
 zeus bot archive coder
 zeus bot delete coder --remove-profile
 ```
+
+Live diagnostics require a launch-recorded loopback Hermes API and its private
+API key; see [live gateway diagnostics](docs/OPERATIONS.md#live-gateway-diagnostics).
+They report a fresh health observation without changing bot lifecycle state.
 
 Deleting a registry entry without `--remove-profile` intentionally leaves its profile
 on disk. Re-creating that bot ID then requires `--replace`. Replacement regenerates
@@ -393,7 +403,7 @@ ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
 The gateway check enables Hermes' local `api_server` platform on loopback,
 passes an isolated local API key, starts with readiness waiting, verifies process
 ownership, probes `/health`, and then stops the bot. Committed CI runs this flow
-without provider credentials against the fully hash-locked Hermes Agent 0.20.0
+without provider credentials against the fully hash-locked Hermes Agent 0.21.0
 source-release environment documented in the compatibility policy.
 
 For a clean Debian/Ubuntu host, use the fresh VPS harness:

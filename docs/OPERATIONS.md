@@ -46,7 +46,7 @@ when `ZEUS_ALLOW_UNAUTH_READS=1` is explicitly enabled. It opens the existing
 database read-only, requires the current schema version, and runs `SELECT 1`.
 It never creates or migrates a database and does not require bots to be running.
 
-A ready service returns `{"schema_version":7,"status":"ready"}`. State-store
+A ready service returns `{"schema_version":9,"status":"ready"}`. State-store
 failures return `503` with `error.code=not_ready`. If state initialization fails
 before the API binds, the process exits instead of serving `/ready`.
 
@@ -162,13 +162,16 @@ aside before putting `/var/lib/zeus.before-restore-${restore_ts}` back.
 ## Migration Rollback
 
 The v2-to-v3 migration is one-way and creates the immutable lifecycle ledger.
-Schema v4 through schema v7 migrations are forward-only. V4 adds durable
+Schema v4 through schema v9 migrations are forward-only. V4 adds durable
 idempotency claims and responses; v5 adds desired state, pending lifecycle
 intent, and migration snapshots; v6 adds persisted reconciliation runs and
 ordered per-bot results. V7 adds indexes for bounded reconciliation history
-queries without rewriting recorded events. Take a pre-v4/v5/v6/v7 SQLite backup and state-tree
+queries without rewriting recorded events. V8 adds durable operator-message receipts.
+V9 adds nullable local-release timestamps to those receipts and excludes released
+receipts from the active-target uniqueness index; existing receipts remain unreleased.
+Take a pre-v4/v5/v6/v7/v8/v9 SQLite backup and state-tree
 backup before upgrading; this is the required pre-migration database backup.
-Older binaries cannot use a newer schema, including schema v7, so rolling back
+Older binaries cannot use a newer schema, including schema v9, so rolling back
 the executable requires restoring that backup. Zeus rejects a newer database
 rather than attempting a down migration; never hand-edit schema state.
 
@@ -333,7 +336,7 @@ JSON `503 server_busy` response with `Retry-After: 1`. Timeouts release their sl
 On orderly shutdown, Zeus keeps the listener available only to reject new work with
 `503 server_draining` while active requests finish, then closes it when the drain completes or its
 deadline expires. The drain setting accepts 0 to 300 seconds. Keep the service manager's stop
-timeout longer than the drain deadline; the provided systemd unit allows 30 seconds for the
+timeout longer than the drain deadline; the provided systemd unit allows 90 seconds for the
 default 20-second drain. When the deadline expires, shutdown proceeds even if a handler has not
 finished, so configure it to cover the longest expected API operation.
 
@@ -526,9 +529,49 @@ closed at load time: `PATH`, `HOME`, `LD_*`, `DYLD_*`, `GIT_*`, `PYTHON*`,
 are only ever resolved against the daemon's base environment, so profile
 content cannot substitute the executable Zeus launches.
 
+Zeus also reserves `HERMES_GATEWAY_EXTERNAL_SUPERVISOR` and
+`HERMES_GATEWAY_NO_SUPERVISE`. Both are set by the adapter so Hermes returns
+restart decisions to Zeus and stays in the foreground under s6. Templates
+cannot supply those environment keys, and stored profile assignments are
+rejected before launch. This prevents Hermes's dotenv loader from undoing
+Zeus's process ownership policy.
+
+### Live gateway diagnostics
+
+Use `zeus bot diagnostics <bot-id> --json` or the authenticated
+`GET /bots/<bot-id>/diagnostics` API for a fresh application-health observation.
+The CLI exits `0` only for `status=ok`; every other diagnostic status exits `1`.
+`bot inspect` continues to show profile and process evidence, and fleet status
+continues to report persisted reconciliation observations.
+
+The bot must have been launched with the loopback Hermes API enabled
+(`API_SERVER_ENABLED=1`, a unique `API_SERVER_PORT`, and `API_SERVER_KEY`).
+Keep the key in the private profile environment or explicitly pass it into
+the Zeus process through `ZEUS_ENV_PASSTHROUGH=API_SERVER_KEY`. Use a distinct,
+random key for each bot, 16–4096 printable ASCII characters without spaces.
+Zeus sends that key only to the launch-recorded loopback address; an edited
+profile cannot redirect the probe. A rotated key that differs from the running
+gateway yields `authentication_failed` until the runtime configuration agrees.
+
+The probe accepts only Hermes 0.21.0, requires the returned PID to match the
+recorded gateway, and verifies the same owned process generation before and
+after the request. It has a two-second HTTP deadline and a 64 KiB response cap;
+redirects and proxy environment variables are ignored. Runtime changes discard
+the health response. The HTTP endpoint remains within the trusted local-host
+boundary; process checks do not attest ownership of the listening socket.
+
+The returned checks cover state database, session store, configuration, model,
+disk, gateway, and background queues. These reflect Hermes's local checks:
+model readiness means a model is configured, without making a provider request;
+missing state/configuration can represent valid defaults; queue inspection can
+fall back to zero. `gateway_busy=false` also occurs during drain and does not
+prove that stopping is safe. Zeus timestamps the live observation itself;
+Hermes's persisted runtime timestamp need not advance while idle. Detailed
+health is an observation, not a lifecycle or provider-availability guarantee.
+
 ### Feishu connection mode
 
-Hermes Agent 0.20.0 must use Feishu WebSocket mode under Zeus. Do not configure
+Hermes Agent 0.21.0 must use Feishu WebSocket mode under Zeus. Do not configure
 Feishu webhook mode while `GHSA-pmqc-57g8-c22c` remains unfixed in the pinned
 Hermes baseline. Profile preflight rejects both
 `FEISHU_CONNECTION_MODE=webhook` and
@@ -577,6 +620,22 @@ supported platforms. Hermes owns cleanup of any children it starts. If the
 gateway does not exit before the grace period, Zeus marks the bot failed and
 does not send SIGKILL by default.
 
+`ZEUS_STOP_GRACE_SECONDS` sets the per-gateway grace period (default `60`, finite
+seconds from `0` to `300`). This leaves time for Hermes 0.21's default 30-second
+cron drain and subsequent cleanup. A shorter explicit override remains available;
+`0` checks for immediate exit. Allow clients enough time for this grace period
+plus lock acquisition and, for restart, readiness checks. With
+`ZEUS_STOP_KILL_AFTER_TIMEOUT=1`, Zeus may wait up to one additional grace period
+after revalidating ownership and sending SIGKILL.
+
+The API request-read timeout only bounds receipt of request headers and body;
+it does not interrupt a running stop operation. The separate
+`ZEUS_API_SHUTDOWN_DRAIN_SECONDS` setting (default `20`) limits how long API
+shutdown waits for in-flight handlers. Increase it when shutdown must retain a
+long-running lifecycle request, and keep the service manager's stop deadline
+above that drain budget. Service-manager cgroup termination is independent of
+Zeus's per-bot stop policy; see [systemd deployment](SYSTEMD.md).
+
 Schema-v2 and legacy markers remain readable for compatibility inspection, but
 Zeus never signals a process or deletes a marker pathname while either format is
 active. Stop and restart return action-required and preserve the marker, PID
@@ -616,7 +675,7 @@ zeus audit doctor
 
 Every audit command discovers the containing Git repository and state context.
 `audit doctor` is the non-mutating readiness preflight: it reports the selected
-provider and model and whether Docker, the exact Hermes Agent 0.20.0 executable,
+provider and model and whether Docker, the exact Hermes Agent 0.21.0 executable,
 configured credentials, and the preloaded digest-qualified image are ready. It
 does not create a run or download dependencies. A run requires an explicit
 lowercase provider, model, and one or more provider-prefixed names from the

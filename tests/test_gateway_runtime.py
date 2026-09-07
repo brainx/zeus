@@ -171,6 +171,37 @@ class GatewayRuntimeTests(unittest.TestCase):
                     time.sleep(0.01)
                 self.assertEqual(0, process.returncode)
 
+    def test_graceful_stop_allows_cron_drain_beyond_previous_default(self) -> None:
+        for grace, expected in ((15, "grace_expired"), (60, "stopped")):
+            with self.subTest(grace=grace), tempfile.TemporaryDirectory() as tmp:
+                signals = []
+                runtime, record, profile, _hermes = self._fixture(
+                    Path(tmp), signals=signals, stop_grace_seconds=grace
+                )
+                _, generation = self._schema3_marker(runtime, profile)
+                clock = [0.0]
+
+                def sleep(seconds: float, clock=clock) -> None:
+                    clock[0] += seconds
+
+                runtime.pid_alive_fn = lambda pid, clock=clock: clock[0] < 30.0
+                with (
+                    patch(
+                        "zeus.gateway_runtime_core.time.monotonic",
+                        side_effect=lambda clock=clock: clock[0],
+                    ),
+                    patch("zeus.gateway_runtime_core.time.sleep", side_effect=sleep),
+                ):
+                    effect = runtime.stop_locked(record, kill_after_timeout=grace == 60)
+                self.assertEqual(expected, effect.outcome)
+                self.assertEqual(generation, effect.generation)
+                self.assertEqual([(self.pid, signal.SIGTERM)], signals)
+                self.assertFalse(effect.kill_attempted)
+                self.assertEqual(grace == 60, effect.marker_removed)
+                self.assertEqual(grace == 15, runtime.pid_marker_path(str(profile)).exists())
+                self.assertGreaterEqual(clock[0], min(grace, 30))
+                self.assertLess(clock[0], min(grace, 30) + 0.2)
+
     def test_stop_recognizes_uncached_gateway_zombie_after_term(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime, record, profile, _hermes = self._fixture(Path(tmp))

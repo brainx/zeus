@@ -254,7 +254,7 @@ class LifecycleLedgerTests(unittest.TestCase):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
                 database = create_v2_database_with_bots(Path(tmp), "coder")
                 with closing(sqlite3.connect(database)) as conn:
-                    conn.execute("UPDATE schema_version SET version = 8")
+                    conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,))
                     conn.commit()
                     before = list(conn.iterdump())
                     self.assertEqual("delete", conn.execute("PRAGMA journal_mode").fetchone()[0])

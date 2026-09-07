@@ -7,7 +7,7 @@ from typing import Protocol
 
 from zeus.lifecycle import serialize_lifecycle_details
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 
 class _SchemaDatabase(Protocol):
@@ -160,6 +160,14 @@ class SchemaManager:
         if current_version < 7:
             self._migrate_v6_to_v7(conn)
             conn.execute("UPDATE schema_version SET version = ?", (7,))
+            current_version = 7
+        if current_version < 8:
+            self._migrate_v7_to_v8(conn)
+            conn.execute("UPDATE schema_version SET version = ?", (8,))
+            current_version = 8
+        if current_version < 9:
+            self._migrate_v8_to_v9(conn)
+            conn.execute("UPDATE schema_version SET version = ?", (9,))
 
     def _ensure_restart_schema(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
@@ -535,4 +543,109 @@ class SchemaManager:
         conn.execute(
             "CREATE INDEX reconcile_results_bot_finished_run_idx "
             "ON reconcile_results (bot_id, finished_at DESC, run_id DESC, started_at)"
+        )
+
+    def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE message_receipts (
+                message_id TEXT PRIMARY KEY,
+                request_key_hash TEXT UNIQUE,
+                target_bot_id TEXT NOT NULL,
+                target_created_at TEXT NOT NULL,
+                target_fingerprint TEXT NOT NULL,
+                endpoint TEXT NOT NULL CHECK (length(endpoint) <= 128),
+                credential_fingerprint TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                upstream_key TEXT NOT NULL UNIQUE,
+                dispatch_state TEXT NOT NULL CHECK (
+                    dispatch_state IN ('prepared', 'unknown', 'accepted', 'rejected')
+                ),
+                run_id TEXT,
+                run_status TEXT CHECK (
+                    run_status IS NULL OR run_status IN (
+                        'queued', 'running', 'waiting_for_approval', 'stopping',
+                        'completed', 'failed', 'cancelled', 'interrupted'
+                    )
+                ),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                retry_before TEXT NOT NULL,
+                last_checked_at TEXT,
+                cancel_requested_at TEXT,
+                lease_until TEXT,
+                error_code TEXT CHECK (error_code IS NULL OR length(error_code) <= 64),
+                version INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version >= 1),
+                CHECK (length(message_id) = 32 AND message_id NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(upstream_key) = 32 AND upstream_key NOT GLOB '*[^0-9a-f]*'),
+                CHECK (request_key_hash IS NULL OR
+                    (length(request_key_hash) = 64 AND request_key_hash NOT GLOB '*[^0-9a-f]*')),
+                CHECK (length(target_fingerprint) = 64
+                    AND target_fingerprint NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(credential_fingerprint) = 64
+                    AND credential_fingerprint NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'),
+                CHECK (length(target_bot_id) BETWEEN 2 AND 63),
+                CHECK (run_id IS NULL OR length(run_id) BETWEEN 1 AND 128),
+                CHECK (updated_at >= created_at AND retry_before > created_at),
+                CHECK ((dispatch_state = 'accepted'
+                    AND run_id IS NOT NULL AND run_status IS NOT NULL)
+                    OR (dispatch_state != 'accepted' AND run_id IS NULL AND run_status IS NULL)),
+                CHECK ((dispatch_state = 'prepared' AND lease_until IS NOT NULL)
+                    OR (dispatch_state != 'prepared' AND lease_until IS NULL)),
+                CHECK (last_checked_at IS NULL OR last_checked_at >= created_at),
+                CHECK (cancel_requested_at IS NULL OR cancel_requested_at >= created_at)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX message_receipts_active_target_idx "
+            "ON message_receipts (target_bot_id, target_created_at) "
+            "WHERE dispatch_state IN ('prepared', 'unknown') "
+            "OR (dispatch_state = 'accepted' "
+            "AND run_status NOT IN ('completed', 'failed', 'cancelled', 'interrupted'))"
+        )
+        conn.execute(
+            "CREATE INDEX message_receipts_created_id_idx "
+            "ON message_receipts (created_at DESC, message_id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX message_receipts_target_created_id_idx "
+            "ON message_receipts (target_bot_id, created_at DESC, message_id DESC)"
+        )
+
+    def _migrate_v8_to_v9(self, conn: sqlite3.Connection) -> None:
+        # Existing receipts remain unreleased. Keep the v8 table/data in place;
+        # the store additionally validates complete datetime calendar semantics.
+        conn.execute(
+            """
+            ALTER TABLE message_receipts ADD COLUMN released_at TEXT CHECK (
+                released_at IS NULL OR (
+                    typeof(released_at) = 'text'
+                    AND dispatch_state = 'accepted'
+                    AND released_at >= created_at
+                    AND released_at <= updated_at
+                    AND length(released_at) IN (25, 32)
+                    AND substr(released_at, -6) = '+00:00'
+                    AND datetime(substr(released_at, 1, 19)) IS NOT NULL
+                    AND strftime('%Y-%m-%dT%H:%M:%S', substr(released_at, 1, 19))
+                        = substr(released_at, 1, 19)
+                    AND (
+                        length(released_at) = 25 OR (
+                            substr(released_at, 20, 1) = '.'
+                            AND substr(released_at, 21, 6) NOT GLOB '*[^0-9]*'
+                            AND substr(released_at, 21, 6) != '000000'
+                        )
+                    )
+                )
+            )
+            """
+        )
+        conn.execute("DROP INDEX message_receipts_active_target_idx")
+        conn.execute(
+            "CREATE UNIQUE INDEX message_receipts_active_target_idx "
+            "ON message_receipts (target_bot_id, target_created_at) "
+            "WHERE released_at IS NULL AND (dispatch_state IN ('prepared', 'unknown') "
+            "OR (dispatch_state = 'accepted' "
+            "AND run_status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')))"
         )

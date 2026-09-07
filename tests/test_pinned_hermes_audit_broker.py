@@ -11,9 +11,11 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from zeus.audit_container import PreparedAuditContainer
 from zeus.audit_docker_broker import (
+    HERMES_VERSION,
     cleanup_audit_docker_broker,
     install_audit_docker_broker,
     read_audit_docker_broker_state,
@@ -32,16 +34,69 @@ SNAPSHOT_DIGEST = "e" * 64
 
 def _installed_pinned_hermes() -> bool:
     try:
-        return importlib.metadata.version("hermes-agent") == "0.20.0"
+        return importlib.metadata.version("hermes-agent") == HERMES_VERSION
     except importlib.metadata.PackageNotFoundError:
         return False
 
 
-@unittest.skipUnless(
-    _installed_pinned_hermes(),
-    "requires installed hermes-agent==0.20.0",
-)
+def _require_pinned_hermes() -> None:
+    if _installed_pinned_hermes():
+        return
+    message = f"requires installed hermes-agent=={HERMES_VERSION}"
+    if os.environ.get("ZEUS_REQUIRE_PINNED_HERMES") == "1":
+        raise AssertionError(message)
+    raise unittest.SkipTest(message)
+
+
+class PinnedHermesAvailabilityTests(unittest.TestCase):
+    def test_optional_backend_skips_when_missing_or_wrong_version(self) -> None:
+        with mock.patch.dict(os.environ, {"ZEUS_REQUIRE_PINNED_HERMES": "0"}):
+            for version in (None, "0.20.0", "0.21.1"):
+                with (
+                    self.subTest(version=version),
+                    mock.patch(
+                        "importlib.metadata.version",
+                        return_value=version,
+                        side_effect=importlib.metadata.PackageNotFoundError
+                        if version is None
+                        else None,
+                    ),
+                    self.assertRaises(unittest.SkipTest),
+                ):
+                    _require_pinned_hermes()
+
+    def test_required_backend_fails_instead_of_skipping(self) -> None:
+        with mock.patch.dict(os.environ, {"ZEUS_REQUIRE_PINNED_HERMES": "1"}):
+            for version in (None, "0.20.0", "0.21.1"):
+                with (
+                    self.subTest(version=version),
+                    mock.patch(
+                        "importlib.metadata.version",
+                        return_value=version,
+                        side_effect=importlib.metadata.PackageNotFoundError
+                        if version is None
+                        else None,
+                    ),
+                    self.assertRaisesRegex(
+                        AssertionError, "requires installed hermes-agent==0.21.0"
+                    ),
+                ):
+                    _require_pinned_hermes()
+
+    def test_exact_pinned_backend_runs_in_optional_and_required_modes(self) -> None:
+        for required in ("0", "1"):
+            with (
+                self.subTest(required=required),
+                mock.patch.dict(os.environ, {"ZEUS_REQUIRE_PINNED_HERMES": required}),
+                mock.patch("importlib.metadata.version", return_value="0.21.0"),
+            ):
+                _require_pinned_hermes()
+
+
 class PinnedHermesAuditBrokerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _require_pinned_hermes()
+
     def test_pinned_backend_completes_the_sealed_broker_protocol(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
