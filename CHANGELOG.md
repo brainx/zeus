@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+- Require successful CI from the main-branch push of the tagged commit before
+  building and publishing release artifacts, including all integration jobs.
+
+- Added opt-in operator messaging through `zeus message send/retry/status/cancel/release/list`,
+  with durable schema-v9 receipts, bounded authenticated Hermes runs requests,
+  launch-bound profile limits and explicit recovery after uncertain dispatch.
+  Acknowledged jobs with unavailable outcomes can be explicitly released without
+  losing their receipt; failed cancellations preserve the last observed status time.
 
 - Added explicit live gateway diagnostics through `zeus bot diagnostics` and
   the authenticated API. Results bind Hermes's detailed health response to

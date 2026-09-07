@@ -54,6 +54,11 @@ run summaries at that boundary.
 
 ## Operator Evidence
 
+Explicit operator jobs are available through `zeus message send/retry/status/cancel/release/list`.
+The opt-in `message-bot` template sets finite turn and API concurrency limits;
+durable receipts support recovery from uncertain submissions. See
+[operator messaging](docs/MESSAGING.md) for setup, retries and permission boundaries.
+
 Inspect previous reconciliation work without starting another pass:
 
 ```bash

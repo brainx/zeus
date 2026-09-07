@@ -46,7 +46,7 @@ when `ZEUS_ALLOW_UNAUTH_READS=1` is explicitly enabled. It opens the existing
 database read-only, requires the current schema version, and runs `SELECT 1`.
 It never creates or migrates a database and does not require bots to be running.
 
-A ready service returns `{"schema_version":7,"status":"ready"}`. State-store
+A ready service returns `{"schema_version":9,"status":"ready"}`. State-store
 failures return `503` with `error.code=not_ready`. If state initialization fails
 before the API binds, the process exits instead of serving `/ready`.
 
@@ -162,13 +162,16 @@ aside before putting `/var/lib/zeus.before-restore-${restore_ts}` back.
 ## Migration Rollback
 
 The v2-to-v3 migration is one-way and creates the immutable lifecycle ledger.
-Schema v4 through schema v7 migrations are forward-only. V4 adds durable
+Schema v4 through schema v9 migrations are forward-only. V4 adds durable
 idempotency claims and responses; v5 adds desired state, pending lifecycle
 intent, and migration snapshots; v6 adds persisted reconciliation runs and
 ordered per-bot results. V7 adds indexes for bounded reconciliation history
-queries without rewriting recorded events. Take a pre-v4/v5/v6/v7 SQLite backup and state-tree
+queries without rewriting recorded events. V8 adds durable operator-message receipts.
+V9 adds nullable local-release timestamps to those receipts and excludes released
+receipts from the active-target uniqueness index; existing receipts remain unreleased.
+Take a pre-v4/v5/v6/v7/v8/v9 SQLite backup and state-tree
 backup before upgrading; this is the required pre-migration database backup.
-Older binaries cannot use a newer schema, including schema v7, so rolling back
+Older binaries cannot use a newer schema, including schema v9, so rolling back
 the executable requires restoring that backup. Zeus rejects a newer database
 rather than attempting a down migration; never hand-edit schema state.
 

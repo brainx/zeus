@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gc
 import io
 import runpy
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 SCRIPT = runpy.run_path(str(Path("scripts/check_verified_release_ref.py")))
 ReleaseVerificationError = SCRIPT["ReleaseVerificationError"]
@@ -200,6 +202,41 @@ class VerifiedReleaseRefTests(unittest.TestCase):
         self.assertNotIn(TOKEN, opener.request.full_url)
         self.assertEqual(f"Bearer {TOKEN}", opener.request.get_header("Authorization"))
         self.assertEqual(15, opener.assert_timeout)
+
+    def test_http_error_closes_owned_response_without_resource_warning(self) -> None:
+        def exercise(status: int, body: io.BytesIO | None) -> None:
+            error = HTTPError("https://api.github.com", status, TOKEN, {}, body)
+
+            class FailingOpener:
+                def open(self, _request: Any, *, timeout: int) -> Any:
+                    raise error
+
+            with self.assertRaises(ReleaseVerificationError) as raised:
+                fetch_github_json(
+                    "/repos/brainx/zeus/git/ref/tags/v0.4.0", TOKEN, opener=FailingOpener()
+                )
+            self.assertEqual("GitHub API request failed", str(raised.exception))
+            self.assertTrue(error.closed)
+            self.assertTrue(error.fp.closed)
+            if body is not None:
+                self.assertTrue(body.closed)
+
+        class FailingClose(io.BytesIO):
+            def close(self) -> None:
+                super().close()
+                raise RuntimeError(TOKEN)
+
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always", ResourceWarning)
+            for status in (302, 403, 429, 500):
+                with self.subTest(status=status):
+                    exercise(status, None)
+                    exercise(status, io.BytesIO(b"private-response-sentinel"))
+            exercise(500, FailingClose())
+            gc.collect()
+        self.assertEqual(
+            [], [item for item in observed if issubclass(item.category, ResourceWarning)]
+        )
 
     def test_main_emits_only_fixed_success_or_redacted_failure_messages(self) -> None:
         responses = _responses()

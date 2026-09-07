@@ -254,7 +254,7 @@ probe.
 Success returns:
 
 ```json
-{"schema_version":7,"status":"ready"}
+{"schema_version":9,"status":"ready"}
 ```
 
 An unavailable, missing, malformed, older, or newer state database returns
