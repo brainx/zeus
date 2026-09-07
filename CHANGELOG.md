@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+- Require successful CI from the main-branch push of the tagged commit before
+  building and publishing release artifacts, including all integration jobs.
 
 - Added opt-in operator messaging through `zeus message send/retry/status/cancel/release/list`,
   with durable schema-v9 receipts, bounded authenticated Hermes runs requests,
