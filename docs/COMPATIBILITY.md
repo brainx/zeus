@@ -48,8 +48,11 @@ does not silently change local commit latency. FULL is an explicit
 higher-durability option for deployments that accept its additional commit
 latency.
 
-This policy does not change database structure or require a migration: the
-schema remains schema v6 and every existing v6 database stays compatible.
+The synchronous policy itself does not change database structure. Zeus v0.6
+adds an independent forward-only migration from schema v6 to schema v7 for
+operator-query indexes. Existing v6 databases upgrade during normal startup;
+read-only history/fleet commands require the current schema. Keep all writers
+on the same Zeus version and retain a quiesced backup for rollback.
 
 ## Manual clean-host evidence
 

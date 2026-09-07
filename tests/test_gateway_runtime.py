@@ -171,6 +171,51 @@ class GatewayRuntimeTests(unittest.TestCase):
                     time.sleep(0.01)
                 self.assertEqual(0, process.returncode)
 
+    def test_stop_recognizes_uncached_gateway_zombie_after_term(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, record, profile, _hermes = self._fixture(Path(tmp))
+            runtime.pid_alive_fn = None
+            self._schema3_marker(runtime, profile)
+            state = PidState.alive
+            signals = []
+
+            def signal_gateway(pid, sig):
+                nonlocal state
+                signals.append((pid, sig))
+                state = PidState.dead
+
+            runtime.kill_fn = signal_gateway
+            with (
+                patch("zeus.process_identity.os.kill"),
+                patch("zeus.process_identity.platform.system", return_value="Linux"),
+                patch("zeus.process_identity.read_linux_pid_state", side_effect=lambda _: state),
+            ):
+                result = runtime.stop_locked(record, kill_after_timeout=False)
+            self.assertEqual("stopped", result.outcome)
+            self.assertEqual([(self.pid, signal.SIGTERM)], signals)
+            self.assertTrue(result.marker_removed)
+            self.assertFalse(runtime.pid_marker_path(str(profile)).exists())
+
+    def test_uncached_gateway_with_unknown_native_state_keeps_marker_without_signaling(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signals = []
+            runtime, record, profile, _hermes = self._fixture(Path(tmp), signals=signals)
+            runtime.pid_alive_fn = None
+            self._schema3_marker(runtime, profile)
+            marker_path = runtime.pid_marker_path(str(profile))
+            original_marker = marker_path.read_bytes()
+            with (
+                patch("zeus.process_identity.os.kill"),
+                patch("zeus.process_identity.platform.system", return_value="Linux"),
+                patch("zeus.process_identity.read_linux_pid_state", return_value=PidState.unknown),
+            ):
+                result = runtime.stop_locked(record, kill_after_timeout=True)
+            self.assertEqual("pid_unknown", result.outcome)
+            self.assertEqual([], signals)
+            self.assertEqual(original_marker, marker_path.read_bytes())
+
     def test_reaped_cached_handle_does_not_hide_a_reused_live_pid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime, _record, _profile, _hermes = self._fixture(Path(tmp))

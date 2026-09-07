@@ -144,6 +144,48 @@ def read_linux_process_start_fingerprint(
     return f"linux:/proc-starttime:{fields[19]}"
 
 
+def read_linux_pid_state(pid: int, proc_root: Path = Path("/proc")) -> PidState:
+    try:
+        stat = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return PidState.unknown
+    command, separator, remainder = stat.rpartition(") ")
+    fields = remainder.split()
+    if (
+        not separator
+        or not command.startswith(f"{pid} (")
+        or len(fields) < 20
+        or fields[0] not in {"R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I"}
+        or not fields[19].isascii()
+        or not fields[19].isdecimal()
+    ):
+        return PidState.unknown
+    return PidState.dead if fields[0] == "Z" else PidState.alive
+
+
+def read_darwin_pid_state(
+    pid: int,
+    *,
+    run_process: _SubprocessRun | None = None,
+) -> PidState:
+    runner = _subprocess_runner(run_process)
+    try:
+        completed = runner(
+            ["/bin/ps", "-p", str(pid), "-o", "state="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return PidState.unknown
+    state = completed.stdout.strip()
+    if completed.returncode != 0 or re.fullmatch(r"[IRSTUZ][+<>AELNSsVWX]*", state) is None:
+        return PidState.unknown
+    return PidState.dead if state[0] == "Z" else PidState.alive
+
+
 def pid_state(pid: int, *, pid_alive_fn: PidAliveFn | None = None) -> PidState:
     try:
         if pid_alive_fn is not None:
@@ -155,6 +197,13 @@ def pid_state(pid: int, *, pid_alive_fn: PidAliveFn | None = None) -> PidState:
         return PidState.unknown
     except OSError as exc:
         return PidState.dead if exc.errno == errno.ESRCH else PidState.unknown
+    # kill(pid, 0) also succeeds for zombies held by another parent. Only native
+    # state evidence can establish their exit when we have no child to reap.
+    system = platform.system()
+    if system == "Linux":
+        return read_linux_pid_state(pid)
+    if system == "Darwin":
+        return read_darwin_pid_state(pid)
     return PidState.alive
 
 

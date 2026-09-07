@@ -16,6 +16,44 @@ Delete and archive are intentionally CLI-only in the current alpha because they
 remove or move local profile directories. Use `zeus bot delete` or
 `zeus bot archive` from a trusted local shell.
 
+## Persisted Operator Evidence
+
+The following diagnostic endpoints always require `x-zeus-api-key`, including
+when `ZEUS_ALLOW_UNAUTH_READS=1`. They accept `/v1` aliases. They read existing
+state without probing gateways or triggering a reconciliation pass.
+
+| Route | Query parameters | Response |
+| --- | --- | --- |
+| `GET /reconcile/runs` | `limit`, `before`, `outcome`, `bot_id` | `runs`, `next_before` |
+| `GET /reconcile/runs/<run-id>` | `limit`, `after` | `run`, `results`, `next_after` |
+| `GET /fleet` | `limit`, `after`, `attention_only`, `stale_after_seconds` | `items`, `next_after`, generation time and freshness settings |
+
+`limit` defaults to 50 and accepts 1–100. Run lists are newest first with run ID
+as the tie breaker; `before` is the opaque cursor from `next_before` (at most
+2048 characters). `outcome` accepts `running`, `succeeded`,
+`completed_with_errors`, or `interrupted`. `bot_id` includes matching single-bot
+requests and fleet runs containing the bot. Preserve filters across pages.
+
+Run detail results use ascending zero-based ordinals. Omit `after` for the first
+page, then pass the nonnegative integer `next_after` (maximum 2^63−1). Encode
+the run identifier as one URL path segment. Unknown runs return
+`404 unknown_reconcile_run`. Metadata contains persisted counters and scope;
+individual pages validate the selected evidence, not the entire history.
+
+Fleet pages are ordered by bot ID, with `after` an exclusive bot ID. The
+`attention_only` filter accepts `true`, `false`, `1`, or `0` and applies before
+pagination. `stale_after_seconds` defaults to 120 and accepts 0–86400. Items
+include desired/stored state, remaining restart budget, pending intent, the
+latest observation, its age and `freshness`, and explicit `attention_reasons`.
+Observations from an earlier incarnation of a recreated bot are excluded.
+`freshness_source=persisted_reconciliation` and `live_probe=false` explicitly
+identify cached evidence; `fresh` does not establish current application health.
+See [reconciliation](RECONCILE.md) for attention and clock-skew semantics.
+
+All three routes return `400 invalid_request` for invalid parameters and
+`503 not_ready` for unavailable or incompatible stored evidence. Every request
+reads one SQLite snapshot; pages requested later may reflect new runs or state.
+
 ## Error Model
 
 Errors use a stable object shape:
@@ -31,7 +69,7 @@ Errors use a stable object shape:
 ```
 
 Known error codes are `invalid_request`, `invalid_bot_id`, `unknown_bot`,
-`unknown_template`, `missing_api_key`, `invalid_api_key`,
+`unknown_template`, `unknown_reconcile_run`, `missing_api_key`, `invalid_api_key`,
 `unsupported_media_type`, `method_not_allowed`, `bot_locked`, `bot_exists`,
 `bot_running`, `bot_replace_failed`, `bot_delete_failed`, `bot_archive_failed`,
 `auth_rate_limited`, `mutation_rate_limited`, `reconcile_locked`,
@@ -189,7 +227,7 @@ probe.
 Success returns:
 
 ```json
-{"schema_version":6,"status":"ready"}
+{"schema_version":7,"status":"ready"}
 ```
 
 An unavailable, missing, malformed, older, or newer state database returns

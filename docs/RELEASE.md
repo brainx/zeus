@@ -182,3 +182,30 @@ gh attestation verify SHA256SUMS.txt --repo brainx/zeus
 The attestation should resolve to `.github/workflows/release.yml` on the
 matching `refs/tags/v*.*.*` tag. Treat checksum or attestation failures as a
 release-blocking provenance failure.
+
+## v0.6 Development Upgrade
+
+The development package identifies itself as `0.6.0.dev0`; the latest stable
+release remains v0.5.0. Existing lifecycle route shapes are retained, with
+additional read-only operator endpoints. `/ready` reports schema version 7
+after the additive index migration. Normal service/CLI initialization performs
+the migration; the new inspection commands refuse older schemas rather than
+upgrading state as a side effect of a read.
+
+Before upgrading an existing host, quiesce Zeus writers and take the database
+and private profiles backup described in [Operations](OPERATIONS.md). Restart
+with one version of Zeus managing the state directory. Do not run a v0.5 process
+against an upgraded v7 database. A rollback requires the matching pre-upgrade
+backup and old package; Zeus does not downgrade databases.
+
+Olymp must explicitly support the `0.6.0.dev0` version and schema-v7 readiness
+contract before registering a node with that expected version. Preserve exact
+version checks and the existing v0.5/schema-v6 contract for stable nodes. The
+new fleet freshness field is evidence age, not a substitute for application
+health or cross-host rollout approval.
+
+The CI package job runs `scripts/verify_service_recovery.sh` only on a disposable
+Ubuntu 24.04 GitHub-hosted runner, using the built wheel and private copied
+systemd units. Preview checksums and upload follow successful recovery checks.
+The script refuses ordinary developer hosts; it is not an installer or a
+production restore command.

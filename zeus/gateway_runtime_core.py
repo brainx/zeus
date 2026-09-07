@@ -379,14 +379,7 @@ class _GatewayRuntimeCore:
         for process in tuple(self._processes.values()):
             if process.pid == pid:
                 process.poll()
-        if self.pid_alive_fn is not None:
-            return process_identity.pid_state(pid, pid_alive_fn=self.pid_alive_fn)
-
-        def probe_with_current_kill(probe_pid: int) -> bool:
-            os.kill(probe_pid, 0)
-            return True
-
-        return process_identity.pid_state(pid, pid_alive_fn=probe_with_current_kill)
+        return process_identity.pid_state(pid, pid_alive_fn=self.pid_alive_fn)
 
     def send_signal(self, pid: int, sig: signal.Signals) -> SignalResult:
         try:

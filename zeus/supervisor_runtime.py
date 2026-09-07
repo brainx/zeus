@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import platform
 import signal
 from dataclasses import replace
@@ -329,14 +328,7 @@ class _SupervisorRuntime(_SupervisorCore):
     def _pid_state(self, pid: int) -> _PidState:
         if "_runtime" in self.__dict__:
             return self._runtime.pid_state(pid)
-        if self.pid_alive_fn is not None:
-            return _process_identity.pid_state(pid, pid_alive_fn=self.pid_alive_fn)
-
-        def probe_with_current_kill(probe_pid: int) -> bool:
-            os.kill(probe_pid, 0)
-            return True
-
-        return _process_identity.pid_state(pid, pid_alive_fn=probe_with_current_kill)
+        return _process_identity.pid_state(pid, pid_alive_fn=self.pid_alive_fn)
 
     def _unknown_pid_response(
         self,

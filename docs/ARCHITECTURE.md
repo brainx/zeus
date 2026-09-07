@@ -242,9 +242,27 @@ The v2-to-v3 migration is also one transaction. It creates a
 the projection/event invariant, and advances the schema version only after all
 steps succeed. Additive v3-to-v4 and v4-to-v5 upgrades add durable idempotency
 and desired/pending intent in forward-only transactions. Databases newer than
-schema v6 are rejected rather than downgraded.
+schema v7 are rejected rather than downgraded.
 
 `$ZEUS_STATE_DIR/logs/audit.jsonl` remains a best-effort compatibility mirror.
 It is written only after the SQLite transaction commits and is not imported into
 the v3 ledger. A mirror write failure cannot remove the authoritative event or
 fail an already committed transition.
+
+## Operator Read Models
+
+Schema v7 adds indexes for run ordering and per-bot latest-result lookup, with
+no changes to persisted lifecycle fields. `ReconcileHistoryReader` and
+`FleetOverviewReader` open existing SQLite databases in WAL-aware read-only
+transactions, without `StateStore.init`, migrations, or Supervisor calls. Each
+page materializes at most its limit plus one row. Run detail validates only its
+selected results and their event links; full store reads retain complete history
+validation. Attention-filtered fleet queries can scan candidate bots, with an
+indexed latest-result lookup for each. SQLite coordination sidecars may be
+created without changing logical state.
+
+The CLI and API adapters share these readers. Diagnostic API routes require
+strict authentication and use fixed route templates in access logs. Fleet
+observations are persisted reconciliation evidence with explicit timestamps,
+not live process or application-health probes. Cross-host consumers should
+preserve that distinction rather than treating a fresh row as a rollout gate.

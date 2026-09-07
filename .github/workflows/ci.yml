@@ -183,6 +183,10 @@ jobs:
         run: ZEUS_WHEEL_SMOKE_BUILD=0 sh scripts/wheel_smoke.sh
       - name: Check package metadata
         run: twine check dist/*
+      - name: Verify installed service recovery and backup restore
+        env:
+          ZEUS_SERVICE_RECOVERY_DRILL: "1"
+        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_OS,RUNNER_ENVIRONMENT,GITHUB_WORKSPACE,ZEUS_SERVICE_RECOVERY_DRILL sh scripts/verify_service_recovery.sh "$(command -v python)"
       - name: Generate preview checksums
         run: sh scripts/generate_checksums.sh dist
       - name: Upload verified preview artifacts

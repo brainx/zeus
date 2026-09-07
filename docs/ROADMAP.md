@@ -2,16 +2,18 @@
 
 ## Current status
 
-The latest stable release is Zeus v0.5.0. It remains alpha software with a
-local-first, host-local scope. It owns profiles, processes, lifecycle safety,
-and reconciliation evidence on one host.
+The latest stable release is Zeus v0.5.0. The `main` branch is the
+v0.6.0.dev0 development line. Zeus remains alpha software with a local-first,
+host-local scope. It owns profiles, processes, lifecycle safety, and
+reconciliation evidence on one host.
 
 ## Shipped
 
 - Workspace-local CLI and loopback API.
 - Bundled and custom Hermes template validation and rendering.
 - PID ownership checks, lifecycle locking, crash recovery, and restart policy.
-- SQLite lifecycle and reconciliation evidence.
+- SQLite lifecycle and reconciliation evidence with indexed, paginated run
+  history and a read-only fleet overview exposing freshness and attention reasons.
 - Credential-free fake-Hermes demo, hash-locked real-Hermes CI, and manual
   real-Hermes verification scripts.
 - Wheel builds, installed-wheel smoke checks, and GitHub release artifacts.
@@ -27,7 +29,10 @@ and reconciliation evidence on one host.
 
 - Keep local and CI quality gates aligned with the measured coverage baseline.
 - Strengthen installed-package behavior and compatibility evidence.
-- Improve local operational readiness, backup guidance, and health evidence.
+- Exercise installed-wheel service interruption, pending-intent recovery, and
+  quiesced backup/restore on disposable Ubuntu CI before distributing previews.
+- Keep the pinned Olymp compatibility contract aligned with Zeus development
+  versions while preserving fail-closed mutation version checks.
 
 ## Under evaluation
 

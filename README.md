@@ -52,6 +52,23 @@ cross-host coordination, rollout policy, and approvals. Zeus deliberately does n
 cluster-wide placement or rollout decisions; Olymp can consume Zeus' local API and persisted
 run summaries at that boundary.
 
+## Operator Evidence
+
+Inspect previous reconciliation work without starting another pass:
+
+```bash
+zeus reconcile list --limit 20
+zeus reconcile show <run-id> --limit 20 --json
+zeus fleet status --attention-only --json
+```
+
+The fleet view reports stored state, restart budget, pending intent, and the age
+of the latest persisted reconciliation observation. It performs no live health
+probe. Pages contain at most 100 rows; use the returned cursor for the next page.
+The matching authenticated routes are `GET /reconcile/runs`,
+`GET /reconcile/runs/<run-id>`, and `GET /fleet`. See [API](docs/API.md) and
+[reconciliation](docs/RECONCILE.md) for filters and freshness semantics.
+
 ## Repository Audit
 
 `zeus audit` is a report-only, host-local review of the exact committed `HEAD`.
@@ -596,7 +613,7 @@ backoff. Retry history resets after a gateway remains running for
 `ZEUS_RESTART_STABILITY_SECONDS` (default `30`); brief recoveries retain the
 retry budget. See [reconcile scheduling](docs/RECONCILE.md) for details.
 
-Reconcile stores a schema-v6 run and one ordered result per bot. Fleet passes hold
+Reconcile stores a durable run and one ordered result per bot. Fleet passes hold
 one fleet lock, continue after bot-scoped errors, and preserve each earlier committed
 lifecycle change. Existing CLI/API arrays remain the default; use `--summary` or
 `?summary=1` for run ID, timestamps, aggregate counts, and ordered result evidence.

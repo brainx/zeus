@@ -23,7 +23,7 @@ from unittest.mock import patch
 from zeus import models
 from zeus.bot_lifecycle_store import BotLifecycleStore
 from zeus.models import BotRecord, BotStatus, DesiredState, RestartPolicy
-from zeus.state import StateStore
+from zeus.state import SCHEMA_VERSION, StateStore
 from zeus.supervisor import Supervisor
 
 V4_BOTS_SCHEMA = """
@@ -1223,7 +1223,7 @@ class CrashRecoveryStateTests(unittest.TestCase):
             self.assertNotIn("desired_state", columns)
             self.assertEqual(1, events)
 
-    def test_fresh_v6_database_is_idempotent_and_serializes_only_public_desired_fields(
+    def test_fresh_v7_database_is_idempotent_and_serializes_only_public_desired_fields(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1254,7 +1254,7 @@ class CrashRecoveryStateTests(unittest.TestCase):
                     )
                 }
 
-            self.assertEqual(6, version)
+            self.assertEqual(SCHEMA_VERSION, version)
             self.assertEqual("running", payload["desired_state"])
             self.assertIs(payload["converged"], True)
             self.assertNotIn("desired_revision", payload)

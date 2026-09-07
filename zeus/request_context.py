@@ -54,6 +54,8 @@ _STATIC_ROUTE_TEMPLATES = {
     "/templates": "/templates",
     "/bots": "/bots",
     "/bots/reconcile": "/bots/reconcile",
+    "/fleet": "/fleet",
+    "/reconcile/runs": "/reconcile/runs",
 }
 _BOT_ACTIONS = frozenset(
     {"history", "inspect", "logs", "reconcile", "restart", "start", "status", "stop"}
@@ -97,6 +99,8 @@ def route_template(path: str) -> str | None:
         return static_template
 
     parts = path.split("/")
+    if len(parts) == 4 and parts[:3] == ["", "reconcile", "runs"] and parts[3]:
+        return "/reconcile/runs/{run_id}"
     if (
         len(parts) == 4
         and parts[0] == ""

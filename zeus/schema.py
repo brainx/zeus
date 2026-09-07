@@ -7,7 +7,7 @@ from typing import Protocol
 
 from zeus.lifecycle import serialize_lifecycle_details
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class _SchemaDatabase(Protocol):
@@ -156,6 +156,10 @@ class SchemaManager:
         if current_version < 6:
             self._migrate_v5_to_v6(conn)
             conn.execute("UPDATE schema_version SET version = ?", (6,))
+            current_version = 6
+        if current_version < 7:
+            self._migrate_v6_to_v7(conn)
+            conn.execute("UPDATE schema_version SET version = ?", (7,))
 
     def _ensure_restart_schema(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
@@ -517,4 +521,18 @@ class SchemaManager:
                 FOREIGN KEY (run_id) REFERENCES reconcile_runs(run_id) ON DELETE CASCADE
             )
             """
+        )
+
+    def _migrate_v6_to_v7(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE INDEX reconcile_runs_started_id_idx "
+            "ON reconcile_runs (started_at DESC, run_id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX reconcile_runs_outcome_started_id_idx "
+            "ON reconcile_runs (outcome, started_at DESC, run_id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX reconcile_results_bot_finished_run_idx "
+            "ON reconcile_results (bot_id, finished_at DESC, run_id DESC, started_at)"
         )
