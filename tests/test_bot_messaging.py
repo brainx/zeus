@@ -408,7 +408,7 @@ class BotMessagingTests(unittest.TestCase):
 
     def test_cancel_intent_wait_cannot_send_to_changed_generation(self) -> None:
         result = self.messaging.send("coder", "hello")
-        update = self.messaging.store.update_run
+        update = self.messaging.store.record_cancel_intent
 
         def race(*args, **kwargs):
             receipt = update(*args, **kwargs)
@@ -417,7 +417,7 @@ class BotMessagingTests(unittest.TestCase):
             return receipt
 
         with (
-            patch.object(self.messaging.store, "update_run", side_effect=race),
+            patch.object(self.messaging.store, "record_cancel_intent", side_effect=race),
             self.assertRaisesRegex(MessagingError, "runtime_changed"),
         ):
             self.messaging.cancel(result["message_id"])
@@ -509,6 +509,44 @@ class BotMessagingTests(unittest.TestCase):
         self.assertEqual("stopping", cancelled["run_status"])
         self.assertIsNotNone(cancelled["cancel_requested_at"])
         self.assertEqual(self.run_id, self.stop.call_args.args[2])
+
+    def test_failed_cancel_does_not_refresh_cached_run_status(self) -> None:
+        result = self.messaging.send("coder", "hello")
+        first_requested_at = None
+        for error in ("timeout", "not_found"):
+            with self.subTest(error=error):
+                if error == "not_found":
+                    self.messaging.status(result["message_id"])
+                before = self.messaging.store.get(result["message_id"])
+                self.now += timedelta(hours=1)
+                self.stop.side_effect = HermesRunsClientError(error, uncertain=error == "timeout")
+                with self.assertRaisesRegex(HermesRunsClientError, error):
+                    self.messaging.cancel(result["message_id"])
+                after = self.messaging.store.get(result["message_id"])
+                first_requested_at = first_requested_at or self.now
+                self.assertEqual(before.run_status, after.run_status)
+                self.assertEqual(before.last_checked_at, after.last_checked_at)
+                self.assertEqual(first_requested_at, after.cancel_requested_at)
+                self.assertEqual(self.now, after.updated_at)
+
+    def test_successful_cancel_records_status_only_after_the_response(self) -> None:
+        result = self.messaging.send("coder", "hello")
+        self.now += timedelta(seconds=1)
+        requested_at = self.now
+
+        def stop(*_args):
+            receipt = self.messaging.store.get(result["message_id"])
+            self.assertEqual("running", receipt.run_status)
+            self.assertIsNone(receipt.last_checked_at)
+            self.assertEqual(requested_at, receipt.cancel_requested_at)
+            self.now += timedelta(seconds=1)
+            return {"run_id": self.run_id, "status": "cancelled"}
+
+        self.stop.side_effect = stop
+        cancelled = self.messaging.cancel(result["message_id"])
+        self.assertEqual("cancelled", cancelled["run_status"])
+        self.assertEqual(requested_at.isoformat(), cancelled["cancel_requested_at"])
+        self.assertEqual(self.now.isoformat(), cancelled["last_checked_at"])
 
     def test_status_rejects_recreated_bot_and_rotated_key_without_http(self) -> None:
         result = self.messaging.send("coder", "hello")

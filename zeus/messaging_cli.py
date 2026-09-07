@@ -20,7 +20,7 @@ from zeus.supervisor import Supervisor
 def add_messaging_parsers(sub: Any) -> None:
     messages = sub.add_parser("message", help="submit and inspect explicit operator jobs")
     actions = messages.add_subparsers(dest="action", required=True)
-    for action in ("send", "retry", "status", "cancel", "list"):
+    for action in ("send", "retry", "status", "cancel", "release", "list"):
         parser = actions.add_parser(action)
         if action == "send":
             parser.add_argument("bot_id")
@@ -29,6 +29,12 @@ def add_messaging_parsers(sub: Any) -> None:
             parser.add_argument("message_id")
         if action in {"send", "retry"}:
             parser.add_argument("--file", required=True, help="UTF-8 input file, or - for stdin")
+        if action == "release":
+            parser.add_argument(
+                "--acknowledge-unknown-outcome",
+                action="store_true",
+                help="release the local busy blocker; the job may still run and is not cancelled",
+            )
         if action == "list":
             parser.add_argument("--bot-id")
             parser.add_argument("--before", help="cursor returned by the previous page")
@@ -73,6 +79,10 @@ def run_messaging_command(args: argparse.Namespace, settings: Settings) -> int:
             payload = workflow.status(args.message_id)
         elif args.action == "cancel":
             payload = workflow.cancel(args.message_id)
+        elif args.action == "release":
+            payload = workflow.release(
+                args.message_id, acknowledge_unknown_outcome=args.acknowledge_unknown_outcome
+            )
         else:
             payload = workflow.list(bot_id=args.bot_id, limit=args.limit, before=args.before)
     except StateReadinessError:

@@ -176,6 +176,76 @@ class MessageStoreTests(unittest.TestCase):
         self.assertEqual("rejected", receipt.dispatch_state)
         self._prepare(request_key_fingerprint="e" * 64)
 
+    def test_cancel_intent_preserves_last_observation_and_terminal_status(self) -> None:
+        receipt = self._prepare()
+        receipt = self.store.finish_attempt(
+            receipt.message_id,
+            expected_version=receipt.version,
+            dispatch_state="accepted",
+            run_id="run-123",
+            run_status="running",
+            now=self.now,
+        )
+        requested_at = self.now + timedelta(seconds=1)
+        receipt = self.store.record_cancel_intent(
+            receipt.message_id, expected_version=receipt.version, now=requested_at
+        )
+        self.assertEqual("running", receipt.run_status)
+        self.assertIsNone(receipt.last_checked_at)
+        self.assertEqual(requested_at, receipt.cancel_requested_at)
+        self.assertEqual(requested_at, receipt.updated_at)
+        checked_at = self.now + timedelta(seconds=2)
+        receipt = self.store.update_run(
+            receipt.message_id,
+            expected_version=receipt.version,
+            run_status="completed",
+            now=checked_at,
+        )
+        receipt = self.store.record_cancel_intent(
+            receipt.message_id,
+            expected_version=receipt.version,
+            now=self.now + timedelta(seconds=3),
+        )
+        self.assertEqual("completed", receipt.run_status)
+        self.assertEqual(checked_at, receipt.last_checked_at)
+        self.assertEqual(requested_at, receipt.cancel_requested_at)
+
+    def test_cancel_intent_requires_acknowledgement_current_version_and_clock(self) -> None:
+        receipt = self._prepare()
+        self._error(
+            "invalid_transition",
+            lambda: self.store.record_cancel_intent(
+                receipt.message_id, expected_version=receipt.version, now=self.now
+            ),
+        )
+        receipt = self.store.finish_attempt(
+            receipt.message_id,
+            expected_version=receipt.version,
+            dispatch_state="accepted",
+            run_id="run-123",
+            run_status="running",
+            now=self.now,
+        )
+        self._error(
+            "clock_rollback",
+            lambda: self.store.record_cancel_intent(
+                receipt.message_id,
+                expected_version=receipt.version,
+                now=self.now - timedelta(seconds=1),
+            ),
+        )
+        requested = self.store.record_cancel_intent(
+            receipt.message_id, expected_version=receipt.version, now=self.now
+        )
+        self.assertEqual(receipt.version + 1, requested.version)
+        self._error(
+            "receipt_changed",
+            lambda: self.store.record_cancel_intent(
+                receipt.message_id, expected_version=receipt.version, now=self.now
+            ),
+        )
+        self.assertEqual(requested, self.store.get(receipt.message_id))
+
     def test_retry_lease_expiry_clock_rollback_and_cas(self) -> None:
         receipt = self._prepare()
         self._error(
@@ -285,7 +355,8 @@ class MessageStoreTests(unittest.TestCase):
                 "INSERT INTO message_receipts SELECT ?, NULL, target_bot_id, target_created_at, "
                 "target_fingerprint, endpoint, credential_fingerprint, request_hash, ?, "
                 "dispatch_state, run_id, run_status, created_at, updated_at, retry_before, "
-                "last_checked_at, cancel_requested_at, lease_until, error_code, version "
+                "last_checked_at, cancel_requested_at, lease_until, error_code, version, "
+                "released_at "
                 "FROM message_receipts WHERE message_id = ?",
                 [
                     (f"{index:032x}", f"{index + 10000:032x}", receipt.message_id)
@@ -472,6 +543,9 @@ class MessageSchemaMigrationTests(unittest.TestCase):
             def _migrate_v7_to_v8(self, conn):
                 pass
 
+            def _migrate_v8_to_v9(self, conn):
+                pass
+
         PriorSchemaManager(SQLiteDatabase(path)).init()
         with closing(sqlite3.connect(path)) as conn:
             conn.execute("UPDATE schema_version SET version = 7")
@@ -497,7 +571,7 @@ class MessageSchemaMigrationTests(unittest.TestCase):
                 )
                 self.assertTrue(all(after_schema[name] == sql for name, sql in before_schema))
                 self.assertEqual(
-                    8, conn.execute("SELECT version FROM schema_version").fetchone()[0]
+                    9, conn.execute("SELECT version FROM schema_version").fetchone()[0]
                 )
                 self.assertEqual(
                     [], conn.execute("PRAGMA foreign_key_list(message_receipts)").fetchall()

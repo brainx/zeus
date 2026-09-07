@@ -876,12 +876,12 @@ class SQLiteSchemaTests(unittest.TestCase):
         self.assertIn("UPDATE schema_version SET version = 5", sql)
         self.assertEqual("ROLLBACK", sql[-1])
 
-    def test_v9_rejection_is_read_only_for_connect_init_and_migrate(self) -> None:
+    def test_future_schema_rejection_is_read_only_for_connect_init_and_migrate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "zeus.db"
             StateStore(database_path).init()
             with closing(sqlite3.connect(database_path)) as conn:
-                conn.execute("UPDATE schema_version SET version = 9")
+                conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,))
                 conn.commit()
             before = _database_snapshot(database_path)
             expected_uri = f"{database_path.resolve().as_uri()}?mode=ro"
@@ -920,7 +920,7 @@ class SQLiteSchemaTests(unittest.TestCase):
             def swap_after_preflight(path: Path) -> None:
                 _preflight_schema_compatibility(path)
                 with closing(real_connect(path)) as conn:
-                    conn.execute("UPDATE schema_version SET version = 9")
+                    conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,))
                     conn.commit()
                 post_swap_snapshot.append(_database_snapshot(path))
 
@@ -1096,7 +1096,7 @@ class SQLiteDurabilityTests(unittest.TestCase):
             child_type.assert_called_once_with(database)
 
     def test_durability_configuration_does_not_change_schema_version(self) -> None:
-        self.assertEqual(8, SCHEMA_VERSION)
+        self.assertEqual(9, SCHEMA_VERSION)
         for mode in (SQLiteSynchronous.NORMAL, SQLiteSynchronous.FULL):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 database_path = Path(tmp) / "zeus.db"

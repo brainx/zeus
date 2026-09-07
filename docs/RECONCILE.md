@@ -37,7 +37,7 @@ following a cursor. Sparse bot filters may inspect additional candidate runs,
 using indexed membership checks. Each request reads one SQLite snapshot; a running run may
 accumulate more results between requests.
 
-These commands open existing schema-v8 state read-only. They neither initialize
+These commands open existing schema-v9 state read-only. They neither initialize
 or migrate a database nor reconcile or inspect live processes. An absent,
 outdated, or unreadable store returns `not_ready`; an unknown run returns
 `unknown_reconcile_run`. Start the current Zeus service or another normal

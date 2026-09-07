@@ -166,7 +166,7 @@ class RendererStateTests(unittest.TestCase):
             self.assertEqual(1, count)
             self.assertEqual(SCHEMA_VERSION, version)
 
-    def test_state_v3_to_v8_migration_is_exact_additive_and_idempotent(self) -> None:
+    def test_state_v3_to_current_migration_is_exact_additive_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
@@ -254,13 +254,13 @@ class RendererStateTests(unittest.TestCase):
             self.assertEqual(3, version)
             self.assertEqual("view", object_type)
 
-    def test_state_rejects_v9_without_mutating_database(self) -> None:
+    def test_state_rejects_future_schema_without_mutating_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
             store.init()
             with closing(sqlite3.connect(database)) as conn:
-                conn.execute("UPDATE schema_version SET version = 9")
+                conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,))
                 conn.commit()
                 before = list(conn.iterdump())
 
@@ -270,7 +270,7 @@ class RendererStateTests(unittest.TestCase):
             with closing(sqlite3.connect(database)) as conn:
                 self.assertEqual(before, list(conn.iterdump()))
 
-    def test_fresh_v8_reconciliation_schema_matches_contract(self) -> None:
+    def test_fresh_reconciliation_schema_matches_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
@@ -342,7 +342,7 @@ class RendererStateTests(unittest.TestCase):
             self.assertIn("length(message) <= 2048", result_sql)
             self.assertEqual(1, foreign_keys_enabled)
 
-    def test_v5_to_v8_reconciliation_migration_is_additive_and_idempotent(self) -> None:
+    def test_v5_to_current_reconciliation_migration_is_additive_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)
@@ -407,7 +407,7 @@ class RendererStateTests(unittest.TestCase):
                         ),
                     )
 
-    def test_v5_to_v8_failure_rolls_back_version_and_all_ddl(self) -> None:
+    def test_v5_to_current_failure_rolls_back_version_and_all_ddl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "zeus.db"
             store = StateStore(database)

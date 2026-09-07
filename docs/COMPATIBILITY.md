@@ -52,7 +52,8 @@ setting, to persist dispatch intent before submitting a job.
 The synchronous policy itself does not change database structure. Zeus v0.6
 adds an independent forward-only migration from schema v6 to schema v7 for
 operator-query indexes. Schema v8 then adds durable operator-message receipts.
-Existing v6/v7 databases upgrade during normal startup;
+Schema v9 adds explicit local release timestamps to those receipts.
+Existing v6/v7/v8 databases upgrade during normal startup;
 read-only history/fleet commands require the current schema. Keep all writers
 on the same Zeus version and retain a quiesced backup for rollback.
 

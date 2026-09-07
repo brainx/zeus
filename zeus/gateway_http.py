@@ -62,16 +62,17 @@ def _validate_headers(response: HTTPResponse, max_bytes: int) -> None:
     lengths = response.headers.get_all("Content-Length", [])
     if any(re.fullmatch(r"[0-9]+", value) is None for value in lengths):
         raise GatewayHTTPError("invalid_response")
-    if lengths:
-        parsed = {int(value) for value in lengths}
-        if len(parsed) != 1 or max(parsed) > max_bytes:
-            raise GatewayHTTPError("invalid_response")
+    parsed_lengths = {int(value) for value in lengths}
+    if len(parsed_lengths) > 1:
+        raise GatewayHTTPError("invalid_response")
     encodings = response.headers.get_all("Transfer-Encoding", [])
     if encodings and (lengths or encodings != ["chunked"]):
         raise GatewayHTTPError("invalid_response")
     content_encoding = response.headers.get_all("Content-Encoding", [])
     if content_encoding and content_encoding != ["identity"]:
         raise GatewayHTTPError("invalid_response")
+    if parsed_lengths and max(parsed_lengths) > max_bytes:
+        raise GatewayHTTPError("response_too_large")
 
 
 def request_json(
@@ -165,7 +166,9 @@ def request_json(
             return response.status, None
         data = response.read(max_bytes + 1)
         check_deadline()
-        if len(data) > max_bytes or response.length not in {0, None}:
+        if len(data) > max_bytes:
+            raise GatewayHTTPError("response_too_large")
+        if response.length not in {0, None}:
             raise GatewayHTTPError("invalid_response")
         payload = json.loads(
             data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_reject_constant

@@ -167,6 +167,7 @@ def probe_gateway_health(
         reason = {
             "gateway_unavailable": "health_unavailable",
             "invalid_response": "invalid_health",
+            "response_too_large": "invalid_health",
             "invalid_request": "invalid_health",
         }.get(exc.code, exc.code)
         return reason, None

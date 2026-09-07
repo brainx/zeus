@@ -311,17 +311,12 @@ class HermesDiagnosticsTests(unittest.TestCase):
             with self.subTest(case=index):
                 self.assertEqual(("invalid_health", None), self._probe_payload(payload))
 
-    def test_malformed_json_and_oversized_or_invalid_http_are_rejected(self) -> None:
-        oversized = b"x" * (MAX_HEALTH_RESPONSE_BYTES + 1)
-        oversized_chunk = f"{len(oversized):x}\r\n".encode() + oversized + b"\r\n0\r\n\r\n"
+    def test_malformed_json_and_invalid_http_are_rejected(self) -> None:
         responses = [
             _http(b"[]"),
             _http(b"not json " + _KEY.encode()),
             _http(b"\xff"),
             _http(b'{"status":"ok","status":"degraded"}'),
-            _http(b"{" + b"x" * MAX_HEALTH_RESPONSE_BYTES),
-            _http(oversized, headers=b""),
-            _http(oversized_chunk, headers=b"Transfer-Encoding: chunked\r\n"),
             _http(b"{}", headers=b"Content-Length: -1\r\n"),
             _http(b"{}", headers=b"Content-Length: 2\r\nContent-Length: 3\r\n"),
             _http(b"{}", headers=b"Content-Length: 2\r\nTransfer-Encoding: chunked\r\n"),
@@ -334,6 +329,19 @@ class HermesDiagnosticsTests(unittest.TestCase):
         ]
         for index, response in enumerate(responses):
             with self.subTest(case=index), _Server(response) as server:
+                self.assertEqual(
+                    ("invalid_health", None), probe_gateway_health(server.url, _KEY, _PID)
+                )
+
+    def test_oversized_health_bodies_preserve_invalid_health_reason(self) -> None:
+        oversized = json.dumps({**_payload(), "detail": "x" * MAX_HEALTH_RESPONSE_BYTES}).encode()
+        oversized_chunk = f"{len(oversized):x}\r\n".encode() + oversized + b"\r\n0\r\n\r\n"
+        for response in (
+            _http(oversized),
+            _http(oversized, headers=b""),
+            _http(oversized_chunk, headers=b"Transfer-Encoding: chunked\r\n"),
+        ):
+            with _Server(response) as server:
                 self.assertEqual(
                     ("invalid_health", None), probe_gateway_health(server.url, _KEY, _PID)
                 )

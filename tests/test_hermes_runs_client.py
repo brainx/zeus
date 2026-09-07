@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 import unittest
+from http.client import HTTPResponse
 from unittest.mock import patch
 
 from tests.test_hermes_diagnostics import _http
@@ -290,13 +291,23 @@ class HermesRunsClientTests(unittest.TestCase):
             {"input": "accepted then lost"}, json.loads(server.requests[0].split(b"\r\n\r\n")[1])
         )
 
-    def test_malformed_framing_json_and_body_limits_fail_closed(self) -> None:
+    def test_malformed_framing_and_json_fail_closed(self) -> None:
         responses = [
             _http(b"{}", status=202, headers=b"Content-Length: 3\r\n"),
             _http(
                 b"{}", status=202, headers=b"Content-Length: 2\r\nTransfer-Encoding: chunked\r\n"
             ),
             _http(b"{}", status=202, headers=b"Content-Length: 2\r\nContent-Length: 3\r\n"),
+            _http(
+                b"{}",
+                status=202,
+                headers=b"Content-Length: 999999\r\nContent-Length: 999998\r\n",
+            ),
+            _http(
+                b"{}",
+                status=202,
+                headers=b"Content-Length: 999999\r\nTransfer-Encoding: chunked\r\n",
+            ),
             _http(b"{}", status=202, headers=b"Content-Encoding: gzip\r\nContent-Length: 2\r\n"),
             _http(b' {"run_id":"x","run_id":"y"}', status=202),
             _http(b'{"x":NaN}', status=202),
@@ -310,15 +321,42 @@ class HermesRunsClientTests(unittest.TestCase):
                 self.assert_client_error(
                     "invalid_response", True, submit, server.url, _KEY, "hi", _IDEMPOTENCY_KEY
                 )
-        oversized = b"x" * (MAX_STATUS_RESPONSE_BYTES + 1)
+
+    def test_large_completed_output_has_distinct_error_and_bounded_reads(self) -> None:
+        oversized = json.dumps({**_run(), "output": "x" * MAX_STATUS_RESPONSE_BYTES}).encode()
         chunked = f"{len(oversized):x}\r\n".encode() + oversized + b"\r\n0\r\n\r\n"
-        for wire in (
-            _http(oversized),
-            _http(oversized, headers=b""),
-            _http(chunked, headers=b"Transfer-Encoding: chunked\r\n"),
-        ):
-            with _Server(wire) as server:
-                self.assert_client_error("invalid_response", False, status, server.url, _KEY, _ID)
+        original_read = HTTPResponse.read
+        for action, uncertain in ((status, False), (stop, True)):
+            for framing, wire in (
+                ("length", _http(oversized)),
+                ("eof", _http(oversized, headers=b"")),
+                ("chunked", _http(chunked, headers=b"Transfer-Encoding: chunked\r\n")),
+            ):
+                amounts = []
+
+                def read(response, amount=None, recorded=amounts):
+                    recorded.append(amount)
+                    return original_read(response, amount)
+
+                with (
+                    self.subTest(operation=action.__name__, framing=framing),
+                    _Server(wire) as server,
+                    patch("zeus.gateway_http.HTTPResponse.read", new=read),
+                ):
+                    self.assert_client_error(
+                        "response_too_large", uncertain, action, server.url, _KEY, _ID
+                    )
+                    self.assertEqual(
+                        [] if framing == "length" else [MAX_STATUS_RESPONSE_BYTES + 1], amounts
+                    )
+                self.assertEqual(1, len(server.requests))
+
+    def test_oversized_submission_acknowledgement_remains_uncertain(self) -> None:
+        with _Server(_http(b"x" * (64 * 1024 + 1), status=202)) as server:
+            self.assert_client_error(
+                "response_too_large", True, submit, server.url, _KEY, "hi", _IDEMPOTENCY_KEY
+            )
+        self.assertEqual(1, len(server.requests))
 
     def test_total_deadline_bounds_mutation_headers_body_and_chunk_drips(self) -> None:
         for prefix, dripped in (

@@ -40,6 +40,7 @@ ERROR_CODES = frozenset(
         "unsupported_runtime",
         "gateway_unavailable",
         "invalid_response",
+        "response_too_large",
         "timeout",
     }
 )

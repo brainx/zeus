@@ -50,6 +50,7 @@ _ERROR_CODES = frozenset(
         "rate_limited",
         "gateway_unavailable",
         "invalid_response",
+        "response_too_large",
     }
 )
 _LIST_QUERIES = {
@@ -89,6 +90,7 @@ class MessageReceipt:
     retry_before: datetime
     last_checked_at: datetime | None
     cancel_requested_at: datetime | None
+    released_at: datetime | None
     lease_until: datetime | None
     error_code: str | None
     version: int
@@ -164,16 +166,18 @@ def _receipt(row: sqlite3.Row, *, observe: bool = False) -> MessageReceipt:
         }
         optional = {
             name: _stored_time(row[name]) if row[name] is not None else None
-            for name in ("last_checked_at", "cancel_requested_at", "lease_until")
+            for name in ("last_checked_at", "cancel_requested_at", "released_at", "lease_until")
         }
         if not times["target_created_at"] <= times["created_at"] <= times[
             "updated_at"
         ] or not timedelta(0) < times["retry_before"] - times["created_at"] <= timedelta(days=1):
             raise ValueError("message receipt times are inconsistent")
-        for name in ("last_checked_at", "cancel_requested_at"):
+        for name in ("last_checked_at", "cancel_requested_at", "released_at"):
             stamp = optional[name]
             if stamp is not None and not times["created_at"] <= stamp <= times["updated_at"]:
                 raise ValueError("message receipt observation time is inconsistent")
+        if optional["released_at"] is not None and row["dispatch_state"] != "accepted":
+            raise ValueError("only acknowledged message receipts can be released")
         lease = optional["lease_until"]
         if row["dispatch_state"] == "prepared":
             if lease is None or lease != times["updated_at"] + timedelta(
@@ -200,6 +204,7 @@ def _receipt(row: sqlite3.Row, *, observe: bool = False) -> MessageReceipt:
             retry_before=times["retry_before"],
             last_checked_at=optional["last_checked_at"],
             cancel_requested_at=optional["cancel_requested_at"],
+            released_at=optional["released_at"],
             lease_until=lease,
             error_code=row["error_code"],
             version=_version(row["version"]),
@@ -343,7 +348,8 @@ class MessageStore:
                     return existing, False
             blocker = conn.execute(
                 "SELECT * FROM message_receipts WHERE target_bot_id = ? "
-                "AND target_created_at = ? AND (dispatch_state IN ('prepared', 'unknown') OR "
+                "AND target_created_at = ? AND released_at IS NULL "
+                "AND (dispatch_state IN ('prepared', 'unknown') OR "
                 "(dispatch_state = 'accepted' AND run_status NOT IN "
                 "('completed', 'failed', 'cancelled', 'interrupted'))) LIMIT 1",
                 (bot_id, incarnation.isoformat()),
@@ -456,6 +462,47 @@ class MessageStore:
                 "run_status = ?, error_code = ?, "
                 "updated_at = ?, lease_until = NULL, version = version + 1 WHERE message_id = ?",
                 (dispatch_state, run_id, run_status, error_code, now.isoformat(), message_id),
+            )
+            return self._load(conn, message_id)
+
+    def release(self, message_id: str, *, expected_version: int, now: datetime) -> MessageReceipt:
+        _identifier(message_id)
+        _version(expected_version)
+        now = _time(now)
+        with self._write() as conn:
+            receipt = self._current(conn, message_id, expected_version, now)
+            if receipt.dispatch_state != "accepted":
+                raise MessageStoreError("run_unacknowledged")
+            if receipt.released_at is not None:
+                return receipt
+            if receipt.run_status in _TERMINAL:
+                raise MessageStoreError("run_already_terminal")
+            # Keep the acknowledgement, last observation and request-key tombstone.
+            # Release is an operator decision, never evidence that execution stopped.
+            conn.execute(
+                "UPDATE message_receipts SET released_at = ?, updated_at = ?, "
+                "version = version + 1 WHERE message_id = ?",
+                (now.isoformat(), now.isoformat(), message_id),
+            )
+            return self._load(conn, message_id)
+
+    def record_cancel_intent(
+        self, message_id: str, *, expected_version: int, now: datetime
+    ) -> MessageReceipt:
+        _identifier(message_id)
+        _version(expected_version)
+        now = _time(now)
+        with self._write() as conn:
+            receipt = self._current(conn, message_id, expected_version, now)
+            if receipt.dispatch_state != "accepted":
+                raise MessageStoreError("invalid_transition")
+            # Intent is durable before the request, but it cannot make a
+            # cached run status appear to have been observed more recently.
+            conn.execute(
+                "UPDATE message_receipts SET updated_at = ?, "
+                "cancel_requested_at = COALESCE(cancel_requested_at, ?), "
+                "version = version + 1 WHERE message_id = ?",
+                (now.isoformat(), now.isoformat(), message_id),
             )
             return self._load(conn, message_id)
 

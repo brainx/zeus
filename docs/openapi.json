@@ -105,7 +105,7 @@
         "properties": {
           "schema_version": {
             "type": "integer",
-            "const": 8
+            "const": 9
           },
           "status": {
             "type": "string",

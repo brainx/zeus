@@ -187,18 +187,18 @@ release-blocking provenance failure.
 
 The development package identifies itself as `0.6.0.dev0`; the latest stable
 release remains v0.5.0. Existing lifecycle route shapes are retained, with
-additional read-only operator endpoints. `/ready` reports schema version 8
-after the additive index and message-receipt migrations. Normal service/CLI
-initialization performs the migration; inspection and message commands require
-the current schema and do not migrate it as a side effect.
+additional read-only operator endpoints. `/ready` reports schema version 9
+after the additive index, message-receipt, and release-timestamp migrations.
+Normal service/CLI initialization performs the migration; inspection and message
+commands require the current schema and do not migrate it as a side effect.
 
 Before upgrading an existing host, quiesce Zeus writers and take the database
 and private profiles backup described in [Operations](OPERATIONS.md). Restart
 with one version of Zeus managing the state directory. Do not run a v0.5 process
-against an upgraded v8 database. A rollback requires the matching pre-upgrade
+against an upgraded v9 database. A rollback requires the matching pre-upgrade
 backup and old package; Zeus does not downgrade databases.
 
-Olymp must explicitly support the `0.6.0.dev0` version and schema-v8 readiness
+Olymp must explicitly support the `0.6.0.dev0` version and schema-v9 readiness
 contract before registering a node with that expected version. Preserve exact
 version checks and the existing v0.5/schema-v6 contract for stable nodes. The
 new fleet freshness field is evidence age, not a substitute for application

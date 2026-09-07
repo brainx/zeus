@@ -35,6 +35,12 @@ class MessagingCliTests(unittest.TestCase):
         self.assertIn(payload["error"]["code"], {"not_ready", "state_unavailable"})
         self.assertFalse((self.root / "state").exists())
 
+    def test_release_missing_state_does_not_initialize(self) -> None:
+        code, payload = self.cli("release", "a" * 32, "--acknowledge-unknown-outcome")
+        self.assertEqual(1, code)
+        self.assertIn(payload["error"]["code"], {"not_ready", "state_unavailable"})
+        self.assertFalse((self.root / "state").exists())
+
     def test_send_and_retry_read_exact_file_content(self) -> None:
         source = self.root / "message.txt"
         source.write_text("  operator text\n雪\n", encoding="utf-8")
@@ -108,6 +114,27 @@ class MessagingCliTests(unittest.TestCase):
             with redirect_stdout(output):
                 self.assertEqual(0, main(["message", "status", "a" * 32]))
             self.assertNotIn("\x1b", output.getvalue())
+
+    def test_release_passes_explicit_acknowledgement_without_reading_input(self) -> None:
+        with patch("zeus.messaging_cli.BotMessaging") as workflow:
+            workflow.return_value.release.return_value = {
+                "dispatch_state": "accepted",
+                "released_at": "2026-09-07T00:00:00+00:00",
+            }
+            self.assertEqual(0, self.cli("release", "a" * 32, "--acknowledge-unknown-outcome")[0])
+            workflow.return_value.release.assert_called_once_with(
+                "a" * 32, acknowledge_unknown_outcome=True
+            )
+            workflow.return_value.release.reset_mock()
+            workflow.return_value.release.side_effect = MessagingError(
+                "outcome_acknowledgement_required"
+            )
+            code, payload = self.cli("release", "a" * 32)
+            self.assertEqual(1, code)
+            self.assertEqual("outcome_acknowledgement_required", payload["error"]["code"])
+            workflow.return_value.release.assert_called_once_with(
+                "a" * 32, acknowledge_unknown_outcome=False
+            )
 
 
 if __name__ == "__main__":

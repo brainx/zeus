@@ -115,9 +115,34 @@ Reusing that key for changed input or a different target is a conflict. If the
 first CLI response was lost, `list` recovers the message ID. Preserve the original
 input yourself if retry may be needed.
 
+An acknowledged run can also outlive Hermes's retained result. A completed reply
+larger than the bounded 256 KiB status response causes `response_too_large` and
+can prevent status and cancellation from returning its outcome. These errors
+preserve the last observed status and continue blocking another job.
+After investigating the run through Hermes, you can
+explicitly release that local blocker:
+
+```sh
+zeus message release <message-id> --acknowledge-unknown-outcome --json
+```
+
+Release requires an acknowledged, nonterminal receipt. It records `released_at`
+without changing the run ID, dispatch state, last known run status or
+`last_checked_at`. It makes no gateway request: the run may still be executing,
+and its tool effects may already have occurred. Release does not cancel, retry,
+delete or submit anything. A later, independently requested job remains subject
+to Hermes's concurrency limit. Status and cancellation of the released receipt
+remain available when the original target can be verified; a successful later
+observation preserves `released_at`. Retrying or repeating the original request
+key still returns the same receipt without resubmission. Unknown or prepared
+dispatches cannot be released because delivery has not been acknowledged.
+
+Cancellation separately records `cancel_requested_at` before contacting Hermes.
+A failed stop request does not refresh `last_checked_at` or the cached run status.
+
 These checks avoid automatic duplicate dispatch, but cannot guarantee exactly-once
 external tool effects after a crash or an upstream persistence failure. No message
-commands initialize/migrate Zeus state or start/reconcile bots. Schema 8 must
+commands initialize/migrate Zeus state or start/reconcile bots. Schema 9 must
 already have been initialized by ordinary startup. There are no new Zeus HTTP
 messaging routes in this version.
 

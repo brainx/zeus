@@ -392,7 +392,9 @@ class ReconcileHistoryTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as conn:
             self.assertEqual(before, conn.execute("SELECT * FROM reconcile_runs").fetchall())
             self.assertEqual(results, conn.execute("SELECT * FROM reconcile_results").fetchall())
-            self.assertEqual(8, conn.execute("SELECT version FROM schema_version").fetchone()[0])
+            self.assertEqual(
+                SCHEMA_VERSION, conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            )
             indexes = {
                 row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
             }

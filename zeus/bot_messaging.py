@@ -100,6 +100,7 @@ def _public(receipt: MessageReceipt) -> dict[str, object]:
         "cancel_requested_at": (
             receipt.cancel_requested_at.isoformat() if receipt.cancel_requested_at else None
         ),
+        "released_at": receipt.released_at.isoformat() if receipt.released_at else None,
         "error_code": receipt.error_code,
     }
 
@@ -393,12 +394,10 @@ class BotMessaging:
         if receipt.run_id is None:
             raise MessagingError("run_unacknowledged")
         target = self._receipt_target(receipt, sending=False)
-        receipt = self.store.update_run(
+        receipt = self.store.record_cancel_intent(
             receipt.message_id,
             expected_version=receipt.version,
-            run_status=cast(str, receipt.run_status),
             now=self.clock(),
-            cancel_requested=True,
         )
         if not self._unchanged(target, sending=False):
             raise MessagingError("runtime_changed")
@@ -410,6 +409,18 @@ class BotMessaging:
             expected_version=receipt.version,
             run_status=cast(str, result["status"]),
             now=self.clock(),
+        )
+        return _public(updated)
+
+    def release(
+        self, message_id: str, *, acknowledge_unknown_outcome: bool = False
+    ) -> dict[str, object]:
+        """Record an operator decision to stop blocking, without inferring a run outcome."""
+        if acknowledge_unknown_outcome is not True:
+            raise MessagingError("outcome_acknowledgement_required")
+        receipt = self._receipt(message_id)
+        updated = self.store.release(
+            receipt.message_id, expected_version=receipt.version, now=self.clock()
         )
         return _public(updated)
 

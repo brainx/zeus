@@ -7,7 +7,7 @@ from typing import Protocol
 
 from zeus.lifecycle import serialize_lifecycle_details
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class _SchemaDatabase(Protocol):
@@ -164,6 +164,10 @@ class SchemaManager:
         if current_version < 8:
             self._migrate_v7_to_v8(conn)
             conn.execute("UPDATE schema_version SET version = ?", (8,))
+            current_version = 8
+        if current_version < 9:
+            self._migrate_v8_to_v9(conn)
+            conn.execute("UPDATE schema_version SET version = ?", (9,))
 
     def _ensure_restart_schema(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
@@ -608,4 +612,40 @@ class SchemaManager:
         conn.execute(
             "CREATE INDEX message_receipts_target_created_id_idx "
             "ON message_receipts (target_bot_id, created_at DESC, message_id DESC)"
+        )
+
+    def _migrate_v8_to_v9(self, conn: sqlite3.Connection) -> None:
+        # Existing receipts remain unreleased. Keep the v8 table/data in place;
+        # the store additionally validates complete datetime calendar semantics.
+        conn.execute(
+            """
+            ALTER TABLE message_receipts ADD COLUMN released_at TEXT CHECK (
+                released_at IS NULL OR (
+                    typeof(released_at) = 'text'
+                    AND dispatch_state = 'accepted'
+                    AND released_at >= created_at
+                    AND released_at <= updated_at
+                    AND length(released_at) IN (25, 32)
+                    AND substr(released_at, -6) = '+00:00'
+                    AND datetime(substr(released_at, 1, 19)) IS NOT NULL
+                    AND strftime('%Y-%m-%dT%H:%M:%S', substr(released_at, 1, 19))
+                        = substr(released_at, 1, 19)
+                    AND (
+                        length(released_at) = 25 OR (
+                            substr(released_at, 20, 1) = '.'
+                            AND substr(released_at, 21, 6) NOT GLOB '*[^0-9]*'
+                            AND substr(released_at, 21, 6) != '000000'
+                        )
+                    )
+                )
+            )
+            """
+        )
+        conn.execute("DROP INDEX message_receipts_active_target_idx")
+        conn.execute(
+            "CREATE UNIQUE INDEX message_receipts_active_target_idx "
+            "ON message_receipts (target_bot_id, target_created_at) "
+            "WHERE released_at IS NULL AND (dispatch_state IN ('prepared', 'unknown') "
+            "OR (dispatch_state = 'accepted' "
+            "AND run_status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')))"
         )
