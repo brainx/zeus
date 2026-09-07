@@ -21,10 +21,11 @@ from pathlib import Path
 from unittest.mock import call, patch
 
 from tests.host_capabilities import child_process_identity_available
-from tests.test_api import api_server
+from tests.test_api import api_server, stop_api_fixture
 from zeus import __version__
 from zeus.api import main as api_main
 from zeus.api import make_handler
+from zeus.api_server import ThreadingHTTPServer
 from zeus.cli import _demo_services, _parse_env, _services, build_parser
 from zeus.cli import main as cli_main
 from zeus.config import Settings, SQLiteSynchronous
@@ -5222,31 +5223,30 @@ raise SystemExit(0)
                 }
             )
             handler = make_handler(settings)
-            from http.server import ThreadingHTTPServer
-
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-                conn.request("GET", "/templates")
-                response = conn.getresponse()
-                self.assertEqual(200, response.status)
-                templates = json.loads(response.read())
-                self.assertTrue(templates)
+                with closing(
+                    http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                ) as conn:
+                    conn.request("GET", "/templates")
+                    response = conn.getresponse()
+                    self.assertEqual(200, response.status)
+                    templates = json.loads(response.read())
+                    self.assertTrue(templates)
 
-                conn.request(
-                    "POST",
-                    "/bots",
-                    body=b"{}",
-                    headers={"content-type": "application/json"},
-                )
-                response = conn.getresponse()
-                self.assertEqual(503, response.status)
-                response.read()
+                    conn.request(
+                        "POST",
+                        "/bots",
+                        body=b"{}",
+                        headers={"content-type": "application/json"},
+                    )
+                    response = conn.getresponse()
+                    self.assertEqual(503, response.status)
+                    response.read()
             finally:
-                server.shutdown()
-                server.server_close()
+                stop_api_fixture(server, thread)
 
 
 class SQLiteDurabilityConfigurationTests(unittest.TestCase):
