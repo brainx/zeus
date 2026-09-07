@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeGuard
 from urllib.parse import urlparse
@@ -44,6 +44,7 @@ _LAUNCH_MARKER_KEYS = frozenset(
 )
 _RUNTIME_MARKER_KEYS = _LAUNCH_MARKER_KEYS | frozenset({"pid", "started_at"})
 _RUNTIME_MARKER_FINGERPRINT_KEYS = _RUNTIME_MARKER_KEYS | frozenset({"proc_start_fingerprint"})
+_MESSAGING_POLICY_KEYS = frozenset({"messaging_policy_fingerprint"})
 _READINESS_PROBE_KEYS = frozenset(
     {"url", "expected_status", "expected_platform", "timeout_seconds", "interval_seconds"}
 )
@@ -73,9 +74,10 @@ class GatewayLaunchMarker:
     resolved_hermes_bin: str
     command_fingerprint: str
     readiness_probe: ReadinessProbe | None
+    messaging_policy_fingerprint: str | None = field(default=None, kw_only=True)
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema": 3,
             "bot_id": self.bot_id,
             "component": "gateway",
@@ -87,6 +89,9 @@ class GatewayLaunchMarker:
             "command_fingerprint": self.command_fingerprint,
             "readiness_probe": readiness_probe_to_payload(self.readiness_probe),
         }
+        if self.messaging_policy_fingerprint is not None:
+            payload["messaging_policy_fingerprint"] = self.messaging_policy_fingerprint
+        return payload
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,8 @@ def parse_runtime_marker(value: object) -> GatewayRuntimeMarker:
     if frozenset(marker) not in {
         _RUNTIME_MARKER_KEYS,
         _RUNTIME_MARKER_FINGERPRINT_KEYS,
+        _RUNTIME_MARKER_KEYS | _MESSAGING_POLICY_KEYS,
+        _RUNTIME_MARKER_FINGERPRINT_KEYS | _MESSAGING_POLICY_KEYS,
     } or not all(type(key) is str for key in marker):
         raise MarkerValidationError("runtime marker has invalid keys")
 
@@ -176,6 +183,7 @@ def parse_runtime_marker(value: object) -> GatewayRuntimeMarker:
         resolved_hermes_bin=launch.resolved_hermes_bin,
         command_fingerprint=launch.command_fingerprint,
         readiness_probe=launch.readiness_probe,
+        messaging_policy_fingerprint=launch.messaging_policy_fingerprint,
         pid=pid,
         started_at=started_at,
         proc_start_fingerprint=process_start,
@@ -265,7 +273,10 @@ def readiness_probe_from_payload(value: object) -> ReadinessProbe | None:
 
 
 def _parse_launch_marker_identity(value: object) -> tuple[dict[str, object], str]:
-    marker = _exact_dict(value, _LAUNCH_MARKER_KEYS, "marker")
+    keys = _LAUNCH_MARKER_KEYS
+    if isinstance(value, dict) and "messaging_policy_fingerprint" in value:
+        keys |= _MESSAGING_POLICY_KEYS
+    marker = _exact_dict(value, keys, "marker")
     return marker, _parse_bot_id(marker)
 
 
@@ -315,6 +326,12 @@ def _finish_launch_marker(
     ):
         raise MarkerValidationError("command fingerprint is invalid")
     readiness = _strict_readiness_probe_from_payload(marker["readiness_probe"])
+    policy: str | None = None
+    if "messaging_policy_fingerprint" in marker:
+        raw_policy = marker["messaging_policy_fingerprint"]
+        if type(raw_policy) is not str or _FINGERPRINT_RE.fullmatch(raw_policy) is None:
+            raise MarkerValidationError("messaging policy fingerprint is invalid")
+        policy = raw_policy
     return GatewayLaunchMarker(
         bot_id=bot_id,
         operation_id=operation_id,
@@ -323,6 +340,7 @@ def _finish_launch_marker(
         resolved_hermes_bin=resolved_hermes,
         command_fingerprint=fingerprint,
         readiness_probe=readiness,
+        messaging_policy_fingerprint=policy,
     )
 
 

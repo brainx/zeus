@@ -46,7 +46,7 @@ when `ZEUS_ALLOW_UNAUTH_READS=1` is explicitly enabled. It opens the existing
 database read-only, requires the current schema version, and runs `SELECT 1`.
 It never creates or migrates a database and does not require bots to be running.
 
-A ready service returns `{"schema_version":7,"status":"ready"}`. State-store
+A ready service returns `{"schema_version":9,"status":"ready"}`. State-store
 failures return `503` with `error.code=not_ready`. If state initialization fails
 before the API binds, the process exits instead of serving `/ready`.
 
@@ -162,13 +162,16 @@ aside before putting `/var/lib/zeus.before-restore-${restore_ts}` back.
 ## Migration Rollback
 
 The v2-to-v3 migration is one-way and creates the immutable lifecycle ledger.
-Schema v4 through schema v7 migrations are forward-only. V4 adds durable
+Schema v4 through schema v9 migrations are forward-only. V4 adds durable
 idempotency claims and responses; v5 adds desired state, pending lifecycle
 intent, and migration snapshots; v6 adds persisted reconciliation runs and
 ordered per-bot results. V7 adds indexes for bounded reconciliation history
-queries without rewriting recorded events. Take a pre-v4/v5/v6/v7 SQLite backup and state-tree
+queries without rewriting recorded events. V8 adds durable operator-message receipts.
+V9 adds nullable local-release timestamps to those receipts and excludes released
+receipts from the active-target uniqueness index; existing receipts remain unreleased.
+Take a pre-v4/v5/v6/v7/v8/v9 SQLite backup and state-tree
 backup before upgrading; this is the required pre-migration database backup.
-Older binaries cannot use a newer schema, including schema v7, so rolling back
+Older binaries cannot use a newer schema, including schema v9, so rolling back
 the executable requires restoring that backup. Zeus rejects a newer database
 rather than attempting a down migration; never hand-edit schema state.
 
@@ -532,6 +535,39 @@ restart decisions to Zeus and stays in the foreground under s6. Templates
 cannot supply those environment keys, and stored profile assignments are
 rejected before launch. This prevents Hermes's dotenv loader from undoing
 Zeus's process ownership policy.
+
+### Live gateway diagnostics
+
+Use `zeus bot diagnostics <bot-id> --json` or the authenticated
+`GET /bots/<bot-id>/diagnostics` API for a fresh application-health observation.
+The CLI exits `0` only for `status=ok`; every other diagnostic status exits `1`.
+`bot inspect` continues to show profile and process evidence, and fleet status
+continues to report persisted reconciliation observations.
+
+The bot must have been launched with the loopback Hermes API enabled
+(`API_SERVER_ENABLED=1`, a unique `API_SERVER_PORT`, and `API_SERVER_KEY`).
+Keep the key in the private profile environment or explicitly pass it into
+the Zeus process through `ZEUS_ENV_PASSTHROUGH=API_SERVER_KEY`. Use a distinct,
+random key for each bot, 16–4096 printable ASCII characters without spaces.
+Zeus sends that key only to the launch-recorded loopback address; an edited
+profile cannot redirect the probe. A rotated key that differs from the running
+gateway yields `authentication_failed` until the runtime configuration agrees.
+
+The probe accepts only Hermes 0.21.0, requires the returned PID to match the
+recorded gateway, and verifies the same owned process generation before and
+after the request. It has a two-second HTTP deadline and a 64 KiB response cap;
+redirects and proxy environment variables are ignored. Runtime changes discard
+the health response. The HTTP endpoint remains within the trusted local-host
+boundary; process checks do not attest ownership of the listening socket.
+
+The returned checks cover state database, session store, configuration, model,
+disk, gateway, and background queues. These reflect Hermes's local checks:
+model readiness means a model is configured, without making a provider request;
+missing state/configuration can represent valid defaults; queue inspection can
+fall back to zero. `gateway_busy=false` also occurs during drain and does not
+prove that stopping is safe. Zeus timestamps the live observation itself;
+Hermes's persisted runtime timestamp need not advance while idle. Detailed
+health is an observation, not a lifecycle or provider-availability guarantee.
 
 ### Feishu connection mode
 

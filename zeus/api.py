@@ -283,7 +283,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             path = self._normalized_path()
             if is_operator_path(path):
                 self._require_key(read=False)
-                status, payload = operator_response(path, self.path, settings.database_path)
+                status, payload = operator_response(path, self.path, supervisor)
                 if status >= 400:
                     error = payload["error"]
                     self._json_error_response(status, error["code"], error["message"])

@@ -92,6 +92,7 @@ for template_id in \
   kimi-k3-coding-bot \
   docs-writer-bot \
   gateway-operator \
+  message-bot \
   log-triage-bot \
   research-bot \
   support-gateway; do

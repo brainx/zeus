@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from typing import Any, TextIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -89,7 +90,13 @@ def _fetch_github_json(path: str, token: str, *, opener: Any = None) -> JsonObje
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except ReleaseVerificationError:
         raise
-    except (HTTPError, URLError, TimeoutError, OSError):
+    except HTTPError as error:
+        # HTTPError owns the response even though open() did not return it.
+        # Cleanup errors must not replace the redacted request failure.
+        with suppress(Exception):
+            error.close()
+        raise ReleaseVerificationError("GitHub API request failed") from None
+    except (URLError, TimeoutError, OSError):
         raise ReleaseVerificationError("GitHub API request failed") from None
 
     if len(body) > MAX_RESPONSE_BYTES:

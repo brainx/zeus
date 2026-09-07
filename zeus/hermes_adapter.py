@@ -16,6 +16,7 @@ from zeus.hermes_profile_environment import (
     load_hermes_profile_environment,
 )
 from zeus.hermes_security import validate_hermes_profile_security
+from zeus.messaging_policy import MessagePolicyError, load_message_policy
 from zeus.models import ID_RE
 from zeus.readiness import ReadinessProbe
 
@@ -112,6 +113,13 @@ class HermesAdapter:
             "command_fingerprint": command_fingerprint(exec_argv),
             "readiness_probe": readiness_probe_to_payload(readiness_probe),
         }
+        if env.get("ZEUS_MESSAGES_ENABLED") == "1":
+            if "HERMES_MANAGED_DIR" in env:
+                raise MessagePolicyError("managed_policy_unsupported")
+            policy = load_message_policy(profile_path)
+            if policy.api_key != env.get("API_SERVER_KEY"):
+                raise MessagePolicyError("configuration_invalid")
+            marker["messaging_policy_fingerprint"] = policy.fingerprint
         return {
             "profile_path": str(profile_path),
             "marker_path": str(marker_path),

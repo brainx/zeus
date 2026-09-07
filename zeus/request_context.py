@@ -58,7 +58,7 @@ _STATIC_ROUTE_TEMPLATES = {
     "/reconcile/runs": "/reconcile/runs",
 }
 _BOT_ACTIONS = frozenset(
-    {"history", "inspect", "logs", "reconcile", "restart", "start", "status", "stop"}
+    {"diagnostics", "history", "inspect", "logs", "reconcile", "restart", "start", "status", "stop"}
 )
 
 
