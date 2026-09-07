@@ -2,7 +2,8 @@
 
 ## Current status
 
-The latest stable release is Zeus v0.6.0. Zeus remains alpha software with a local-first,
+The latest stable release is Zeus v0.6.0. The `main` branch is the
+v0.6.1.dev0 development line. Zeus remains alpha software with a local-first,
 host-local scope. It owns profiles, processes, lifecycle safety, and
 reconciliation evidence on one host.
 
