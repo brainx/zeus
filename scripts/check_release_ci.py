@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from http.client import HTTPException
 from typing import Any, TextIO
 from urllib.error import HTTPError, URLError
@@ -112,7 +113,13 @@ def _fetch_github_json(path: str, token: str, *, opener: Any = None) -> JsonObje
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except ReleaseCIError:
         raise
-    except (HTTPError, URLError, HTTPException, TimeoutError, OSError):
+    except HTTPError as error:
+        # HTTPError owns the response even though open() did not return it.
+        # Cleanup errors must not replace the redacted request failure.
+        with suppress(Exception):
+            error.close()
+        raise ReleaseCIError("api_request_failed") from None
+    except (URLError, HTTPException, TimeoutError, OSError):
         raise ReleaseCIError("api_request_failed") from None
     if len(body) > MAX_RESPONSE_BYTES:
         raise ReleaseCIError("api_response_too_large")

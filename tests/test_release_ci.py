@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import io
 import json
 import runpy
 import unittest
+import warnings
 from copy import deepcopy
 from http.client import IncompleteRead
 from pathlib import Path
@@ -387,6 +389,8 @@ class ReleaseCITests(unittest.TestCase):
                 with self.assertRaises(ReleaseCIError) as raised:
                     fetch_github_json(f"{PREFIX}/workflows/ci.yml", TOKEN, opener=FailingOpener())
                 self.assertEqual("api_request_failed", str(raised.exception))
+                if isinstance(error, HTTPError):
+                    self.assertTrue(error.closed)
         for status, body, code in (
             (302, b"raw-body-sentinel", "api_request_failed"),
             (200, b"x" * (SCRIPT["MAX_RESPONSE_BYTES"] + 1), "api_response_too_large"),
@@ -407,6 +411,39 @@ class ReleaseCITests(unittest.TestCase):
                 ):
                     fetch_github_json(f"{PREFIX}/workflows/ci.yml", TOKEN)
                 self.assertEqual(code, raised.exception.code)
+
+    def test_http_error_closes_owned_response_without_resource_warning(self) -> None:
+        def exercise(status: int, body: io.BytesIO | None) -> None:
+            error = HTTPError("https://api.github.com", status, TOKEN, {}, body)
+
+            class FailingOpener:
+                def open(self, _request: Any, *, timeout: int) -> Any:
+                    raise error
+
+            with self.assertRaises(ReleaseCIError) as raised:
+                fetch_github_json(f"{PREFIX}/workflows/ci.yml", TOKEN, opener=FailingOpener())
+            self.assertEqual("api_request_failed", str(raised.exception))
+            self.assertTrue(error.closed)
+            self.assertTrue(error.fp.closed)
+            if body is not None:
+                self.assertTrue(body.closed)
+
+        class FailingClose(io.BytesIO):
+            def close(self) -> None:
+                super().close()
+                raise RuntimeError(TOKEN)
+
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always", ResourceWarning)
+            for status in (302, 403, 429, 500):
+                with self.subTest(status=status):
+                    exercise(status, None)
+                    exercise(status, io.BytesIO(b"private-response-sentinel"))
+            exercise(500, FailingClose())
+            gc.collect()
+        self.assertEqual(
+            [], [item for item in observed if issubclass(item.category, ResourceWarning)]
+        )
 
     def test_workflow_gates_build_and_upload_with_build_only_actions_scope(self) -> None:
         workflow = Path(".github/workflows/release.yml").read_text()
