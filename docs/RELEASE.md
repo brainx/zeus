@@ -118,6 +118,25 @@ and includes branch coverage. The threshold records the honest current baseline;
 raise it when coverage improves, and do not lower it to accommodate new uncovered
 production code.
 
+Before building and again before uploading release artifacts,
+`scripts/check_release_ci.py` requires the latest `ci.yml` push run on `main`
+for the exact tagged commit to be completed and successful. Tag pushes, pull
+requests, and manual runs do not qualify. Its current attempt must contain
+successful Python 3.11/3.12/3.13 matrix jobs, Python 3.14, subprocess lifecycle,
+Docker isolation, real Hermes, macOS lifecycle, and package jobs. Python 3.14
+remains provisional in ordinary CI but is required for release promotion.
+If a partial rerun omits required jobs, rerun all jobs before retrying the
+release build. An older successful run cannot override a newer failed or
+unfinished run for the same commit.
+
+The build job alone receives `actions: read`; its token is passed only through
+the environment. API requests reject redirects and use bounded response sizes,
+pagination, and socket timeouts; each verification step has a three-minute
+workflow limit. Errors expose fixed codes only. The checker revalidates the
+selected run and attempt after inspecting jobs. This is a checked snapshot,
+not a lock against later CI reruns. The publish job depends on the checked
+build and receives no Actions permission.
+
 ## CI Preview Builds
 
 The CI `package` job uploads the wheel, source archive, and `SHA256SUMS.txt`
@@ -183,11 +202,11 @@ The attestation should resolve to `.github/workflows/release.yml` on the
 matching `refs/tags/v*.*.*` tag. Treat checksum or attestation failures as a
 release-blocking provenance failure.
 
-## v0.6 Development Upgrade
+## v0.6 Upgrade
 
-The development package identifies itself as `0.6.0.dev0`; the latest stable
-release remains v0.5.0. Existing lifecycle route shapes are retained, with
-additional read-only operator endpoints. `/ready` reports schema version 9
+The v0.6 release package identifies itself as `0.6.0`. Existing lifecycle route
+shapes are retained, with additional read-only operator endpoints.
+`/ready` reports schema version 9
 after the additive index, message-receipt, and release-timestamp migrations.
 Normal service/CLI initialization performs the migration; inspection and message
 commands require the current schema and do not migrate it as a side effect.
@@ -198,11 +217,13 @@ with one version of Zeus managing the state directory. Do not run a v0.5 process
 against an upgraded v9 database. A rollback requires the matching pre-upgrade
 backup and old package; Zeus does not downgrade databases.
 
-Olymp must explicitly support the `0.6.0.dev0` version and schema-v9 readiness
+Olymp must explicitly support the `0.6.0` version and schema-v9 readiness
 contract before registering a node with that expected version. Preserve exact
-version checks and the existing v0.5/schema-v6 contract for stable nodes. The
-new fleet freshness field is evidence age, not a substitute for application
-health or cross-host rollout approval.
+version checks and the existing v0.5/schema-v6 contract for stable nodes.
+Development-preview compatibility for `0.6.0.dev0` is a separate exact-version
+contract and does not authorize stable-version mutations. The new fleet freshness
+field is evidence age, not a substitute for application health or cross-host
+rollout approval.
 
 The CI package job runs `scripts/verify_service_recovery.sh` only on a disposable
 Ubuntu 24.04 GitHub-hosted runner, using the built wheel and private copied
