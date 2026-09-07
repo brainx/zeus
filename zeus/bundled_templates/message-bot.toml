@@ -1,0 +1,45 @@
+id = "message-bot"
+name = "Operator Message Bot"
+description = "Explicit operator jobs through an authenticated Hermes API gateway."
+version = "0.1.0"
+soul = """
+You are a gateway operations Hermes agent. Prioritize current service health, exact command evidence, reversible actions, and clear escalation when a request touches secrets, billing, identity, or production permissions.
+"""
+
+[hermes]
+required_env = ["OPENROUTER_API_KEY", "API_SERVER_ENABLED", "API_SERVER_PORT", "API_SERVER_KEY", "ZEUS_MESSAGES_ENABLED"]
+
+[hermes.model]
+provider = "openrouter"
+default = "anthropic/claude-sonnet-4"
+
+[hermes.terminal]
+backend = "docker"
+cwd = "."
+home_mode = "profile"
+timeout = 240
+docker_image = "nikolaik/python-nodejs:python3.11-nodejs20@sha256:8f958bdc1b4a422bfafd97cab4f69836401f616ae985d4b57a53d254f5bcb038"
+docker_mount_cwd_to_workspace = false
+
+[hermes.gateway]
+enabled = true
+
+[hermes.gateway.api_server]
+max_concurrent_runs = 1
+
+[hermes.agent]
+max_turns = 12
+bot_mode_protocol = false
+
+[hermes.delegation]
+max_iterations = 40
+max_concurrent_children = 2
+max_async_children = 2
+child_timeout_seconds = 0
+subagent_auto_approve = false
+
+[metadata]
+use_case = "Explicit operator message jobs"
+risk_level = "medium"
+recommended_restart_policy = "manual"
+tags = ["operations", "gateway", "messages"]

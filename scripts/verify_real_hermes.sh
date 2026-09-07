@@ -158,6 +158,23 @@ assert ownership["classification"] in {
     "legacy-marker-valid",
 }, ownership
 '
+  failure_stage="gateway_diagnostics"
+  API_SERVER_KEY="$api_server_key" ZEUS_ENV_PASSTHROUGH="API_SERVER_KEY" \
+    ZEUS_STATE_DIR="$state_dir" ZEUS_HERMES_BIN="$(command -v hermes)" \
+    python3 -B -m zeus.cli bot diagnostics "$bot_id" --json \
+    | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+assert payload["status"] == "ok", payload["reason"]
+assert payload["process"]["verified"] is True
+health = payload["health"]
+assert health["pid"] == payload["process"]["pid"]
+assert health["version"] == "0.21.0"
+assert health["readiness"]["checks"]["gateway"]["status"] == "ok"
+print("Live gateway diagnostics passed.")
+'
   failure_stage="loopback_health"
   python3 - "$api_server_host" "$api_server_port" "$health_timeout_seconds" "$health_interval_seconds" <<'PY'
 import json

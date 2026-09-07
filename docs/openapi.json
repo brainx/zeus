@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Zeus Local API",
-    "version": "0.6.0.dev0",
+    "version": "0.6.0",
     "description": "Local JSON API for managing Hermes bot profiles and gateway lifecycle."
   },
   "servers": [
@@ -105,7 +105,7 @@
         "properties": {
           "schema_version": {
             "type": "integer",
-            "const": 7
+            "const": 9
           },
           "status": {
             "type": "string",
@@ -400,6 +400,337 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReconcileResult"
+            }
+          }
+        }
+      },
+      "LiveGatewayDiagnostics": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bot_id",
+          "observed_at",
+          "status",
+          "reason",
+          "process",
+          "health"
+        ],
+        "properties": {
+          "bot_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{1,62}$"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded",
+              "unavailable",
+              "not_running",
+              "unverified",
+              "not_configured"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "description": "Stable diagnostic outcome code; no upstream error body."
+          },
+          "process": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "pid",
+              "verified"
+            ],
+            "properties": {
+              "pid": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              },
+              "verified": {
+                "type": "boolean"
+              }
+            }
+          },
+          "health": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GatewayDetailedHealth"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "GatewayDetailedHealth": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "version",
+          "pid",
+          "gateway_state",
+          "active_agents",
+          "gateway_busy",
+          "gateway_drainable",
+          "readiness"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "version": {
+            "type": "string",
+            "const": "0.21.0"
+          },
+          "pid": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "gateway_state": {
+            "type": "string",
+            "enum": [
+              "starting",
+              "running",
+              "connected",
+              "ok",
+              "ready",
+              "draining",
+              "stopping",
+              "stopped",
+              "startup_failed",
+              "unknown",
+              "fatal",
+              "degraded",
+              "error",
+              "failed"
+            ]
+          },
+          "active_agents": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "gateway_busy": {
+            "type": "boolean"
+          },
+          "gateway_drainable": {
+            "type": "boolean"
+          },
+          "readiness": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "checks"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ok",
+                  "degraded"
+                ]
+              },
+              "checks": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "state_db",
+                  "session_store",
+                  "config",
+                  "model",
+                  "disk",
+                  "gateway",
+                  "background_queues"
+                ],
+                "properties": {
+                  "state_db": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "status"
+                    ],
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "degraded"
+                        ]
+                      }
+                    }
+                  },
+                  "session_store": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "status"
+                    ],
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "unavailable",
+                          "retrying"
+                        ]
+                      }
+                    }
+                  },
+                  "config": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "status"
+                    ],
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "degraded"
+                        ]
+                      }
+                    }
+                  },
+                  "model": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "status"
+                    ],
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "degraded"
+                        ]
+                      }
+                    }
+                  },
+                  "disk": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "status"
+                    ],
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "degraded"
+                        ]
+                      },
+                      "used_percent": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100
+                      },
+                      "free_bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      }
+                    }
+                  },
+                  "gateway": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "status",
+                      "state",
+                      "connected_platforms",
+                      "platforms"
+                    ],
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "degraded"
+                        ]
+                      },
+                      "state": {
+                        "type": "string",
+                        "enum": [
+                          "starting",
+                          "running",
+                          "connected",
+                          "ok",
+                          "ready",
+                          "draining",
+                          "stopping",
+                          "stopped",
+                          "startup_failed",
+                          "unknown",
+                          "fatal",
+                          "degraded",
+                          "error",
+                          "failed"
+                        ]
+                      },
+                      "connected_platforms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      },
+                      "platforms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      }
+                    }
+                  },
+                  "background_queues": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "status",
+                      "active_api_runs",
+                      "process_completions",
+                      "active_delegations"
+                    ],
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "const": "ok"
+                      },
+                      "active_api_runs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      },
+                      "process_completions": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      },
+                      "active_delegations": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -1624,6 +1955,105 @@
           "503": {
             "description": "API key is not configured",
             "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/bots/{bot_id}/diagnostics": {
+      "get": {
+        "summary": "Observe live Hermes gateway health without changing lifecycle state",
+        "description": "Uses the captured launch endpoint and verifies the same gateway generation before and after a bounded authenticated probe. Always requires the Zeus API key. No query parameters. Readiness is a local observation, not a provider or safe-stop guarantee.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{1,62}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Live diagnostic observation; inspect status even for HTTP 200.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveGatewayDiagnostics"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid bot identifier, route, or query parameters.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown bot.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "API key is unconfigured or the state store is unavailable.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {

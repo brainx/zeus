@@ -242,7 +242,17 @@ The v2-to-v3 migration is also one transaction. It creates a
 the projection/event invariant, and advances the schema version only after all
 steps succeed. Additive v3-to-v4 and v4-to-v5 upgrades add durable idempotency
 and desired/pending intent in forward-only transactions. Databases newer than
-schema v7 are rejected rather than downgraded.
+schema v9 are rejected rather than downgraded.
+
+Schema v8 adds operator-message receipts without rewriting bot projections or
+events. A FULL-synchronous transaction reserves a stable upstream idempotency key
+before an HTTP request; no database lock spans network I/O. Attempt leases and
+compare-and-swap versions prevent overlapping retries or stale acknowledgements.
+Schema v9 adds a nullable release timestamp without rewriting existing receipts.
+One unreleased unresolved/nonterminal receipt is admitted per bot incarnation.
+The captured process generation and launch-bound messaging policy are checked
+around network operations. See [operator messaging](MESSAGING.md) for recovery
+and its limits.
 
 `$ZEUS_STATE_DIR/logs/audit.jsonl` remains a best-effort compatibility mirror.
 It is written only after the SQLite transaction commits and is not imported into
@@ -266,3 +276,14 @@ strict authentication and use fixed route templates in access logs. Fleet
 observations are persisted reconciliation evidence with explicit timestamps,
 not live process or application-health probes. Cross-host consumers should
 preserve that distinction rather than treating a fresh row as a rollout gate.
+
+`bot_diagnostics` separately implements explicit live observations through
+`zeus bot diagnostics` and `GET /bots/<bot-id>/diagnostics`. It reads existing
+bot state without initializing it, captures a strict launch marker and owned
+gateway generation, and probes only that launch's loopback endpoint.
+`hermes_diagnostics` authenticates to Hermes 0.21's detailed-health route with a
+private profile credential, applies a total HTTP deadline and response bound,
+and projects only validated readiness fields. A second state and ownership
+check discards results if the generation changed. The probe never writes
+lifecycle state or triggers recovery; unavailable and degraded health remain
+explicit observations. Local API transport shares the trusted-host boundary.

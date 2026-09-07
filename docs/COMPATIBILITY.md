@@ -13,7 +13,7 @@ an untested platform or external Hermes release into a support claim.
 | Subprocess lifecycle | Linux `ubuntu-24.04` | Python 3.11 | Focused multi-process lifecycle and locking behavior |
 | Audit Docker isolation | Linux `ubuntu-24.04` | Python 3.11 | Real Docker containment, including network denial, host-secret exclusion, read-only root, and cleanup |
 | macOS process lifecycle | macOS `macos-26` | Python 3.13 | Focused process, fake-Hermes integration, and gateway-launcher recovery tests |
-| Real Hermes compatibility | Linux `ubuntu-24.04` | Python 3.11 | Hash-locked Hermes Agent 0.21.0 source install, profile rendering, strict diagnostics, sealed audit-broker transcript, loopback gateway readiness, process ownership, and clean shutdown without a model-provider credential |
+| Real Hermes compatibility | Linux `ubuntu-24.04` | Python 3.11 | Hash-locked Hermes Agent 0.21.0 source install, profile rendering, strict diagnostics, sealed audit-broker transcript, loopback gateway readiness, authenticated live gateway diagnostics, process ownership, and clean shutdown without a model-provider credential |
 | Package build | Linux `ubuntu-24.04` | Python 3.11 | Wheel and source build, installed-wheel smoke test, dependency consistency, metadata checks, and seven-day preview artifacts with checksums |
 | Tagged release build | Linux `ubuntu-24.04` | Python 3.11 | Full release gate, artifact checksums, and GitHub release artifacts |
 
@@ -44,13 +44,16 @@ are retained for seven days and do not carry signed release evidence.
 
 Unset or empty `ZEUS_SQLITE_SYNCHRONOUS` configuration remains NORMAL, as do
 direct `StateStore(path)` and `SQLiteDatabase(path)` calls. Upgrading therefore
-does not silently change local commit latency. FULL is an explicit
+does not silently change the durability policy for ordinary state commits. FULL is an explicit
 higher-durability option for deployments that accept its additional commit
-latency.
+latency. Operator-message receipt writes always use FULL, independently of this
+setting, to persist dispatch intent before submitting a job.
 
 The synchronous policy itself does not change database structure. Zeus v0.6
 adds an independent forward-only migration from schema v6 to schema v7 for
-operator-query indexes. Existing v6 databases upgrade during normal startup;
+operator-query indexes. Schema v8 then adds durable operator-message receipts.
+Schema v9 adds explicit local release timestamps to those receipts.
+Existing v6/v7/v8 databases upgrade during normal startup;
 read-only history/fleet commands require the current schema. Keep all writers
 on the same Zeus version and retain a quiesced backup for rollback.
 
@@ -75,8 +78,11 @@ The deterministic CI baseline is Hermes Agent 0.21.0 on Ubuntu 24.04 with Python
 archive and verifies SHA-256
 `76b99a8be9b77d66833c3cfe2b35c6d6f6a58e4ff9637ef8effcfc1f420ab35a`
 before installation. [`requirements-hermes-ci.txt`](../requirements-hermes-ci.txt)
-pins the complete 64-package Linux x86_64 runtime and build closure and its
-selected SHA-256 hashes. CI installs that closure with dependency resolution
+pins the complete 72-package Linux x86_64 runtime and build closure and its
+selected SHA-256 hashes. This includes the API adapter's optional upstream
+`aiohttp==3.14.3` dependency and its required packages; Hermes's core FastAPI
+dependency serves its Web UI and does not replace that adapter dependency.
+CI installs that closure with dependency resolution
 disabled, pip hash checking, and binary-only artifacts, then extracts the
 verified archive into a retained CI source checkout and installs it editable
 with dependencies and build isolation disabled. This follows Hermes 0.21's

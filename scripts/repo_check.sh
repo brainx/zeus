@@ -37,6 +37,7 @@ docs/FRESH_VPS_TEST.md
 docs/SYSTEMD.md
 docs/OPERATIONS.md
 docs/RECONCILE.md
+docs/MESSAGING.md
 docs/RELEASE.md
 docs/openapi.json
 docs/ROADMAP.md
@@ -51,12 +52,14 @@ scripts/check_verified_release_ref.py
 scripts/wheel_smoke.sh
 scripts/generate_checksums.sh
 scripts/verify_real_hermes.sh
+scripts/verify_pinned_hermes_runs.py
 scripts/fresh_vps_verify.sh
 templates/coding-bot.toml
 templates/deepseek-coding-bot.toml
 templates/kimi-k3-coding-bot.toml
 templates/docs-writer-bot.toml
 templates/gateway-operator.toml
+templates/message-bot.toml
 templates/log-triage-bot.toml
 templates/research-bot.toml
 templates/support-gateway.toml
@@ -66,6 +69,7 @@ zeus/bundled_templates/deepseek-coding-bot.toml
 zeus/bundled_templates/kimi-k3-coding-bot.toml
 zeus/bundled_templates/docs-writer-bot.toml
 zeus/bundled_templates/gateway-operator.toml
+zeus/bundled_templates/message-bot.toml
 zeus/bundled_templates/log-triage-bot.toml
 zeus/bundled_templates/research-bot.toml
 zeus/bundled_templates/support-gateway.toml

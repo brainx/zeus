@@ -54,6 +54,11 @@ run summaries at that boundary.
 
 ## Operator Evidence
 
+Explicit operator jobs are available through `zeus message send/retry/status/cancel/release/list`.
+The opt-in `message-bot` template sets finite turn and API concurrency limits;
+durable receipts support recovery from uncertain submissions. See
+[operator messaging](docs/MESSAGING.md) for setup, retries and permission boundaries.
+
 Inspect previous reconciliation work without starting another pass:
 
 ```bash
@@ -343,6 +348,7 @@ zeus bot start coder
 zeus bot status coder
 zeus bot history coder --limit 50
 zeus bot inspect coder --json
+zeus bot diagnostics coder --json
 zeus bot logs coder
 zeus bot logs coder --json
 zeus bot reconcile coder
@@ -353,6 +359,10 @@ zeus bot stop coder
 zeus bot archive coder
 zeus bot delete coder --remove-profile
 ```
+
+Live diagnostics require a launch-recorded loopback Hermes API and its private
+API key; see [live gateway diagnostics](docs/OPERATIONS.md#live-gateway-diagnostics).
+They report a fresh health observation without changing bot lifecycle state.
 
 Deleting a registry entry without `--remove-profile` intentionally leaves its profile
 on disk. Re-creating that bot ID then requires `--replace`. Replacement regenerates
