@@ -1096,7 +1096,7 @@ class SQLiteDurabilityTests(unittest.TestCase):
             child_type.assert_called_once_with(database)
 
     def test_durability_configuration_does_not_change_schema_version(self) -> None:
-        self.assertEqual(9, SCHEMA_VERSION)
+        self.assertEqual(10, SCHEMA_VERSION)
         for mode in (SQLiteSynchronous.NORMAL, SQLiteSynchronous.FULL):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 database_path = Path(tmp) / "zeus.db"

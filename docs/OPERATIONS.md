@@ -46,7 +46,7 @@ when `ZEUS_ALLOW_UNAUTH_READS=1` is explicitly enabled. It opens the existing
 database read-only, requires the current schema version, and runs `SELECT 1`.
 It never creates or migrates a database and does not require bots to be running.
 
-A ready service returns `{"schema_version":9,"status":"ready"}`. State-store
+A ready service returns `{"schema_version":10,"status":"ready"}`. State-store
 failures return `503` with `error.code=not_ready`. If state initialization fails
 before the API binds, the process exits instead of serving `/ready`.
 
@@ -539,13 +539,41 @@ Zeus's process ownership policy.
 ### Message receipt capacity
 
 Run `zeus message capacity --json` to observe local receipt usage before it
-reaches the fixed 10,000-record admission limit. The report separates total
-retained receipts from active admission blockers and includes database, WAL, and
+reaches the fixed 10,000-unarchived-record admission limit. The report separates
+unarchived `used`, `archived`, retained `total`, and active admission blockers and includes database, WAL, and
 available-filesystem byte observations. Status is `ok` below 80%, `warning` from
 80%, `critical` from 95%, and `full` from 100%. A valid `full` report exits zero;
 state errors exit nonzero. This command is read-only and does not initialize,
 migrate, checkpoint, reconcile, or contact Hermes. A missing WAL is reported as
 zero when its absence can be confirmed; unavailable size observations are null.
+
+Preview eligible old receipts with `zeus message archive --json`. Apply a fresh
+selection with `zeus message archive --limit 100 --apply --json`; repeat bounded
+batches when more eligible history remains. The default cutoff is 30 days ago;
+`--before` accepts a timezone-aware ISO timestamp no later than now, and `--limit`
+is 1–500. Eligibility requires `updated_at` strictly before the cutoff plus a
+rejected dispatch or an accepted terminal outcome. Released nonterminal and
+uncertain receipts remain in use. Preview is not a reservation. Apply validates
+and commits the entire batch with FULL durability, preserving deduplication keys,
+receipt identity, and observations while incrementing versions for stale-writer
+protection. Later terminal observations preserve the archive timestamp.
+
+Archival only restores admission slots. It does not remove historical rows,
+vacuum, checkpoint, compact, or recover disk space. A full filesystem can still
+prevent a durable dispatch reservation or archive transaction. Storage failures
+fail closed; no new submission proceeds without durable intent. Preserve enough
+free storage for normal database/WAL growth and backups.
+
+Zeus `0.6.1.dev0` requires schema 10. Before upgrading schema 9, quiesce every
+writer and keep a consistent backup of the complete state tree and private
+profiles using the backup procedure above. The normal initialization/upgrade
+path performs the additive transactional migration; message commands never
+migrate. Resume only matching Zeus binaries and an Olymp build explicitly
+compatible with Zeus `0.6.1.dev0` and readiness schema 10. Schema-9-only clients
+must not be treated as compatible because the package version is unchanged.
+Older Zeus binaries reject schema 10. Rollback requires restoring the quiesced
+pre-upgrade backup with its matching binary, not editing the schema version or
+deleting the new column. See [compatibility policy](COMPATIBILITY.md).
 
 ### Live gateway diagnostics
 

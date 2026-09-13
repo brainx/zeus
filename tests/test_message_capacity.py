@@ -48,7 +48,7 @@ class MessageCapacityTests(unittest.TestCase):
                 "target_fingerprint, endpoint, credential_fingerprint, request_hash, ?, "
                 "dispatch_state, run_id, run_status, created_at, updated_at, retry_before, "
                 "last_checked_at, cancel_requested_at, lease_until, error_code, version, "
-                "released_at "
+                "released_at, archived_at "
                 "FROM message_receipts WHERE message_id = ?",
                 (
                     (f"{index:032x}", f"{index + 20000:032x}", self.receipt_id)
@@ -167,6 +167,19 @@ class MessageCapacityTests(unittest.TestCase):
         self.assertIsNone(result["database_bytes"])
         self.assertIsNone(result["wal_bytes"])
         self.assertIsNone(result["filesystem_free_bytes"])
+
+    def test_real_incompatible_schemas_are_rejected_without_writes(self) -> None:
+        for version in (9, 11):
+            with self.subTest(version=version):
+                with closing(sqlite3.connect(self.path)) as conn:
+                    conn.execute("UPDATE schema_version SET version = ?", (version,))
+                    conn.commit()
+                before = self.path.read_bytes()
+                code, output, error = self._cli("--json")
+                self.assertEqual(1, code)
+                self.assertEqual("", error)
+                self.assertEqual("state_unavailable", json.loads(output)["error"]["code"])
+                self.assertEqual(before, self.path.read_bytes())
 
     def test_incompatible_and_malformed_databases_are_not_modified(self) -> None:
         for content in (b"not sqlite", b""):

@@ -243,7 +243,7 @@ Returns:
 
 Authenticated state-store readiness check, also available as `GET /v1/ready`.
 It opens the existing SQLite database in read-only mode, requires schema version
-6, and executes `SELECT 1`; it does not inspect or start bots. A stopped bot does
+10, and executes `SELECT 1`; it does not inspect or start bots. A stopped bot does
 not make Zeus unready.
 
 The route uses the normal read-endpoint authentication policy. It requires
@@ -254,7 +254,7 @@ probe.
 Success returns:
 
 ```json
-{"schema_version":9,"status":"ready"}
+{"schema_version":10,"status":"ready"}
 ```
 
 An unavailable, missing, malformed, older, or newer state database returns

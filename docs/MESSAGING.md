@@ -67,10 +67,9 @@ to inspect older receipts.
 
 `message capacity` observes the existing receipt database without initializing,
 migrating, checkpointing, or reconciling state and makes no gateway request. It
-reports the fixed 10,000-receipt limit, total receipts currently used, remaining
-capacity, active per-incarnation admission blockers, and database, WAL, and
-filesystem-free byte observations. `archived` is currently `0`; archival is not
-implemented yet. Capacity status changes to `warning` at 80%, `critical` at 95%,
+reports the fixed 10,000-unarchived-receipt limit, unarchived `used` receipts,
+remaining capacity, retained `total`, `archived`, active per-incarnation admission
+blockers, and database, WAL, and filesystem-free byte observations. Capacity status changes to `warning` at 80%, `critical` at 95%,
 and `full` at 100%. A full but valid database is a successful observation and
 exits zero. Missing, incompatible, or malformed state fails closed with a nonzero
 exit. Unavailable filesystem size observations appear as `null` in JSON.
@@ -97,8 +96,8 @@ persisted run status stale; it is not automatically treated as completed.
 Zeus commits a receipt with SQLite `synchronous=FULL` before submitting the job.
 The receipt stores hashes and bounded routing/run metadata, never the input,
 output or API key. These writes use FULL even when ordinary Zeus state uses
-NORMAL. Receipts survive bot deletion; capacity is 10,000 records, with no
-automatic pruning. Back up the database together with private profiles.
+NORMAL. Receipts survive bot deletion; admission capacity is 10,000 unarchived
+records, with no automatic archival or pruning. Back up the database together with private profiles.
 
 A lost response or changed gateway generation leaves an `unknown` receipt. An
 interrupted submit can retain `prepared` if it stops before recording its outcome.
@@ -153,7 +152,7 @@ A failed stop request does not refresh `last_checked_at` or the cached run statu
 
 These checks avoid automatic duplicate dispatch, but cannot guarantee exactly-once
 external tool effects after a crash or an upstream persistence failure. No message
-commands initialize/migrate Zeus state or start/reconcile bots. Schema 9 must
+commands initialize/migrate Zeus state or start/reconcile bots. Schema 10 must
 already have been initialized by ordinary startup. There are no new Zeus HTTP
 messaging routes in this version.
 
@@ -161,3 +160,41 @@ Before dispatch, Zeus rechecks receipt ownership and leaves the complete two-sec
 HTTP budget inside its lease and retry window. A local process can still be
 suspended between that check and sending bytes; the trusted-host boundary and
 Hermes's finite idempotency retention remain part of the recovery limits.
+
+
+### Logical receipt archival
+
+Preview a bounded batch, then explicitly apply archival when appropriate:
+
+```sh
+zeus message archive --json
+zeus message archive --before 2026-01-01T00:00:00+00:00 --limit 100 --apply --json
+```
+
+The default cutoff is 30 days ago. `--before` must be a timezone-aware ISO timestamp
+no later than the current time; eligibility uses `updated_at` strictly before that
+cutoff, so the exact boundary is excluded. `--limit` accepts 1–500, default 100.
+Selection is deterministic by `updated_at`, then `message_id`. The JSON response
+contains `message_ids`, `count`, `before`, and `applied`. Preview is read-only and
+reserves nothing; apply reselects and strictly validates the complete batch inside
+one FULL-durable transaction. A corrupt selected receipt or storage failure rolls
+back the entire batch.
+
+Only rejected dispatches and accepted runs last observed as completed, failed,
+cancelled, or interrupted qualify. Prepared/unknown dispatches, nonterminal runs,
+and released nonterminal runs never qualify. Age, bot deletion, an unavailable
+gateway, an expired upstream result, or release alone do not prove completion.
+
+Archival stamps `archived_at` and advances the receipt's version without changing
+its original observations, run identity, outcome, or deduplication keys. It restores
+admission capacity while retaining the complete history for `list`, `status`, and
+request-key lookup. Compatible request replay and accepted retry still return the
+original receipt without resubmission, even when capacity is full; changed input
+or target conflicts. Stale writers fail version checks. Clock checks include the
+archive time. A later observation of the same terminal status may advance
+`updated_at` while preserving `archived_at`; terminal outcomes cannot regress.
+
+Logical archival does not delete rows, compact/checkpoint SQLite, or free disk
+space. Monitor the reported database/WAL sizes and available filesystem bytes
+separately. Neither preview nor apply constructs a messaging workflow, contacts
+Hermes, or initializes/migrates state.

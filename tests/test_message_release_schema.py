@@ -5,8 +5,9 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
-from zeus.schema import SCHEMA_VERSION, SchemaManager
+from zeus.schema import SchemaManager
 from zeus.sqlite_db import SQLiteDatabase
 
 _CREATED = "2026-01-01T00:00:00+00:00"
@@ -21,6 +22,7 @@ class _VersionEightSchema(SchemaManager):
 
 class MessageReleaseSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.enterContext(patch("zeus.schema.SCHEMA_VERSION", 9))
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.path = root / "zeus.db"
         self.database = SQLiteDatabase(self.path)
@@ -89,7 +91,6 @@ class MessageReleaseSchemaTests(unittest.TestCase):
 
         SchemaManager(self.database).migrate()
         with closing(sqlite3.connect(self.path)) as conn:
-            self.assertEqual(9, SCHEMA_VERSION)
             self.assertEqual(9, conn.execute("SELECT version FROM schema_version").fetchone()[0])
             columns = [row[1] for row in conn.execute("PRAGMA table_info(message_receipts)")]
             self.assertEqual([*old_columns, "released_at"], columns)

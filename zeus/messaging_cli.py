@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+from datetime import datetime
 from typing import Any
 
 from zeus.bot_messaging import MAX_INPUT_BYTES, BotMessaging, MessagingError
@@ -20,12 +21,12 @@ from zeus.supervisor import Supervisor
 def add_messaging_parsers(sub: Any) -> None:
     messages = sub.add_parser("message", help="submit and inspect explicit operator jobs")
     actions = messages.add_subparsers(dest="action", required=True)
-    for action in ("send", "retry", "status", "cancel", "release", "list", "capacity"):
+    for action in ("send", "retry", "status", "cancel", "release", "list", "capacity", "archive"):
         parser = actions.add_parser(action)
         if action == "send":
             parser.add_argument("bot_id")
             parser.add_argument("--request-key", help="optional stable key for this submission")
-        elif action not in {"list", "capacity"}:
+        elif action not in {"list", "capacity", "archive"}:
             parser.add_argument("message_id")
         if action in {"send", "retry"}:
             parser.add_argument("--file", required=True, help="UTF-8 input file, or - for stdin")
@@ -35,6 +36,12 @@ def add_messaging_parsers(sub: Any) -> None:
                 action="store_true",
                 help="release the local busy blocker; the job may still run and is not cancelled",
             )
+        if action == "archive":
+            parser.add_argument(
+                "--before", help="exclusive timezone-aware ISO cutoff (default: 30 days ago)"
+            )
+            parser.add_argument("--limit", type=int, default=100, help="maximum receipts (1-500)")
+            parser.add_argument("--apply", action="store_true", help="apply logical archival")
         if action == "list":
             parser.add_argument("--bot-id")
             parser.add_argument("--before", help="cursor returned by the previous page")
@@ -68,6 +75,12 @@ def run_messaging_command(args: argparse.Namespace, settings: Settings) -> int:
     try:
         if args.action == "capacity":
             payload = MessageStore(settings.database_path).capacity()
+        elif args.action == "archive":
+            payload = MessageStore(settings.database_path).archive(
+                before=datetime.fromisoformat(args.before) if args.before is not None else None,
+                limit=args.limit,
+                apply=args.apply,
+            )
         else:
             workflow = BotMessaging(
                 Supervisor(

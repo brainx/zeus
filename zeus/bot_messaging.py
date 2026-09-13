@@ -101,6 +101,7 @@ def _public(receipt: MessageReceipt) -> dict[str, object]:
             receipt.cancel_requested_at.isoformat() if receipt.cancel_requested_at else None
         ),
         "released_at": receipt.released_at.isoformat() if receipt.released_at else None,
+        "archived_at": receipt.archived_at.isoformat() if receipt.archived_at else None,
         "error_code": receipt.error_code,
     }
 
@@ -223,7 +224,7 @@ class BotMessaging:
         receipt = self.store.get(message_id)
         if receipt is None:
             raise MessagingError("unknown_message")
-        if self.clock() < receipt.updated_at:
+        if self.clock() < max(receipt.updated_at, receipt.archived_at or receipt.updated_at):
             raise MessagingError("clock_rollback")
         return receipt
 

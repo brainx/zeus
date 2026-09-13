@@ -7,7 +7,7 @@ from typing import Protocol
 
 from zeus.lifecycle import serialize_lifecycle_details
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class _SchemaDatabase(Protocol):
@@ -168,6 +168,10 @@ class SchemaManager:
         if current_version < 9:
             self._migrate_v8_to_v9(conn)
             conn.execute("UPDATE schema_version SET version = ?", (9,))
+            current_version = 9
+        if current_version < 10 <= SCHEMA_VERSION:
+            self._migrate_v9_to_v10(conn)
+            conn.execute("UPDATE schema_version SET version = ?", (10,))
 
     def _ensure_restart_schema(self, conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(bots)").fetchall()}
@@ -648,4 +652,36 @@ class SchemaManager:
             "WHERE released_at IS NULL AND (dispatch_state IN ('prepared', 'unknown') "
             "OR (dispatch_state = 'accepted' "
             "AND run_status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')))"
+        )
+
+    def _migrate_v9_to_v10(self, conn: sqlite3.Connection) -> None:
+        # Logical archival retains the complete receipt and all deduplication keys.
+        # Later terminal observations may advance updated_at past archived_at.
+        conn.execute(
+            """
+            ALTER TABLE message_receipts ADD COLUMN archived_at TEXT CHECK (
+                archived_at IS NULL OR (
+                    typeof(archived_at) = 'text'
+                    AND archived_at >= created_at
+                    AND (dispatch_state = 'rejected' OR (
+                        dispatch_state = 'accepted'
+                        AND run_status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                    ))
+                    AND length(archived_at) IN (25, 32)
+                    AND substr(archived_at, -6) = '+00:00'
+                    AND datetime(substr(archived_at, 1, 19)) IS NOT NULL
+                    AND strftime('%Y-%m-%dT%H:%M:%S', substr(archived_at, 1, 19))
+                        = substr(archived_at, 1, 19)
+                    AND (length(archived_at) = 25 OR (
+                        substr(archived_at, 20, 1) = '.'
+                        AND substr(archived_at, 21, 6) NOT GLOB '*[^0-9]*'
+                        AND substr(archived_at, 21, 6) != '000000'
+                    ))
+                )
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX message_receipts_unarchived_idx "
+            "ON message_receipts (updated_at, message_id) WHERE archived_at IS NULL"
         )
