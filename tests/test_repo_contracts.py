@@ -1022,7 +1022,7 @@ class RepoContractTests(unittest.TestCase):
         ):
             self.assertIn(command, offline_path)
         for command in (
-            "hermes version",
+            "hermes --version",
             "cp .env.example .env",
             "chmod 0600 .env",
             "zeus doctor",

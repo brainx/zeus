@@ -114,7 +114,7 @@ class SubprocessLifecycleTests(unittest.TestCase):
                     "try:\n"
                     "    result = supervisor.start(\n"
                     "        'coder', source='api', request_id=uuid.uuid4().hex)\n"
-                    "    print(json.dumps({'pid': result.pid}), flush=True)\n"
+                    "    print(json.dumps(result.to_dict()), flush=True)\n"
                     "    sys.stdin.read()\n"
                     "finally:\n"
                     "    for child in supervisor._runtime._processes.values():\n"
@@ -142,7 +142,7 @@ class SubprocessLifecycleTests(unittest.TestCase):
                     _stdout, stderr = parent.communicate("", timeout=5)
                     self.fail(f"gateway parent exited during launch: {stderr}")
                 child_pid = json.loads(launched)["pid"]
-                self.assertIsInstance(child_pid, int)
+                self.assertIsInstance(child_pid, int, launched)
                 self.assertIs(PidState.alive, pid_state(child_pid))
 
                 stopped = self._run_cli(env, "bot", "stop", "coder", timeout=10)

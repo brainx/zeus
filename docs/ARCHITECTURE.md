@@ -33,7 +33,9 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.templates`: Bundled plus local TOML template discovery with duplicate ID checks.
 - `zeus.renderer`: Hermes profile rendering.
 - `zeus.sqlite_db`: Shared SQLite connection factory and per-connection durability policy.
-- `zeus.schema`: Schema-v6 initialization, compatibility guards, and forward migrations.
+- `zeus.schema`: Schema-v10 initialization, compatibility guards, and forward migrations.
+- `zeus.message_store`: Durable job receipts, read-only capacity observations,
+  and bounded logical archival that retains replay identities.
 - `zeus.idempotency_store`: Durable API mutation claims and replay responses.
 - `zeus.reconcile_store`: Persisted fleet reconciliation runs and ordered results.
 - `zeus.bot_lifecycle_store`: Bot projection, intent, lifecycle ledger, history, and audit mirror.
@@ -55,9 +57,15 @@ Set `ZEUS_STATE_DIR` to use a different runtime root.
 - `zeus.gateway_runtime`: Public process-effects facade; launch, marker,
   ownership, stop, and low-level process helpers are isolated behind it.
 - `zeus.intent_recovery`: Store-free pending-intent recovery decisions through a structural host.
-- `zeus.supervisor`: Public lifecycle compatibility facade. Focused internal
-  modules own core coordination, runtime compatibility, start, stop/restart,
-  reconciliation/recovery, status/inspection, and registry/profile operations.
+- `zeus.supervisor`: Public lifecycle facade with explicit delegates to five
+  stateless operation services for registry, status, start, stop, and reconcile.
+  Each service receives the current supervisor through a narrow typed host
+  interface; callbacks are resolved when called so supported overrides remain live.
+- `zeus.supervisor_runtime`: The single concrete supervisor core owns construction,
+  locks, event coordination, and runtime compatibility properties. The old
+  `supervisor_core` import path and `_SupervisorRuntime` name remain compatibility
+  aliases. `GatewayRuntime` retains process effects; `ProfileManager` retains
+  profile transactions; `PendingIntentRecovery` retains bounded recovery decisions.
 - `zeus.api`: Local HTTP routes and compatibility facade.
 - `zeus.cli`: Operator CLI.
 - `zeus.audit_*`: Native, report-only audit components for committed `HEAD`
@@ -242,13 +250,20 @@ The v2-to-v3 migration is also one transaction. It creates a
 the projection/event invariant, and advances the schema version only after all
 steps succeed. Additive v3-to-v4 and v4-to-v5 upgrades add durable idempotency
 and desired/pending intent in forward-only transactions. Databases newer than
-schema v9 are rejected rather than downgraded.
+schema v10 are rejected rather than downgraded.
 
 Schema v8 adds operator-message receipts without rewriting bot projections or
 events. A FULL-synchronous transaction reserves a stable upstream idempotency key
 before an HTTP request; no database lock spans network I/O. Attempt leases and
 compare-and-swap versions prevent overlapping retries or stale acknowledgements.
 Schema v9 adds a nullable release timestamp without rewriting existing receipts.
+Schema v10 adds logical archival to the same table. Only rejected or accepted
+terminal receipts can be archived; unresolved and released nonterminal work
+remains ineligible. Archival frees admission slots while retaining complete
+identity, historical replay lookup, and outcomes. It advances the concurrency
+version without refreshing gateway observation timestamps and does not reclaim
+disk space. Capacity reporting and archive preview read existing state without
+migrations, workflow construction, or gateway calls.
 One unreleased unresolved/nonterminal receipt is admitted per bot incarnation.
 The captured process generation and launch-bound messaging policy are checked
 around network operations. See [operator messaging](MESSAGING.md) for recovery

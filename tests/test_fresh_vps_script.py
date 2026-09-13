@@ -47,7 +47,7 @@ class FreshVPSVerifierTests(unittest.TestCase):
                     'mkdir -p "$HOME/.local/bin"',
                     "cat > \"$HOME/.local/bin/hermes\" <<'HERMES'",
                     "#!/usr/bin/env bash",
-                    "exit 0",
+                    'case "${1:-}" in --version|doctor|-p) exit 0 ;; *) exit 64 ;; esac',
                     "HERMES",
                     'chmod 700 "$HOME/.local/bin/hermes"',
                     "printf 'executed\\n' > \"$INSTALLER_EXECUTED\"",
