@@ -14,33 +14,23 @@ from zeus.models import (
     StoredProfilePreflightError,
 )
 from zeus.readiness import ReadinessProbe
-from zeus.supervisor_core import (
+from zeus.supervisor_contracts import (
     _READINESS_PROBE_UNSET,
     _GatewayGeneration,
     _LifecycleContext,
     _ReadinessProbeUnset,
 )
-from zeus.supervisor_runtime import _SupervisorRuntime
+from zeus.supervisor_start_host import StartHost
 
-PidAliveFn = _process_identity.PidAliveFn
-CmdlineReader = _process_identity.CmdlineReader
-ProcStartFingerprintReader = _process_identity.ProcStartFingerprintReader
-
-_CommandCheck = _process_identity.CommandCheck
 _PidState = _process_identity.PidState
-_looks_like_python_interpreter = _process_identity.looks_like_python_interpreter
-_read_linux_cmdline = _process_identity.read_linux_cmdline
-_read_linux_process_start_fingerprint = _process_identity.read_linux_process_start_fingerprint
-_resolve_executable = _process_identity.resolve_executable
-_resolve_launcher_exec_target = _process_identity.resolve_launcher_exec_target
-_safe_command_shape = _process_identity.safe_command_shape
-_trusted_hermes_paths = _process_identity.trusted_hermes_paths
-_verify_gateway_command = _process_identity.verify_gateway_command
 
 
-class _SupervisorStart(_SupervisorRuntime):
+class StartOperations:
+    """Stateless start operations; callbacks are resolved from the current host."""
+
+    @staticmethod
     def start(
-        self,
+        host: StartHost,
         bot_id: str,
         *,
         wait: bool = False,
@@ -48,32 +38,33 @@ class _SupervisorStart(_SupervisorRuntime):
         source: str = "cli",
         request_id: str | None = None,
     ) -> BotStatusResponse:
-        context = self._lifecycle_context(source, request_id)
-        with self.bot_lock(bot_id), self._bot_process_lock(bot_id):
-            return self._start_locked(
+        context = host._lifecycle_context(source, request_id)
+        with host.bot_lock(bot_id), host._bot_process_lock(bot_id):
+            return host._start_locked(
                 bot_id,
                 wait=wait,
                 timeout_seconds=timeout_seconds,
                 context=context,
             )
 
+    @staticmethod
     def _start_locked(
-        self,
+        host: StartHost,
         bot_id: str,
         *,
         wait: bool = False,
         timeout_seconds: float | None = None,
         context: _LifecycleContext,
     ) -> BotStatusResponse:
-        record = self._require_bot(bot_id)
+        record = host._require_bot(bot_id)
         if record.pending_operation_id is not None:
-            return self._pending_action_required(record, "lifecycle intent is already pending")
-        pid_state = self._pid_state(record.pid) if record.pid else _PidState.dead
+            return host._pending_action_required(record, "lifecycle intent is already pending")
+        pid_state = host._pid_state(record.pid) if record.pid else _PidState.dead
         if record.pid and pid_state == _PidState.unknown:
-            return self._unknown_pid_response(record, "start another gateway", context=context)
+            return host._unknown_pid_response(record, "start another gateway", context=context)
         if record.pid and pid_state == _PidState.alive:
-            if not self._pid_owned(record.profile_path, record.pid, bot_id):
-                self._update_lifecycle(
+            if not host._pid_owned(record.profile_path, record.pid, bot_id):
+                host._update_lifecycle(
                     context,
                     bot_id,
                     BotStatus.failed,
@@ -88,7 +79,7 @@ class _SupervisorStart(_SupervisorRuntime):
                     profile_path=record.profile_path,
                     message="recorded gateway PID is alive but ownership could not be verified",
                 )
-            response = self._status_for_live_record(record, context=context)
+            response = host._status_for_live_record(record, context=context)
             return BotStatusResponse(
                 bot_id=bot_id,
                 status=response.status,
@@ -98,22 +89,22 @@ class _SupervisorStart(_SupervisorRuntime):
                     "already running" if response.status == BotStatus.running else response.message
                 ),
             )
-        marker = self._classify_existing_runtime_marker(record)
+        marker = host._classify_existing_runtime_marker(record)
         if marker.kind == "dead":
-            if not self._remove_exact_schema3_marker(record, marker):
-                return self._pending_action_required(
+            if not host._remove_exact_schema3_marker(record, marker):
+                return host._pending_action_required(
                     record, "stale gateway marker cleanup could not be verified"
                 )
         elif marker.kind != "missing":
-            return self._pending_action_required(
+            return host._pending_action_required(
                 record,
                 marker.reason or "existing gateway marker ownership is unresolved",
             )
         try:
-            probe = self._preflight_start(record, timeout_seconds=timeout_seconds)
+            probe = host._preflight_start(record, timeout_seconds=timeout_seconds)
         except (OSError, StoredProfilePreflightError) as exc:
             message = f"failed to start gateway: {exc}"
-            self._update_lifecycle(
+            host._update_lifecycle(
                 context,
                 bot_id,
                 BotStatus.failed,
@@ -122,7 +113,7 @@ class _SupervisorStart(_SupervisorRuntime):
                 last_error=message,
                 last_transition_reason="gateway launch preflight failed",
             )
-            self.store.append_audit_event(
+            host.store.append_audit_event(
                 "bot.start_failed",
                 bot_id=bot_id,
                 error=type(exc).__name__,
@@ -135,7 +126,7 @@ class _SupervisorStart(_SupervisorRuntime):
                 record.profile_path,
                 message,
             )
-        record = self.store.begin_lifecycle_intent(
+        record = host.store.begin_lifecycle_intent(
             bot_id,
             action="start",
             operation_id=context.operation_id,
@@ -143,7 +134,7 @@ class _SupervisorStart(_SupervisorRuntime):
             request_id=context.request_id,
             reason="gateway start requested",
         )
-        return self._start_record(
+        return host._start_record(
             record,
             reset_restart=True,
             message="started",
@@ -153,8 +144,9 @@ class _SupervisorStart(_SupervisorRuntime):
             probe=probe,
         )
 
+    @staticmethod
     def _start_record(
-        self,
+        host: StartHost,
         record: BotRecord,
         *,
         reset_restart: bool,
@@ -171,7 +163,7 @@ class _SupervisorStart(_SupervisorRuntime):
             raise RuntimeError("gateway launch requires a pending start or restart intent")
         if isinstance(probe, _ReadinessProbeUnset):
             try:
-                probe = self._preflight_start(record, timeout_seconds=timeout_seconds)
+                probe = host._preflight_start(record, timeout_seconds=timeout_seconds)
             except (OSError, StoredProfilePreflightError) as exc:
                 return BotStatusResponse(
                     bot_id,
@@ -180,19 +172,19 @@ class _SupervisorStart(_SupervisorRuntime):
                     record.profile_path,
                     f"restart aborted: launch preflight failed: {exc}",
                 )
-        effect = self._runtime.launch(
+        effect = host._runtime.launch(
             record,
             probe=probe,
             wait=wait,
-            marker_lock=self._marker_publication_lock,
-            marker_matcher=self._matching_runtime_marker,
-            ack_reader=self._read_launcher_ack,
-            pipe_writer=self._write_pipe_payload,
+            marker_lock=host._marker_publication_lock,
+            marker_matcher=host._matching_runtime_marker,
+            ack_reader=host._read_launcher_ack,
+            pipe_writer=host._write_pipe_payload,
         )
         if effect.outcome == "launch_failed":
             failure_message = f"failed to start gateway: {effect.reason}"
             try:
-                self._complete_failed_intent(
+                host._complete_failed_intent(
                     record,
                     context=context,
                     pid=None,
@@ -200,10 +192,10 @@ class _SupervisorStart(_SupervisorRuntime):
                     reason="gateway process launch failed",
                 )
             except Exception:
-                return self._pending_action_required(
+                return host._pending_action_required(
                     record, "launch failure could not be persisted"
                 )
-            self.store.append_audit_event(
+            host.store.append_audit_event(
                 "bot.start_failed",
                 bot_id=bot_id,
                 error=effect.error_type,
@@ -246,7 +238,7 @@ class _SupervisorStart(_SupervisorRuntime):
             )
             terminal = replace(record, pid=pid)
             try:
-                self._complete_failed_intent(
+                host._complete_failed_intent(
                     terminal,
                     context=context,
                     pid=None,
@@ -256,8 +248,8 @@ class _SupervisorStart(_SupervisorRuntime):
                     reason="gateway exited during startup grace period",
                 )
             except Exception:
-                return self._launch_completion_failure_response(record, generation)
-            self.store.append_audit_event(
+                return host._launch_completion_failure_response(record, generation)
+            host.store.append_audit_event(
                 "bot.start_failed",
                 bot_id=bot_id,
                 pid=pid,
@@ -272,7 +264,7 @@ class _SupervisorStart(_SupervisorRuntime):
             )
         if effect.outcome == "readiness_exited":
             try:
-                self._complete_failed_intent(
+                host._complete_failed_intent(
                     record,
                     context=context,
                     pid=None,
@@ -282,8 +274,8 @@ class _SupervisorStart(_SupervisorRuntime):
                     reason="readiness process exited",
                 )
             except Exception:
-                return self._launch_completion_failure_response(record, generation)
-            self.store.append_audit_event(
+                return host._launch_completion_failure_response(record, generation)
+            host.store.append_audit_event(
                 "bot.start_failed",
                 bot_id=bot_id,
                 pid=pid,
@@ -299,7 +291,7 @@ class _SupervisorStart(_SupervisorRuntime):
             )
         if effect.outcome == "ready":
             try:
-                self._complete_started_intent(
+                host._complete_started_intent(
                     record,
                     context=context,
                     status=BotStatus.running,
@@ -309,8 +301,8 @@ class _SupervisorStart(_SupervisorRuntime):
                     reason="gateway readiness probe passed",
                 )
             except Exception:
-                return self._launch_completion_failure_response(record, generation)
-            self.store.append_audit_event("bot.start", bot_id=bot_id, pid=pid)
+                return host._launch_completion_failure_response(record, generation)
+            host.store.append_audit_event("bot.start", bot_id=bot_id, pid=pid)
             return BotStatusResponse(
                 bot_id=bot_id,
                 status=BotStatus.running,
@@ -320,7 +312,7 @@ class _SupervisorStart(_SupervisorRuntime):
             )
         if effect.outcome == "readiness_timeout":
             try:
-                self._complete_started_intent(
+                host._complete_started_intent(
                     record,
                     context=context,
                     status=BotStatus.starting,
@@ -330,8 +322,8 @@ class _SupervisorStart(_SupervisorRuntime):
                     reason="readiness probe timed out",
                 )
             except Exception:
-                return self._launch_completion_failure_response(record, generation)
-            self.store.append_audit_event(
+                return host._launch_completion_failure_response(record, generation)
+            host.store.append_audit_event(
                 "bot.start_readiness_pending",
                 bot_id=bot_id,
                 pid=pid,
@@ -347,7 +339,7 @@ class _SupervisorStart(_SupervisorRuntime):
             )
         if effect.outcome == "readiness_pending":
             try:
-                self._complete_started_intent(
+                host._complete_started_intent(
                     record,
                     context=context,
                     status=BotStatus.starting,
@@ -356,8 +348,8 @@ class _SupervisorStart(_SupervisorRuntime):
                     reason="gateway process started; readiness probe pending",
                 )
             except Exception:
-                return self._launch_completion_failure_response(record, generation)
-            self.store.append_audit_event(
+                return host._launch_completion_failure_response(record, generation)
+            host.store.append_audit_event(
                 "bot.start_readiness_pending",
                 bot_id=bot_id,
                 pid=pid,
@@ -373,7 +365,7 @@ class _SupervisorStart(_SupervisorRuntime):
         if effect.outcome != "running":
             raise RuntimeError(f"unknown gateway launch outcome: {effect.outcome}")
         try:
-            self._complete_started_intent(
+            host._complete_started_intent(
                 record,
                 context=context,
                 status=BotStatus.running,
@@ -383,8 +375,8 @@ class _SupervisorStart(_SupervisorRuntime):
                 reason="gateway process started without readiness probe",
             )
         except Exception:
-            return self._launch_completion_failure_response(record, generation)
-        self.store.append_audit_event("bot.start", bot_id=bot_id, pid=pid)
+            return host._launch_completion_failure_response(record, generation)
+        host.store.append_audit_event("bot.start", bot_id=bot_id, pid=pid)
         return BotStatusResponse(
             bot_id=bot_id,
             status=BotStatus.running,
@@ -393,19 +385,23 @@ class _SupervisorStart(_SupervisorRuntime):
             message=message,
         )
 
+    @staticmethod
     def _preflight_start(
-        self, record: BotRecord, *, timeout_seconds: float | None
+        host: StartHost, record: BotRecord, *, timeout_seconds: float | None
     ) -> ReadinessProbe | None:
-        return self._runtime.preflight_start(record, timeout_seconds=timeout_seconds)
+        return host._runtime.preflight_start(record, timeout_seconds=timeout_seconds)
 
-    def _write_pipe_payload(self, fd: int, payload: bytes) -> None:
-        self._runtime.write_pipe_payload(fd, payload)
+    @staticmethod
+    def _write_pipe_payload(host: StartHost, fd: int, payload: bytes) -> None:
+        host._runtime.write_pipe_payload(fd, payload)
 
-    def _read_launcher_ack(self, fd: int) -> bytes:
-        return self._runtime.read_launcher_ack(fd)
+    @staticmethod
+    def _read_launcher_ack(host: StartHost, fd: int) -> bytes:
+        return host._runtime.read_launcher_ack(fd)
 
+    @staticmethod
     def _complete_started_intent(
-        self,
+        host: StartHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
@@ -420,7 +416,7 @@ class _SupervisorStart(_SupervisorRuntime):
         operation_id = record.pending_operation_id
         if action not in {"start", "restart"} or operation_id is None:
             raise RuntimeError("pending launch intent is unavailable")
-        return self.store.complete_lifecycle_intent(
+        return host.store.complete_lifecycle_intent(
             record.bot_id,
             action=action,
             operation_id=operation_id,
@@ -439,8 +435,9 @@ class _SupervisorStart(_SupervisorRuntime):
             clear_stopped_at=True,
         )
 
+    @staticmethod
     def _complete_failed_intent(
-        self,
+        host: StartHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
@@ -454,7 +451,7 @@ class _SupervisorStart(_SupervisorRuntime):
         operation_id = record.pending_operation_id
         if action not in {"start", "restart"} or operation_id is None:
             raise RuntimeError("pending launch intent is unavailable")
-        return self.store.complete_lifecycle_intent(
+        return host.store.complete_lifecycle_intent(
             record.bot_id,
             action=action,
             operation_id=operation_id,
@@ -474,25 +471,27 @@ class _SupervisorStart(_SupervisorRuntime):
             clear_ready_at=True,
         )
 
+    @staticmethod
     def _cleanup_interrupted_intent_launch(
-        self,
+        host: StartHost,
         record: BotRecord,
         process: PopenLike,
         *,
         expected_fingerprint: str,
     ) -> bool:
-        return self._runtime.cleanup_interrupted_launch(
+        return host._runtime.cleanup_interrupted_launch(
             record,
             process,
             expected_fingerprint=expected_fingerprint,
         )
 
+    @staticmethod
     def _launch_completion_failure_response(
-        self,
+        host: StartHost,
         record: BotRecord,
         generation: _GatewayGeneration,
     ) -> BotStatusResponse:
-        cleaned = self._runtime.cleanup_registered_launch(record, generation)
+        cleaned = host._runtime.cleanup_registered_launch(record, generation)
         if cleaned:
             return BotStatusResponse(
                 record.bot_id,
