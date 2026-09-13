@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import uuid
@@ -218,6 +219,31 @@ def _receipt(row: sqlite3.Row, *, observe: bool = False) -> MessageReceipt:
         raise MessageStoreError("invalid_receipt") from None
 
 
+def _file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _wal_size(database_path: Path) -> int | None:
+    wal_path = database_path.with_name(f"{database_path.name}-wal")
+    try:
+        return wal_path.stat().st_size
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
+def _filesystem_free(path: Path) -> int | None:
+    try:
+        observation = os.statvfs(path)
+        return observation.f_bavail * observation.f_frsize
+    except OSError:
+        return None
+
+
 class MessageStore:
     def __init__(self, database_path: Path | str) -> None:
         self.database_path = Path(database_path)
@@ -264,6 +290,47 @@ class MessageStore:
                 "SELECT * FROM message_receipts WHERE message_id = ?", (message_id,)
             ).fetchone()
             return _receipt(row, observe=True) if row is not None else None
+
+    def capacity(self) -> dict[str, object]:
+        """Observe receipt capacity and storage without changing SQLite state."""
+        total = 0
+        blocking = 0
+        with self._read() as conn:
+            cursor = conn.execute("SELECT * FROM message_receipts")
+            while rows := cursor.fetchmany(256):
+                for row in rows:
+                    receipt = _receipt(row, observe=True)
+                    total += 1
+                    if receipt.released_at is None and (
+                        receipt.dispatch_state in {"prepared", "unknown"}
+                        or (
+                            receipt.dispatch_state == "accepted"
+                            and receipt.run_status not in _TERMINAL
+                        )
+                    ):
+                        blocking += 1
+
+        remaining = max(0, MAX_MESSAGE_RECEIPTS - total)
+        if total >= MAX_MESSAGE_RECEIPTS:
+            status = "full"
+        elif total * 100 >= MAX_MESSAGE_RECEIPTS * 95:
+            status = "critical"
+        elif total * 100 >= MAX_MESSAGE_RECEIPTS * 80:
+            status = "warning"
+        else:
+            status = "ok"
+        return {
+            "limit": MAX_MESSAGE_RECEIPTS,
+            "used": total,
+            "remaining": remaining,
+            "total": total,
+            "archived": 0,
+            "blocking": blocking,
+            "status": status,
+            "database_bytes": _file_size(self.database_path),
+            "wal_bytes": _wal_size(self.database_path),
+            "filesystem_free_bytes": _filesystem_free(self.database_path.parent),
+        }
 
     def list(
         self, *, bot_id: str | None = None, limit: int = 50, before: str | None = None

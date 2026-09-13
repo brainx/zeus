@@ -55,6 +55,7 @@ zeus message send coder --file request.txt --request-key incident-104 --json
 zeus message list --bot-id coder --limit 20 --json
 zeus message status <message-id> --json
 zeus message cancel <message-id> --json
+zeus message capacity --json
 ```
 
 Input must be a regular UTF-8 file containing nonblank text, at most 16,000
@@ -63,6 +64,16 @@ not accepted as a shell argument. Submission returns a receipt immediately;
 `status` explicitly fetches current output. JSON output escapes terminal control
 characters. Use a returned `next_before` cursor with `list --before <cursor>`
 to inspect older receipts.
+
+`message capacity` observes the existing receipt database without initializing,
+migrating, checkpointing, or reconciling state and makes no gateway request. It
+reports the fixed 10,000-receipt limit, total receipts currently used, remaining
+capacity, active per-incarnation admission blockers, and database, WAL, and
+filesystem-free byte observations. `archived` is currently `0`; archival is not
+implemented yet. Capacity status changes to `warning` at 80%, `critical` at 95%,
+and `full` at 100%. A full but valid database is a successful observation and
+exits zero. Missing, incompatible, or malformed state fails closed with a nonzero
+exit. Unavailable filesystem size observations appear as `null` in JSON.
 
 `accepted` means Hermes acknowledged the run. It does not mean the job completed
 successfully. Status distinguishes queued, running, waiting for approval,

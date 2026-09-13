@@ -536,6 +536,17 @@ cannot supply those environment keys, and stored profile assignments are
 rejected before launch. This prevents Hermes's dotenv loader from undoing
 Zeus's process ownership policy.
 
+### Message receipt capacity
+
+Run `zeus message capacity --json` to observe local receipt usage before it
+reaches the fixed 10,000-record admission limit. The report separates total
+retained receipts from active admission blockers and includes database, WAL, and
+available-filesystem byte observations. Status is `ok` below 80%, `warning` from
+80%, `critical` from 95%, and `full` from 100%. A valid `full` report exits zero;
+state errors exit nonzero. This command is read-only and does not initialize,
+migrate, checkpoint, reconcile, or contact Hermes. A missing WAL is reported as
+zero when its absence can be confirmed; unavailable size observations are null.
+
 ### Live gateway diagnostics
 
 Use `zeus bot diagnostics <bot-id> --json` or the authenticated
