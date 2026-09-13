@@ -29,7 +29,11 @@ platform guarantee.
 Python 3.14 is a provisional Zeus-only lane with `continue-on-error` behavior.
 It does not promote Python 3.14 to required Hermes compatibility: the repository
 pins Hermes Agent 0.21.0, whose package metadata requires Python 3.11 through
-3.13, and runs that compatibility gate only on Python 3.11.
+3.13, and runs that compatibility gate only on Python 3.11. The `ci-required`
+merge aggregate therefore covers the supported Python 3.11 through 3.13 matrix
+and the five focused required jobs, without the provisional Python 3.14 lane.
+Tagged release promotion applies a stricter evidence policy and separately
+requires the Python 3.14 job to have succeeded for the exact release commit.
 
 The package metadata declares `requires-python = ">=3.11"`, while committed CI
 currently tests the versions listed above. A version absent from that matrix is

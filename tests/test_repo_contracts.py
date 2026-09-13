@@ -229,6 +229,7 @@ class RepoContractTests(unittest.TestCase):
             "scripts/install_pinned_hermes.sh",
             "scripts/verify_pinned_hermes_runs.py",
             "scripts/check_verified_release_ref.py",
+            "scripts/check_ci_required.py",
             "scripts/wheel_smoke.sh",
             "scripts/fresh_vps_verify.sh",
             "zeus/bundled_skills/__init__.py",
@@ -312,6 +313,7 @@ class RepoContractTests(unittest.TestCase):
             "macos-process-lifecycle": "macos-26",
             "real-hermes": "ubuntu-24.04",
             "package": "ubuntu-24.04",
+            "ci-required": "ubuntu-24.04",
         }
         expected_python_versions = {
             "test": ("3.11", "3.12", "3.13"),
@@ -321,6 +323,7 @@ class RepoContractTests(unittest.TestCase):
             "macos-process-lifecycle": ("3.13",),
             "real-hermes": ("3.11",),
             "package": ("3.11",),
+            "ci-required": ("3.11",),
         }
         expected_setup_python = {
             "test": "${{ matrix.python-version }}",
@@ -330,6 +333,7 @@ class RepoContractTests(unittest.TestCase):
             "macos-process-lifecycle": '"3.13"',
             "real-hermes": '"3.11"',
             "package": '"3.11"',
+            "ci-required": '"3.11"',
         }
         expected_commands = {
             "test": (
@@ -403,6 +407,7 @@ class RepoContractTests(unittest.TestCase):
                 'sh scripts/verify_service_recovery.sh "$(command -v python)"',
                 "sh scripts/generate_checksums.sh dist",
             ),
+            "ci-required": ("python scripts/check_ci_required.py",),
         }
 
         self.assertEqual(set(expected_runners), set(jobs))
@@ -424,6 +429,22 @@ class RepoContractTests(unittest.TestCase):
             if values:
                 job_level_continue_on_error[job_name] = values[0]
         self.assertEqual({"python-3-14": "true"}, job_level_continue_on_error)
+
+        ci_required = jobs["ci-required"]
+        self.assertEqual("always()", _job_level_scalar(ci_required, "if"))
+        self.assertEqual("5", _job_level_scalar(ci_required, "timeout-minutes"))
+        self.assertEqual(
+            {
+                "test",
+                "lifecycle-subprocess",
+                "package",
+                "real-hermes",
+                "audit-docker-isolation",
+                "macos-process-lifecycle",
+            },
+            set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", ci_required)),
+        )
+        self.assertIn("ZEUS_CI_NEEDS_JSON: ${{ toJSON(needs) }}", ci_required)
 
         real_hermes = jobs["real-hermes"]
         self.assertEqual("15", _job_level_scalar(real_hermes, "timeout-minutes"))

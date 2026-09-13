@@ -34,6 +34,7 @@ REQUIRED_JOBS = frozenset(
         "real-hermes",
         "macos-process-lifecycle",
         "package",
+        "ci-required",
     }
 )
 ERROR_CODES = frozenset(
