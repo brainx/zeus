@@ -125,9 +125,33 @@ requests, and manual runs do not qualify. Its current attempt must contain
 successful Python 3.11/3.12/3.13 matrix jobs, Python 3.14, subprocess lifecycle,
 Docker isolation, real Hermes, macOS lifecycle, and package jobs. Python 3.14
 remains provisional in ordinary CI but is required for release promotion.
+The release verifier also requires the successful `ci-required` aggregate job.
+That job runs with `always()` after the supported-version matrix, subprocess
+lifecycle, package, real-Hermes, Docker-isolation, and macOS-lifecycle jobs. It
+fails unless every one of those six dependency results is explicitly
+`success`, so a skipped, cancelled, missing, failed, or malformed result cannot
+turn into a green aggregate check.
 If a partial rerun omits required jobs, rerun all jobs before retrying the
 release build. An older successful run cannot override a newer failed or
 unfinished run for the same commit.
+
+Adding the workflow job does not change repository rules. Repository
+administration is a separate action and requires separate authorization. Only
+after a real `.github/workflows/ci.yml` run completes successfully, inspect the
+check runs it produced and resolve the producer `app.id` for each of these exact
+contexts: `real-hermes`, `audit-docker-isolation`,
+`macos-process-lifecycle`, and `ci-required`. Verify that each observed producer
+is GitHub Actions before using that numeric ID as the required-check `app_id`.
+
+Roll out those four required checks additively as `(context, app_id)` pairs.
+Preserve every existing required check, strictness setting, review requirement,
+ruleset condition, bypass rule, and other protection setting; this rollout must
+only add the four verified pairs. After the separately authorized update, read
+the repository rule back and confirm all previous settings are unchanged and
+each of the four entries has both the exact context and its matching verified
+GitHub Actions `app_id`. A matching context name without the verified producer
+binding is insufficient. No repository-settings mutation is part of the release
+workflow or this documented verification procedure.
 
 The build job alone receives `actions: read`; its token is passed only through
 the environment. API requests reject redirects and use bounded response sizes,

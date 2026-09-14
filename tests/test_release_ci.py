@@ -34,6 +34,7 @@ JOB_NAMES = (
     "real-hermes",
     "macos-process-lifecycle",
     "package",
+    "ci-required",
 )
 
 
@@ -269,7 +270,7 @@ class ReleaseCITests(unittest.TestCase):
         data = _responses()
         path = f"{PREFIX}/runs/1010/attempts/1/jobs?per_page=100&page=1"
         jobs = _jobs_page(data)["jobs"]
-        for number in range(9, 101):
+        for number in range(len(JOB_NAMES), 101):
             jobs.append({**jobs[0], "id": 2000 + number, "name": f"extra-{number}"})
         data[path] = {"total_count": 101, "jobs": jobs[:100]}
         data[path.replace("&page=1", "&page=2")] = {"total_count": 101, "jobs": jobs[100:]}

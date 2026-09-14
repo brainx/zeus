@@ -74,6 +74,90 @@ The matching authenticated routes are `GET /reconcile/runs`,
 `GET /reconcile/runs/<run-id>`, and `GET /fleet`. See [API](docs/API.md) and
 [reconciliation](docs/RECONCILE.md) for filters and freshness semantics.
 
+## Quick Start
+
+### 1. Credential-free offline demo
+
+The fastest first success needs no Hermes installation, Docker, or provider
+credentials. From a checkout:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+
+zeus demo up
+zeus demo status
+zeus demo down
+```
+
+The demo uses Zeus' packaged fake-Hermes executable and stores its disposable
+runtime under `ZEUS_STATE_DIR` (the workspace-local `.zeus/` directory by
+default). It exercises real profile rendering and process lifecycle behavior
+without contacting a provider.
+
+### 2. Real Hermes setup
+
+Check the installed Hermes version, then prepare a private workspace secret
+file:
+
+```bash
+hermes --version
+cp .env.example .env
+chmod 0600 .env
+```
+
+`.env.example` contains empty placeholders and is not ready to import. Stop here
+until `.env` contains a real, non-empty provider key required by the selected
+template, such as `OPENROUTER_API_KEY` for `coding-bot`. As an alternative,
+provide the same named secret through a secure process-environment mechanism.
+
+Then validate Zeus and render the real Hermes profile:
+
+```bash
+zeus doctor
+zeus template list
+zeus bot create coder --template coding-bot --env-from OPENROUTER_API_KEY
+zeus bot doctor coder
+```
+
+`--env-from NAME` imports a named value from the process environment first and
+then the trusted workspace `./.env`; the value never enters the Zeus argument
+list or command output. A present but empty process value is an error and does
+not fall back to `.env`. Keep the workspace `.env` private with `chmod 0600 .env`.
+The legacy `--env NAME=VALUE` form remains available
+for non-secret compatibility values, but is unsafe for secrets because command
+arguments can be retained in shell history and exposed in process listings.
+
+Safety model: Zeus is a local process orchestrator, not a sandbox. Use Docker or
+another Hermes terminal backend for untrusted tasks. Do not expose the API
+directly to a network; keep it on loopback or behind a separately hardened
+access layer. Logs and audit events may contain sensitive operational data, so
+protect and rotate `$ZEUS_STATE_DIR`.
+
+Start the local API with an explicit key:
+
+```bash
+ZEUS_API_KEY=change-me sh scripts/start.sh
+```
+
+## 60-Second Demo
+
+The pre-recorded asciinema cast in [docs/assets/demo.cast](docs/assets/demo.cast)
+illustrates the local operator flow. It is not evidence that the current Zeus
+checkout is compatible with whichever Hermes version is installed today; use
+the live verification steps below for that evidence.
+
+```bash
+zeus doctor
+zeus template list
+zeus bot create coder --template coding-bot
+zeus bot start coder
+zeus bot status coder
+zeus bot logs coder
+zeus bot stop coder
+```
+
 ## Repository Audit
 
 `zeus audit` is a report-only, host-local review of the exact committed `HEAD`.
@@ -204,90 +288,6 @@ the controls your chosen tools enforce; generic tests and ad-hoc model commands
 do not count as security coverage. Commands carrying `control_ids` run with the
 committed snapshot read-only; configure those tools to place caches and build
 output under `/tmp`.
-
-## Quick Start
-
-### 1. Credential-free offline demo
-
-The fastest first success needs neither Hermes nor provider credentials. From a
-checkout:
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
-
-zeus demo up
-zeus demo status
-zeus demo down
-```
-
-The demo uses Zeus' packaged fake-Hermes executable and stores its disposable
-runtime under `ZEUS_STATE_DIR` (the workspace-local `.zeus/` directory by
-default). It exercises real profile rendering and process lifecycle behavior
-without contacting a provider.
-
-### 2. Real Hermes setup
-
-Check the installed Hermes version, then prepare a private workspace secret
-file:
-
-```bash
-hermes version
-cp .env.example .env
-chmod 0600 .env
-```
-
-`.env.example` contains empty placeholders and is not ready to import. Stop here
-until `.env` contains a real, non-empty provider key required by the selected
-template, such as `OPENROUTER_API_KEY` for `coding-bot`. As an alternative,
-provide the same named secret through a secure process-environment mechanism.
-
-Then validate Zeus and render the real Hermes profile:
-
-```bash
-zeus doctor
-zeus template list
-zeus bot create coder --template coding-bot --env-from OPENROUTER_API_KEY
-zeus bot doctor coder
-```
-
-`--env-from NAME` imports a named value from the process environment first and
-then the trusted workspace `./.env`; the value never enters the Zeus argument
-list or command output. A present but empty process value is an error and does
-not fall back to `.env`. Keep the workspace `.env` private with `chmod 0600 .env`.
-The legacy `--env NAME=VALUE` form remains available
-for non-secret compatibility values, but is unsafe for secrets because command
-arguments can be retained in shell history and exposed in process listings.
-
-Safety model: Zeus is a local process orchestrator, not a sandbox. Use Docker or
-another Hermes terminal backend for untrusted tasks. Do not expose the API
-directly to a network; keep it on loopback or behind a separately hardened
-access layer. Logs and audit events may contain sensitive operational data, so
-protect and rotate `$ZEUS_STATE_DIR`.
-
-Start the local API with an explicit key:
-
-```bash
-ZEUS_API_KEY=change-me sh scripts/start.sh
-```
-
-## 60-Second Demo
-
-The pre-recorded asciinema cast in [docs/assets/demo.cast](docs/assets/demo.cast)
-illustrates the local operator flow. It is not evidence that the current Zeus
-checkout is compatible with whichever Hermes version is installed today; use
-the live verification steps below for that evidence.
-
-```bash
-zeus doctor
-zeus template list
-zeus bot create coder --template coding-bot
-zeus bot start coder
-zeus bot status coder
-zeus bot logs coder
-zeus bot stop coder
-```
 
 ## Documentation
 

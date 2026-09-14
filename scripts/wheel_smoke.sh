@@ -101,11 +101,42 @@ for template_id in \
 done
 
 grep '"checks"' doctor.json >/dev/null
+
+# The offline lifecycle path must work when real audit tools cannot execute.
+unavailable_tools="$tmp_dir/unavailable-tools"
+mkdir -p "$unavailable_tools"
+export ZEUS_WHEEL_RUNTIME_CALLS="$tmp_dir/unexpected-runtime-calls"
+for tool in hermes docker; do
+  cat >"$unavailable_tools/$tool" <<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' 'unexpected runtime invocation' >> "$ZEUS_WHEEL_RUNTIME_CALLS"
+exit 97
+SH
+  chmod 0700 "$unavailable_tools/$tool"
+done
+export PATH="$tmp_dir/venv/bin:$unavailable_tools:$PATH"
+export ZEUS_HERMES_BIN="$unavailable_tools/hermes"
 demo_started=1
 "$venv_zeus" demo up --json >demo-up.json
 "$venv_zeus" demo status --json >demo-status.json
 "$venv_zeus" demo down --json >demo-down.json
 demo_started=0
+
+"$venv_zeus" message capacity --json >message-capacity.json
+"$venv_zeus" message archive --json >message-archive-preview.json
+"$venv_python" - <<'PY'
+import json
+from pathlib import Path
+
+capacity = json.loads(Path("message-capacity.json").read_text())
+assert capacity["used"] == 0 and capacity["total"] == 0
+assert capacity["status"] == "ok"
+preview = json.loads(Path("message-archive-preview.json").read_text())
+assert preview["applied"] is False and preview["count"] == 0
+assert preview["message_ids"] == []
+PY
+[ ! -e "$ZEUS_WHEEL_RUNTIME_CALLS" ] || fail "offline commands invoked Hermes or Docker"
 
 grep '"fake_hermes_bin"' demo-up.json >/dev/null
 grep -F "\"fake_hermes_bin\": \"$venv_fake_hermes\"" demo-up.json >/dev/null

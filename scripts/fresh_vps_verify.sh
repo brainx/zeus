@@ -369,7 +369,7 @@ run sh scripts/test.sh
 run sh scripts/repo_check.sh
 
 section "Hermes Diagnostics"
-run hermes version
+run hermes --version
 run hermes doctor
 
 section "Real Hermes Compatibility"

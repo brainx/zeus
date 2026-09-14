@@ -29,7 +29,11 @@ platform guarantee.
 Python 3.14 is a provisional Zeus-only lane with `continue-on-error` behavior.
 It does not promote Python 3.14 to required Hermes compatibility: the repository
 pins Hermes Agent 0.21.0, whose package metadata requires Python 3.11 through
-3.13, and runs that compatibility gate only on Python 3.11.
+3.13, and runs that compatibility gate only on Python 3.11. The `ci-required`
+merge aggregate therefore covers the supported Python 3.11 through 3.13 matrix
+and the five focused required jobs, without the provisional Python 3.14 lane.
+Tagged release promotion applies a stricter evidence policy and separately
+requires the Python 3.14 job to have succeeded for the exact release commit.
 
 The package metadata declares `requires-python = ">=3.11"`, while committed CI
 currently tests the versions listed above. A version absent from that matrix is
@@ -52,10 +56,24 @@ setting, to persist dispatch intent before submitting a job.
 The synchronous policy itself does not change database structure. Zeus v0.6
 adds an independent forward-only migration from schema v6 to schema v7 for
 operator-query indexes. Schema v8 then adds durable operator-message receipts.
-Schema v9 adds explicit local release timestamps to those receipts.
-Existing v6/v7/v8 databases upgrade during normal startup;
+Schema v9 adds explicit local release timestamps to those receipts. Schema v10
+adds nullable logical archival timestamps and an unarchived selection index,
+preserving existing rows, unique keys, and the active-target uniqueness rule.
+Zeus `0.6.1.dev0` now reports readiness schema 10. Existing v6/v7/v8/v9 databases
+upgrade transactionally during normal startup;
 read-only history/fleet commands require the current schema. Keep all writers
-on the same Zeus version and retain a quiesced backup for rollback.
+on the same Zeus build and retain a quiesced backup for rollback. Stop every
+writer before backup and upgrade. An interrupted migration rolls back both schema
+and data. Older schema-9 binaries reject schema 10; rollback restores the complete
+pre-upgrade backup with its matching binary, rather than downgrading metadata.
+
+Olymp must explicitly accept the Zeus `0.6.1.dev0` / readiness-schema-10 pairing
+before this build is deployed with it. The same development package version may
+exist with schema 9, so a matching version string alone is insufficient evidence.
+No compatibility with an unchanged schema-9-only Olymp client is claimed.
+Message capacity/archive commands require current state and never migrate it.
+Archival restores only the unarchived admission allowance; all receipt identity
+and deduplication history remain retained and disk space is not reclaimed.
 
 ## Manual clean-host evidence
 
@@ -112,7 +130,7 @@ rendered profile, environment, logs, or process arguments.
 
 The manual [`scripts/verify_real_hermes.sh`](../scripts/verify_real_hermes.sh)
 check still uses whichever `hermes` executable is installed on `PATH` unless
-`ZEUS_VERIFY_EXPECTED_HERMES_VERSION` is set. Record `hermes version` with manual
+`ZEUS_VERIFY_EXPECTED_HERMES_VERSION` is set. Record `hermes --version` with manual
 evidence. Passing the pinned baseline does not establish compatibility with every
 Hermes release or optional integration.
 

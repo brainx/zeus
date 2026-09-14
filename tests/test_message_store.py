@@ -356,7 +356,7 @@ class MessageStoreTests(unittest.TestCase):
                 "target_fingerprint, endpoint, credential_fingerprint, request_hash, ?, "
                 "dispatch_state, run_id, run_status, created_at, updated_at, retry_before, "
                 "last_checked_at, cancel_requested_at, lease_until, error_code, version, "
-                "released_at "
+                "released_at, archived_at "
                 "FROM message_receipts WHERE message_id = ?",
                 [
                     (f"{index:032x}", f"{index + 10000:032x}", receipt.message_id)
@@ -546,7 +546,8 @@ class MessageSchemaMigrationTests(unittest.TestCase):
             def _migrate_v8_to_v9(self, conn):
                 pass
 
-        PriorSchemaManager(SQLiteDatabase(path)).init()
+        with patch("zeus.schema.SCHEMA_VERSION", 9):
+            PriorSchemaManager(SQLiteDatabase(path)).init()
         with closing(sqlite3.connect(path)) as conn:
             conn.execute("UPDATE schema_version SET version = 7")
             conn.commit()
@@ -571,7 +572,7 @@ class MessageSchemaMigrationTests(unittest.TestCase):
                 )
                 self.assertTrue(all(after_schema[name] == sql for name, sql in before_schema))
                 self.assertEqual(
-                    9, conn.execute("SELECT version FROM schema_version").fetchone()[0]
+                    10, conn.execute("SELECT version FROM schema_version").fetchone()[0]
                 )
                 self.assertEqual(
                     [], conn.execute("PRAGMA foreign_key_list(message_receipts)").fetchall()

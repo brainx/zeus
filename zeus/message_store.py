@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import uuid
@@ -94,6 +95,7 @@ class MessageReceipt:
     lease_until: datetime | None
     error_code: str | None
     version: int
+    archived_at: datetime | None
 
 
 def _identifier(value: str, *, hashed: bool = False) -> str:
@@ -166,7 +168,13 @@ def _receipt(row: sqlite3.Row, *, observe: bool = False) -> MessageReceipt:
         }
         optional = {
             name: _stored_time(row[name]) if row[name] is not None else None
-            for name in ("last_checked_at", "cancel_requested_at", "released_at", "lease_until")
+            for name in (
+                "last_checked_at",
+                "cancel_requested_at",
+                "released_at",
+                "lease_until",
+                "archived_at",
+            )
         }
         if not times["target_created_at"] <= times["created_at"] <= times[
             "updated_at"
@@ -178,6 +186,15 @@ def _receipt(row: sqlite3.Row, *, observe: bool = False) -> MessageReceipt:
                 raise ValueError("message receipt observation time is inconsistent")
         if optional["released_at"] is not None and row["dispatch_state"] != "accepted":
             raise ValueError("only acknowledged message receipts can be released")
+        archived = optional["archived_at"]
+        if archived is not None and (
+            archived < times["created_at"]
+            or not (
+                row["dispatch_state"] == "rejected"
+                or (row["dispatch_state"] == "accepted" and row["run_status"] in _TERMINAL)
+            )
+        ):
+            raise ValueError("message receipt archival is inconsistent")
         lease = optional["lease_until"]
         if row["dispatch_state"] == "prepared":
             if lease is None or lease != times["updated_at"] + timedelta(
@@ -208,6 +225,7 @@ def _receipt(row: sqlite3.Row, *, observe: bool = False) -> MessageReceipt:
             lease_until=lease,
             error_code=row["error_code"],
             version=_version(row["version"]),
+            archived_at=archived,
         )
         return (
             replace(receipt, dispatch_state="unknown")
@@ -216,6 +234,31 @@ def _receipt(row: sqlite3.Row, *, observe: bool = False) -> MessageReceipt:
         )
     except (IndexError, TypeError, ValueError, OverflowError):
         raise MessageStoreError("invalid_receipt") from None
+
+
+def _file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _wal_size(database_path: Path) -> int | None:
+    wal_path = database_path.with_name(f"{database_path.name}-wal")
+    try:
+        return wal_path.stat().st_size
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
+def _filesystem_free(path: Path) -> int | None:
+    try:
+        observation = os.statvfs(path)
+        return observation.f_bavail * observation.f_frsize
+    except OSError:
+        return None
 
 
 class MessageStore:
@@ -264,6 +307,92 @@ class MessageStore:
                 "SELECT * FROM message_receipts WHERE message_id = ?", (message_id,)
             ).fetchone()
             return _receipt(row, observe=True) if row is not None else None
+
+    def capacity(self) -> dict[str, object]:
+        """Observe receipt capacity and storage without changing SQLite state."""
+        total = 0
+        blocking = 0
+        archived = 0
+        with self._read() as conn:
+            cursor = conn.execute("SELECT * FROM message_receipts")
+            while rows := cursor.fetchmany(256):
+                for row in rows:
+                    receipt = _receipt(row, observe=True)
+                    total += 1
+                    archived += receipt.archived_at is not None
+                    if receipt.released_at is None and (
+                        receipt.dispatch_state in {"prepared", "unknown"}
+                        or (
+                            receipt.dispatch_state == "accepted"
+                            and receipt.run_status not in _TERMINAL
+                        )
+                    ):
+                        blocking += 1
+
+        used = total - archived
+        remaining = max(0, MAX_MESSAGE_RECEIPTS - used)
+        if used >= MAX_MESSAGE_RECEIPTS:
+            status = "full"
+        elif used * 100 >= MAX_MESSAGE_RECEIPTS * 95:
+            status = "critical"
+        elif used * 100 >= MAX_MESSAGE_RECEIPTS * 80:
+            status = "warning"
+        else:
+            status = "ok"
+        return {
+            "limit": MAX_MESSAGE_RECEIPTS,
+            "used": used,
+            "remaining": remaining,
+            "total": total,
+            "archived": archived,
+            "blocking": blocking,
+            "status": status,
+            "database_bytes": _file_size(self.database_path),
+            "wal_bytes": _wal_size(self.database_path),
+            "filesystem_free_bytes": _filesystem_free(self.database_path.parent),
+        }
+
+    def archive(
+        self,
+        *,
+        before: datetime | None = None,
+        limit: int = 100,
+        apply: bool = False,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        """Preview or durably archive a bounded batch; preview reserves nothing."""
+        now = _time(now if now is not None else datetime.now(UTC))
+        before = _time(before) if before is not None else now - timedelta(days=30)
+        if before > now:
+            raise ValueError("message archive cutoff cannot be in the future")
+        if type(limit) is not int or not 1 <= limit <= 500 or type(apply) is not bool:
+            raise ValueError("message archive limit must be between 1 and 500")
+        with self._write() if apply else self._read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM message_receipts WHERE archived_at IS NULL "
+                "AND updated_at < ? AND (dispatch_state = 'rejected' OR "
+                "(dispatch_state = 'accepted' AND run_status IN "
+                "('completed', 'failed', 'cancelled', 'interrupted'))) "
+                "ORDER BY updated_at, message_id LIMIT ?",
+                (before.isoformat(), limit),
+            ).fetchall()
+            receipts = [_receipt(row) for row in rows]
+            for receipt in receipts:
+                self._check_clock(receipt, now)
+                if receipt.version == 2**63 - 1:
+                    raise MessageStoreError("invalid_receipt")
+            if apply:
+                conn.executemany(
+                    "UPDATE message_receipts SET archived_at = ?, version = version + 1 "
+                    "WHERE message_id = ?",
+                    ((now.isoformat(), receipt.message_id) for receipt in receipts),
+                )
+        return {
+            "message_ids": [receipt.message_id for receipt in receipts],
+            "count": len(receipts),
+            "applied": apply,
+            "before": before.isoformat(),
+        }
 
     def list(
         self, *, bot_id: str | None = None, limit: int = 50, before: str | None = None
@@ -358,7 +487,9 @@ class MessageStore:
                 _receipt(blocker)
                 raise MessageStoreError("bot_busy")
             if (
-                conn.execute("SELECT count(*) FROM message_receipts").fetchone()[0]
+                conn.execute(
+                    "SELECT count(*) FROM message_receipts WHERE archived_at IS NULL"
+                ).fetchone()[0]
                 >= MAX_MESSAGE_RECEIPTS
             ):
                 raise MessageStoreError("capacity_exceeded")
@@ -398,7 +529,7 @@ class MessageStore:
 
     @staticmethod
     def _check_clock(receipt: MessageReceipt, now: datetime) -> None:
-        if now < receipt.updated_at:
+        if now < max(receipt.updated_at, receipt.archived_at or receipt.updated_at):
             raise MessageStoreError("clock_rollback")
 
     def _current(

@@ -36,33 +36,23 @@ from zeus.reconciliation import (
     ReconcileRunSummary,
     ReconcileSnapshotDriftError,
 )
-from zeus.supervisor_core import (
+from zeus.supervisor_contracts import (
     _GatewayGeneration,
     _LifecycleContext,
     _MarkerObservation,
     _ReconcileLaunch,
 )
-from zeus.supervisor_stop import _SupervisorStop
+from zeus.supervisor_reconcile_host import ReconcileHost
 
-PidAliveFn = _process_identity.PidAliveFn
-CmdlineReader = _process_identity.CmdlineReader
-ProcStartFingerprintReader = _process_identity.ProcStartFingerprintReader
-
-_CommandCheck = _process_identity.CommandCheck
 _PidState = _process_identity.PidState
-_looks_like_python_interpreter = _process_identity.looks_like_python_interpreter
-_read_linux_cmdline = _process_identity.read_linux_cmdline
-_read_linux_process_start_fingerprint = _process_identity.read_linux_process_start_fingerprint
-_resolve_executable = _process_identity.resolve_executable
-_resolve_launcher_exec_target = _process_identity.resolve_launcher_exec_target
-_safe_command_shape = _process_identity.safe_command_shape
-_trusted_hermes_paths = _process_identity.trusted_hermes_paths
-_verify_gateway_command = _process_identity.verify_gateway_command
 
 
-class _SupervisorReconcile(_SupervisorStop):
+class ReconcileOperations:
+    """Stateless reconcile operations; callbacks are resolved from the current host."""
+
+    @staticmethod
     def reconcile(
-        self,
+        host: ReconcileHost,
         bot_id: str | None = None,
         *,
         now: datetime | None = None,
@@ -73,7 +63,7 @@ class _SupervisorReconcile(_SupervisorStop):
         bot_snapshot: Sequence[tuple[str, str]] | None = None,
     ) -> list[BotStatusResponse]:
         try:
-            execution = self.reconcile_execution(
+            execution = host.reconcile_execution(
                 bot_id,
                 now=now,
                 force=force,
@@ -86,8 +76,9 @@ class _SupervisorReconcile(_SupervisorStop):
             raise LockTimeoutError(error.lock_path, error.timeout_seconds) from error
         return list(execution.legacy_responses)
 
+    @staticmethod
     def reconcile_summary(
-        self,
+        host: ReconcileHost,
         bot_id: str | None = None,
         *,
         now: datetime | None = None,
@@ -97,7 +88,7 @@ class _SupervisorReconcile(_SupervisorStop):
         request_id: str | None = None,
         bot_snapshot: Sequence[tuple[str, str]] | None = None,
     ) -> ReconcileRunSummary:
-        return self.reconcile_execution(
+        return host.reconcile_execution(
             bot_id,
             now=now,
             force=force,
@@ -107,8 +98,9 @@ class _SupervisorReconcile(_SupervisorStop):
             bot_snapshot=bot_snapshot,
         ).summary
 
+    @staticmethod
     def reconcile_execution(
-        self,
+        host: ReconcileHost,
         bot_id: str | None = None,
         *,
         now: datetime | None = None,
@@ -118,7 +110,7 @@ class _SupervisorReconcile(_SupervisorStop):
         request_id: str | None = None,
         bot_snapshot: Sequence[tuple[str, str]] | None = None,
     ) -> ReconcileExecution:
-        return FleetReconciler(self.store, self).execute(
+        return FleetReconciler(host.store, host).execute(
             bot_id,
             now=now,
             force=force,
@@ -128,25 +120,30 @@ class _SupervisorReconcile(_SupervisorStop):
             bot_snapshot=bot_snapshot,
         )
 
-    def validate_reconcile_request(self, source: str, request_id: str | None) -> None:
-        self._lifecycle_context(source, request_id)
+    @staticmethod
+    def validate_reconcile_request(
+        host: ReconcileHost, source: str, request_id: str | None
+    ) -> None:
+        host._lifecycle_context(source, request_id)
 
+    @staticmethod
     def validate_reconcile_target(
-        self,
+        host: ReconcileHost,
         bot_id: str,
         *,
         expected_profile_path: str | None = None,
     ) -> str:
-        with self.bot_lock(bot_id), self._bot_process_lock(bot_id):
-            record = self.store.get_bot(bot_id)
+        with host.bot_lock(bot_id), host._bot_process_lock(bot_id):
+            record = host.store.get_bot(bot_id)
             if record is None:
                 raise KeyError(f"unknown bot: {bot_id}")
             if expected_profile_path is not None and record.profile_path != expected_profile_path:
                 raise ReconcileSnapshotDriftError(bot_id)
             return record.profile_path
 
+    @staticmethod
     def reconcile_one(
-        self,
+        host: ReconcileHost,
         bot_id: str,
         *,
         now: datetime | None = None,
@@ -156,7 +153,7 @@ class _SupervisorReconcile(_SupervisorStop):
         request_id: str | None = None,
         expected_profile_path: str | None = None,
     ) -> BotReconcileResult:
-        result, _response = self.reconcile_one_execution(
+        result, _response = host.reconcile_one_execution(
             bot_id,
             now=now,
             force=force,
@@ -167,8 +164,9 @@ class _SupervisorReconcile(_SupervisorStop):
         )
         return result
 
+    @staticmethod
     def reconcile_one_execution(
-        self,
+        host: ReconcileHost,
         bot_id: str,
         *,
         now: datetime | None = None,
@@ -178,21 +176,21 @@ class _SupervisorReconcile(_SupervisorStop):
         request_id: str | None = None,
         expected_profile_path: str | None = None,
     ) -> tuple[BotReconcileResult, BotStatusResponse]:
-        context = self._lifecycle_context(source, request_id)
+        context = host._lifecycle_context(source, request_id)
         current_time = now or datetime.now(UTC)
         started_at = datetime.now(UTC)
-        with self.bot_lock(bot_id), self._bot_process_lock(bot_id):
-            before = self.store.get_bot(bot_id)
+        with host.bot_lock(bot_id), host._bot_process_lock(bot_id):
+            before = host.store.get_bot(bot_id)
             if before is None:
                 if expected_profile_path is not None:
                     raise ReconcileSnapshotDriftError(bot_id)
                 raise KeyError(f"unknown bot: {bot_id}")
             if expected_profile_path is not None and before.profile_path != expected_profile_path:
                 raise ReconcileSnapshotDriftError(bot_id)
-            prior_events = self.store.list_lifecycle_events(bot_id, limit=1, before=None)
+            prior_events = host.store.list_lifecycle_events(bot_id, limit=1, before=None)
             prior_event_id = prior_events[0].event_id if prior_events else None
             try:
-                response = self._reconcile_record(
+                response = host._reconcile_record(
                     before,
                     current_time,
                     force=force,
@@ -202,11 +200,11 @@ class _SupervisorReconcile(_SupervisorStop):
             except ReconcileSnapshotDriftError:
                 raise
             except Exception as error:
-                loaded_after_error = self.store.get_bot(bot_id)
+                loaded_after_error = host.store.get_bot(bot_id)
                 if loaded_after_error is None and expected_profile_path is not None:
                     raise ReconcileSnapshotDriftError(bot_id) from error
                 after = loaded_after_error or before
-                current_event = self._latest_reconcile_event(bot_id, prior_event_id)
+                current_event = host._latest_reconcile_event(bot_id, prior_event_id)
                 lock_timeout = isinstance(error, LockTimeoutError)
                 message = (
                     "bot reconciliation lock timed out"
@@ -233,14 +231,14 @@ class _SupervisorReconcile(_SupervisorStop):
                     profile_path=before.profile_path,
                     message=message,
                 )
-            loaded_after = self.store.get_bot(bot_id)
+            loaded_after = host.store.get_bot(bot_id)
             if loaded_after is None:
                 if expected_profile_path is not None:
                     raise ReconcileSnapshotDriftError(bot_id)
                 raise KeyError(f"unknown bot: {bot_id}")
-            current_event = self._latest_reconcile_event(bot_id, prior_event_id)
+            current_event = host._latest_reconcile_event(bot_id, prior_event_id)
             return (
-                self._reconcile_result_from_response(
+                host._reconcile_result_from_response(
                     before,
                     loaded_after,
                     response,
@@ -250,18 +248,20 @@ class _SupervisorReconcile(_SupervisorStop):
                 response,
             )
 
+    @staticmethod
     def _latest_reconcile_event(
-        self,
+        host: ReconcileHost,
         bot_id: str,
         prior_event_id: int | None,
     ) -> LifecycleEvent | None:
-        current_events = self.store.list_lifecycle_events(bot_id, limit=1, before=None)
+        current_events = host.store.list_lifecycle_events(bot_id, limit=1, before=None)
         if not current_events or current_events[0].event_id == prior_event_id:
             return None
         return current_events[0]
 
+    @staticmethod
     def _reconcile_result_from_response(
-        self,
+        host: ReconcileHost,
         before: BotRecord,
         after: BotRecord,
         response: BotStatusResponse,
@@ -269,7 +269,7 @@ class _SupervisorReconcile(_SupervisorStop):
         current_event: LifecycleEvent | None,
         started_at: datetime,
     ) -> BotReconcileResult:
-        outcome = self._reconcile_outcome(
+        outcome = host._reconcile_outcome(
             before,
             after,
             response,
@@ -347,8 +347,9 @@ class _SupervisorReconcile(_SupervisorStop):
             return ReconcileOutcome.changed
         return ReconcileOutcome.healthy
 
+    @staticmethod
     def _reconcile_record(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         now: datetime,
         *,
@@ -357,9 +358,9 @@ class _SupervisorReconcile(_SupervisorStop):
         context: _LifecycleContext,
     ) -> BotStatusResponse:
         if record.pending_operation_id is not None:
-            return self._recover_pending_intent(record, context=context, allow_launch=True)
+            return host._recover_pending_intent(record, context=context, allow_launch=True)
         if reset_restart:
-            self._update_restart(
+            host._update_restart(
                 context,
                 record.bot_id,
                 status=record.status,
@@ -371,12 +372,12 @@ class _SupervisorReconcile(_SupervisorStop):
             )
             record = replace(record, restart_attempts=0, next_restart_at=None)
 
-        pid_state = self._pid_state(record.pid) if record.pid else _PidState.dead
+        pid_state = host._pid_state(record.pid) if record.pid else _PidState.dead
         if record.pid and pid_state == _PidState.unknown:
-            return self._unknown_pid_response(record, "reconcile the gateway", context=context)
+            return host._unknown_pid_response(record, "reconcile the gateway", context=context)
         if record.pid and pid_state == _PidState.alive:
-            if not self._pid_owned(record.profile_path, record.pid, record.bot_id):
-                self._update_lifecycle(
+            if not host._pid_owned(record.profile_path, record.pid, record.bot_id):
+                host._update_lifecycle(
                     context,
                     record.bot_id,
                     BotStatus.failed,
@@ -391,7 +392,7 @@ class _SupervisorReconcile(_SupervisorStop):
                     profile_path=record.profile_path,
                     message="recorded gateway PID is alive but ownership could not be verified",
                 )
-            response = self._status_for_live_record(record, context=context)
+            response = host._status_for_live_record(record, context=context)
             return BotStatusResponse(
                 bot_id=record.bot_id,
                 status=response.status,
@@ -401,18 +402,18 @@ class _SupervisorReconcile(_SupervisorStop):
             )
 
         try:
-            with self._marker_publication_lock(record):
-                prepared = self._prepare_reconcile_dead_record_locked(
+            with host._marker_publication_lock(record):
+                prepared = host._prepare_reconcile_dead_record_locked(
                     record,
                     now,
                     force=force,
                     context=context,
                 )
         except (BotDeleteError, LaunchPayloadError) as exc:
-            return self._pending_action_required(record, str(exc))
+            return host._pending_action_required(record, str(exc))
         if isinstance(prepared, BotStatusResponse):
             return prepared
-        result = self._start_record(
+        result = host._start_record(
             prepared.record,
             reset_restart=False,
             message=(
@@ -423,7 +424,7 @@ class _SupervisorReconcile(_SupervisorStop):
             probe=prepared.probe,
         )
         if result.status == BotStatus.running:
-            self.store.append_audit_event(
+            host.store.append_audit_event(
                 "bot.reconcile.restart_started",
                 bot_id=record.bot_id,
                 pid=result.pid,
@@ -431,32 +432,33 @@ class _SupervisorReconcile(_SupervisorStop):
             )
         return result
 
+    @staticmethod
     def _prepare_reconcile_dead_record_locked(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         now: datetime,
         *,
         force: bool,
         context: _LifecycleContext,
     ) -> BotStatusResponse | _ReconcileLaunch:
-        marker = self._classify_existing_runtime_marker(record, expected_pid=record.pid)
+        marker = host._classify_existing_runtime_marker(record, expected_pid=record.pid)
         if marker.kind == "dead":
-            generation = self._gateway_generation(marker)
-            if generation is None or not self._remove_gateway_generation_marker_locked(
+            generation = host._gateway_generation(marker)
+            if generation is None or not host._remove_gateway_generation_marker_locked(
                 record, generation
             ):
-                return self._pending_action_required(
+                return host._pending_action_required(
                     record, "dead gateway marker cleanup could not be verified"
                 )
         elif marker.kind != "missing":
-            return self._pending_action_required(
+            return host._pending_action_required(
                 record,
                 marker.reason or "recorded gateway marker ownership is unresolved",
             )
 
         if record.desired_state is DesiredState.stopped:
             if record.status is not BotStatus.stopped or record.pid is not None:
-                self._update_lifecycle(
+                host._update_lifecycle(
                     context,
                     record.bot_id,
                     BotStatus.stopped,
@@ -473,7 +475,7 @@ class _SupervisorReconcile(_SupervisorStop):
             )
 
         if record.restart_policy != RestartPolicy.on_failure:
-            self._update_lifecycle(
+            host._update_lifecycle(
                 context,
                 record.bot_id,
                 BotStatus.failed,
@@ -495,7 +497,7 @@ class _SupervisorReconcile(_SupervisorStop):
             # Scheduling already counted the pending attempt; it must still run.
             completed_attempts = max(0, completed_attempts - 1)
         if completed_attempts >= record.restart_max_attempts:
-            self._update_restart(
+            host._update_restart(
                 context,
                 record.bot_id,
                 status=BotStatus.failed,
@@ -519,10 +521,10 @@ class _SupervisorReconcile(_SupervisorStop):
             )
 
         if record.next_restart_at is None and not force:
-            delay = self._restart_delay(record)
+            delay = host._restart_delay(record)
             next_restart_at = now + timedelta(seconds=delay)
             attempt = record.restart_attempts + 1
-            self._update_restart(
+            host._update_restart(
                 context,
                 record.bot_id,
                 status=BotStatus.failed,
@@ -532,7 +534,7 @@ class _SupervisorReconcile(_SupervisorStop):
                 action="bot.restart.schedule",
                 reason="restart scheduled by reconcile",
             )
-            self.store.append_audit_event(
+            host.store.append_audit_event(
                 "bot.reconcile.restart_scheduled",
                 bot_id=record.bot_id,
                 attempt=attempt,
@@ -565,7 +567,7 @@ class _SupervisorReconcile(_SupervisorStop):
         attempt = record.restart_attempts
         if record.next_restart_at is None or attempt == 0:
             attempt += 1
-        self._update_restart(
+        host._update_restart(
             context,
             record.bot_id,
             status=BotStatus.failed,
@@ -575,9 +577,9 @@ class _SupervisorReconcile(_SupervisorStop):
             action="bot.restart.attempt",
             reason="restart attempt started by reconcile",
         )
-        refreshed = self._require_bot(record.bot_id)
-        probe = self._preflight_start(refreshed, timeout_seconds=None)
-        refreshed = self.store.begin_lifecycle_intent(
+        refreshed = host._require_bot(record.bot_id)
+        probe = host._preflight_start(refreshed, timeout_seconds=None)
+        refreshed = host.store.begin_lifecycle_intent(
             record.bot_id,
             action="start",
             operation_id=context.operation_id,
@@ -596,15 +598,16 @@ class _SupervisorReconcile(_SupervisorStop):
     def _is_compat_runtime_marker(payload: dict[str, object]) -> bool:
         return is_compat_runtime_marker(payload)
 
+    @staticmethod
     def _recover_pending_intent(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
         allow_launch: bool,
     ) -> BotStatusResponse:
-        return self._intent_recovery.recover(
-            self,
+        return host._intent_recovery.recover(
+            host,
             record,
             context=context,
             allow_launch=allow_launch,
@@ -617,13 +620,14 @@ class _SupervisorReconcile(_SupervisorStop):
     ) -> _LifecycleContext:
         return _LifecycleContext(operation_id, context.source, context.request_id)
 
+    @staticmethod
     def _pending_launch_preflight(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         operation_id: str,
     ) -> tuple[ReadinessProbe | None, str]:
-        probe = self._preflight_start(record, timeout_seconds=None)
-        expected = self.adapter.launcher_payload(
+        probe = host._preflight_start(record, timeout_seconds=None)
+        expected = host.adapter.launcher_payload(
             record.bot_id,
             operation_id=operation_id,
             desired_revision=record.desired_revision,
@@ -634,25 +638,27 @@ class _SupervisorReconcile(_SupervisorStop):
             raise ValueError("invalid expected marker")
         return probe, str(marker_template["command_fingerprint"])
 
+    @staticmethod
     def _recover_pending_stop_intent(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse:
         try:
-            with self._marker_publication_lock(record):
-                return self._recover_pending_stop_intent_locked(
+            with host._marker_publication_lock(record):
+                return host._recover_pending_stop_intent_locked(
                     record,
                     context=context,
                     allow_stop=allow_stop,
                 )
         except (BotDeleteError, LaunchPayloadError) as exc:
-            return self._pending_action_required(record, str(exc))
+            return host._pending_action_required(record, str(exc))
 
+    @staticmethod
     def _recover_pending_launch(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
@@ -662,9 +668,9 @@ class _SupervisorReconcile(_SupervisorStop):
         allow_launch: bool,
     ) -> BotStatusResponse | None:
         try:
-            with self._marker_publication_lock(record):
-                return self._intent_recovery.recover_pending_launch_locked(
-                    self,
+            with host._marker_publication_lock(record):
+                return host._intent_recovery.recover_pending_launch_locked(
+                    host,
                     record,
                     context=context,
                     probe=probe,
@@ -673,97 +679,105 @@ class _SupervisorReconcile(_SupervisorStop):
                     allow_launch=allow_launch,
                 )
         except (BotDeleteError, LaunchPayloadError) as exc:
-            return self._pending_action_required(record, str(exc))
+            return host._pending_action_required(record, str(exc))
 
+    @staticmethod
     def _recover_pending_stop_intent_locked(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse:
-        return self._intent_recovery.recover_pending_stop_intent_locked(
-            self,
+        return host._intent_recovery.recover_pending_stop_intent_locked(
+            host,
             record,
             context=context,
             allow_stop=allow_stop,
         )
 
+    @staticmethod
     def _pending_restart_old_marker(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         observed: _MarkerObservation | None = None,
     ) -> _MarkerObservation | None:
-        return self._intent_recovery.pending_restart_old_marker(
-            self,
+        return host._intent_recovery.pending_restart_old_marker(
+            host,
             record,
             observed,
         )
 
+    @staticmethod
     def _recover_pending_restart_predecessor(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse | None:
         try:
-            with self._marker_publication_lock(record):
-                return self._intent_recovery.recover_pending_restart_predecessor_locked(
-                    self,
+            with host._marker_publication_lock(record):
+                return host._intent_recovery.recover_pending_restart_predecessor_locked(
+                    host,
                     record,
                     context=context,
                     allow_stop=allow_stop,
                 )
         except (BotDeleteError, LaunchPayloadError) as exc:
-            return self._pending_action_required(record, str(exc))
+            return host._pending_action_required(record, str(exc))
 
+    @staticmethod
     def _recover_pending_restart_old_gateway(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         marker: _MarkerObservation,
         *,
         context: _LifecycleContext,
         allow_stop: bool,
     ) -> BotStatusResponse:
-        return self._intent_recovery.recover_pending_restart_old_gateway(
-            self,
+        return host._intent_recovery.recover_pending_restart_old_gateway(
+            host,
             record,
             marker,
             context=context,
             allow_stop=allow_stop,
         )
 
+    @staticmethod
     def _stop_pending_restart_old_gateway(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         generation: _GatewayGeneration,
         *,
         context: _LifecycleContext,
     ) -> BotStatusResponse:
-        return self._intent_recovery.stop_pending_restart_old_gateway(
-            self,
+        return host._intent_recovery.stop_pending_restart_old_gateway(
+            host,
             record,
             generation,
             context=context,
         )
 
+    @staticmethod
     def _stop_gateway_generation_locked(
-        self,
+        host: ReconcileHost,
         record: BotRecord,
         generation: _GatewayGeneration,
     ) -> StopEffect:
-        return self._runtime.stop_generation_locked(
+        return host._runtime.stop_generation_locked(
             record,
             generation,
             kill_after_timeout=None,
-            classify_exact=self._classify_exact_gateway_generation,
-            remove_generation=self._remove_gateway_generation_marker_locked,
+            classify_exact=host._classify_exact_gateway_generation,
+            remove_generation=host._remove_gateway_generation_marker_locked,
         )
 
-    def _append_recovery_audit_event(self, action: str, **values: object) -> None:
-        self.store.append_audit_event(action, **values)
+    @staticmethod
+    def _append_recovery_audit_event(host: ReconcileHost, action: str, **values: object) -> None:
+        host.store.append_audit_event(action, **values)
 
-    def _restart_delay(self, record: BotRecord) -> float:
+    @staticmethod
+    def _restart_delay(host: ReconcileHost, record: BotRecord) -> float:
         delay = record.restart_backoff_seconds * (2**record.restart_attempts)
-        return float(min(delay, self.restart_backoff_cap_seconds))
+        return float(min(delay, host.restart_backoff_cap_seconds))

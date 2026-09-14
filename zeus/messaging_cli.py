@@ -7,12 +7,13 @@ import json
 import os
 import stat
 import sys
+from datetime import datetime
 from typing import Any
 
 from zeus.bot_messaging import MAX_INPUT_BYTES, BotMessaging, MessagingError
 from zeus.config import Settings
 from zeus.hermes_runs_client import HermesRunsClientError
-from zeus.message_store import MessageStoreError
+from zeus.message_store import MessageStore, MessageStoreError
 from zeus.state import StateReadinessError, StateStore
 from zeus.supervisor import Supervisor
 
@@ -20,12 +21,12 @@ from zeus.supervisor import Supervisor
 def add_messaging_parsers(sub: Any) -> None:
     messages = sub.add_parser("message", help="submit and inspect explicit operator jobs")
     actions = messages.add_subparsers(dest="action", required=True)
-    for action in ("send", "retry", "status", "cancel", "release", "list"):
+    for action in ("send", "retry", "status", "cancel", "release", "list", "capacity", "archive"):
         parser = actions.add_parser(action)
         if action == "send":
             parser.add_argument("bot_id")
             parser.add_argument("--request-key", help="optional stable key for this submission")
-        elif action != "list":
+        elif action not in {"list", "capacity", "archive"}:
             parser.add_argument("message_id")
         if action in {"send", "retry"}:
             parser.add_argument("--file", required=True, help="UTF-8 input file, or - for stdin")
@@ -35,6 +36,12 @@ def add_messaging_parsers(sub: Any) -> None:
                 action="store_true",
                 help="release the local busy blocker; the job may still run and is not cancelled",
             )
+        if action == "archive":
+            parser.add_argument(
+                "--before", help="exclusive timezone-aware ISO cutoff (default: 30 days ago)"
+            )
+            parser.add_argument("--limit", type=int, default=100, help="maximum receipts (1-500)")
+            parser.add_argument("--apply", action="store_true", help="apply logical archival")
         if action == "list":
             parser.add_argument("--bot-id")
             parser.add_argument("--before", help="cursor returned by the previous page")
@@ -65,33 +72,62 @@ def _read_input(path: str) -> str:
 def run_messaging_command(args: argparse.Namespace, settings: Settings) -> int:
     # Existing schema is required; commands do not initialize state, migrate,
     # reconcile, or start gateways as a side effect of sending a message.
-    workflow = BotMessaging(
-        Supervisor(StateStore(settings.database_path), settings.hermes_bin, settings.hermes_root)
-    )
     try:
-        if args.action == "send":
-            payload = workflow.send(
-                args.bot_id, _read_input(args.file), request_key=args.request_key
-            )
-        elif args.action == "retry":
-            payload = workflow.retry(args.message_id, _read_input(args.file))
-        elif args.action == "status":
-            payload = workflow.status(args.message_id)
-        elif args.action == "cancel":
-            payload = workflow.cancel(args.message_id)
-        elif args.action == "release":
-            payload = workflow.release(
-                args.message_id, acknowledge_unknown_outcome=args.acknowledge_unknown_outcome
+        if args.action == "capacity":
+            payload = MessageStore(settings.database_path).capacity()
+        elif args.action == "archive":
+            payload = MessageStore(settings.database_path).archive(
+                before=datetime.fromisoformat(args.before) if args.before is not None else None,
+                limit=args.limit,
+                apply=args.apply,
             )
         else:
-            payload = workflow.list(bot_id=args.bot_id, limit=args.limit, before=args.before)
+            workflow = BotMessaging(
+                Supervisor(
+                    StateStore(settings.database_path), settings.hermes_bin, settings.hermes_root
+                )
+            )
+            if args.action == "send":
+                payload = workflow.send(
+                    args.bot_id, _read_input(args.file), request_key=args.request_key
+                )
+            elif args.action == "retry":
+                payload = workflow.retry(args.message_id, _read_input(args.file))
+            elif args.action == "status":
+                payload = workflow.status(args.message_id)
+            elif args.action == "cancel":
+                payload = workflow.cancel(args.message_id)
+            elif args.action == "release":
+                payload = workflow.release(
+                    args.message_id,
+                    acknowledge_unknown_outcome=args.acknowledge_unknown_outcome,
+                )
+            else:
+                payload = workflow.list(bot_id=args.bot_id, limit=args.limit, before=args.before)
     except StateReadinessError:
         return _error("not_ready", args.as_json)
     except (MessagingError, MessageStoreError, HermesRunsClientError) as exc:
         return _error(exc.code, args.as_json)
     except (OSError, RuntimeError, ValueError):
         return _error("message_state_unavailable", args.as_json)
-    print(json.dumps(payload, sort_keys=True, indent=None if args.as_json else 2))
+    if args.action == "capacity" and not args.as_json:
+        for name in (
+            "status",
+            "used",
+            "limit",
+            "remaining",
+            "total",
+            "archived",
+            "blocking",
+            "database_bytes",
+            "wal_bytes",
+            "filesystem_free_bytes",
+        ):
+            print(f"{name}: {payload[name]}")
+    else:
+        print(json.dumps(payload, sort_keys=True, indent=None if args.as_json else 2))
+    if args.action == "capacity":
+        return 0
     return 1 if payload.get("dispatch_state") in {"unknown", "rejected", "prepared"} else 0
 
 

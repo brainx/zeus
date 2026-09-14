@@ -21,54 +21,47 @@ from zeus.models import (
     DesiredState,
     validate_id,
 )
-from zeus.supervisor_core import (
+from zeus.supervisor_contracts import (
     _LifecycleContext,
 )
-from zeus.supervisor_reconcile import _SupervisorReconcile
+from zeus.supervisor_status_host import StatusHost
 
-PidAliveFn = _process_identity.PidAliveFn
-CmdlineReader = _process_identity.CmdlineReader
-ProcStartFingerprintReader = _process_identity.ProcStartFingerprintReader
-
-_CommandCheck = _process_identity.CommandCheck
 _PidState = _process_identity.PidState
-_looks_like_python_interpreter = _process_identity.looks_like_python_interpreter
-_read_linux_cmdline = _process_identity.read_linux_cmdline
-_read_linux_process_start_fingerprint = _process_identity.read_linux_process_start_fingerprint
-_resolve_executable = _process_identity.resolve_executable
-_resolve_launcher_exec_target = _process_identity.resolve_launcher_exec_target
-_safe_command_shape = _process_identity.safe_command_shape
-_trusted_hermes_paths = _process_identity.trusted_hermes_paths
-_verify_gateway_command = _process_identity.verify_gateway_command
 
 
-class _SupervisorStatus(_SupervisorReconcile):
+class StatusOperations:
+    """Stateless status operations; callbacks are resolved from the current host."""
+
+    @staticmethod
     def status(
-        self,
+        host: StatusHost,
         bot_id: str,
         *,
         source: str = "cli",
         request_id: str | None = None,
     ) -> BotStatusResponse:
-        context = self._lifecycle_context(source, request_id)
+        context = host._lifecycle_context(source, request_id)
         # Reject unknown bots before allocating any lock state so that requests
         # for nonexistent ids cannot grow the in-memory lock table or the
         # on-disk lock directory.
         safe_bot_id = validate_id(bot_id, "bot_id")
-        self._require_bot(safe_bot_id)
-        with self.bot_lock(safe_bot_id), self._bot_process_lock(safe_bot_id):
-            return self._status_locked(safe_bot_id, context=context)
+        host._require_bot(safe_bot_id)
+        with host.bot_lock(safe_bot_id), host._bot_process_lock(safe_bot_id):
+            return host._status_locked(safe_bot_id, context=context)
 
-    def _status_locked(self, bot_id: str, *, context: _LifecycleContext) -> BotStatusResponse:
-        record = self._require_bot(bot_id)
+    @staticmethod
+    def _status_locked(
+        host: StatusHost, bot_id: str, *, context: _LifecycleContext
+    ) -> BotStatusResponse:
+        record = host._require_bot(bot_id)
         if record.pending_operation_id is not None:
-            return self._recover_pending_intent(record, context=context, allow_launch=False)
-        pid_state = self._pid_state(record.pid) if record.pid else _PidState.dead
+            return host._recover_pending_intent(record, context=context, allow_launch=False)
+        pid_state = host._pid_state(record.pid) if record.pid else _PidState.dead
         if record.pid and pid_state == _PidState.unknown:
-            return self._unknown_pid_response(record, "determine gateway status", context=context)
+            return host._unknown_pid_response(record, "determine gateway status", context=context)
         alive = bool(record.pid and pid_state == _PidState.alive)
-        if alive and record.pid and not self._pid_owned(record.profile_path, record.pid, bot_id):
-            self._update_lifecycle(
+        if alive and record.pid and not host._pid_owned(record.profile_path, record.pid, bot_id):
+            host._update_lifecycle(
                 context,
                 bot_id,
                 BotStatus.failed,
@@ -84,44 +77,45 @@ class _SupervisorStatus(_SupervisorReconcile):
                 message="recorded gateway PID is alive but ownership could not be verified",
             )
         if alive:
-            return self._status_for_live_record(record, context=context)
+            return host._status_for_live_record(record, context=context)
         try:
-            with self._marker_publication_lock(record):
-                return self._status_dead_record_locked(record, context=context)
+            with host._marker_publication_lock(record):
+                return host._status_dead_record_locked(record, context=context)
         except (BotDeleteError, LaunchPayloadError) as exc:
-            return self._pending_action_required(record, str(exc))
+            return host._pending_action_required(record, str(exc))
 
+    @staticmethod
     def _status_dead_record_locked(
-        self,
+        host: StatusHost,
         record: BotRecord,
         *,
         context: _LifecycleContext,
     ) -> BotStatusResponse:
-        observed = self._read_strict_runtime_marker(record.bot_id, record.profile_path)
+        observed = host._read_strict_runtime_marker(record.bot_id, record.profile_path)
         if observed.kind == "present" and observed.payload is not None:
             if record.pid is None:
-                return self._pending_action_required(
+                return host._pending_action_required(
                     record, "stale gateway marker PID is not recorded"
                 )
-            marker = self._classify_schema3_runtime_marker(
+            marker = host._classify_schema3_runtime_marker(
                 record,
                 observed.payload,
                 expected_pid=record.pid,
                 expected_revision=record.desired_revision,
                 require_live_command=True,
             )
-            generation = self._gateway_generation(marker)
+            generation = host._gateway_generation(marker)
             if (
                 marker.kind != "dead"
                 or generation is None
-                or not self._remove_gateway_generation_marker_locked(record, generation)
+                or not host._remove_gateway_generation_marker_locked(record, generation)
             ):
-                return self._pending_action_required(
+                return host._pending_action_required(
                     record,
                     marker.reason or "stale gateway marker ownership could not be verified",
                 )
         elif observed.kind != "missing":
-            return self._pending_action_required(
+            return host._pending_action_required(
                 record,
                 observed.reason or "stale gateway marker ownership could not be verified",
             )
@@ -132,7 +126,7 @@ class _SupervisorStatus(_SupervisorReconcile):
         if record.status in {BotStatus.starting, BotStatus.running}:
             last_error = "gateway process is not running"
         if record.status in {BotStatus.starting, BotStatus.running}:
-            self._update_lifecycle(
+            host._update_lifecycle(
                 context,
                 record.bot_id,
                 status,
@@ -142,7 +136,7 @@ class _SupervisorStatus(_SupervisorReconcile):
                 last_transition_reason="gateway process was not running",
             )
         elif record.pid is not None:
-            self._update_lifecycle(
+            host._update_lifecycle(
                 context,
                 record.bot_id,
                 status,
@@ -154,7 +148,7 @@ class _SupervisorStatus(_SupervisorReconcile):
         if record.desired_state is DesiredState.running:
             status = BotStatus.failed
             last_error = "desired running gateway is missing; action required: run reconcile"
-            self._update_lifecycle(
+            host._update_lifecycle(
                 context,
                 record.bot_id,
                 status,
@@ -177,22 +171,24 @@ class _SupervisorStatus(_SupervisorReconcile):
             message=message,
         )
 
-    def logs(self, bot_id: str, max_bytes: int = 20_000) -> str:
-        self._require_bot(bot_id)
-        with self.bot_lock(bot_id):
-            record = self._require_bot(bot_id)
-            return tail_file(self.log_path(record.profile_path), max_bytes=max_bytes)
+    @staticmethod
+    def logs(host: StatusHost, bot_id: str, max_bytes: int = 20_000) -> str:
+        host._require_bot(bot_id)
+        with host.bot_lock(bot_id):
+            record = host._require_bot(bot_id)
+            return tail_file(host.log_path(record.profile_path), max_bytes=max_bytes)
 
-    def inspect(self, bot_id: str, max_log_bytes: int = 20_000) -> dict[str, object]:
-        self._require_bot(bot_id)
-        with self.bot_lock(bot_id):
-            record = self._require_bot(bot_id)
+    @staticmethod
+    def inspect(host: StatusHost, bot_id: str, max_log_bytes: int = 20_000) -> dict[str, object]:
+        host._require_bot(bot_id)
+        with host.bot_lock(bot_id):
+            record = host._require_bot(bot_id)
             profile_path = Path(record.profile_path)
-            marker = self._read_pid_marker(record.profile_path)
+            marker = host._read_pid_marker(record.profile_path)
             ownership = OwnershipCheck(False, "not-running")
-            pid_state = self._pid_state(record.pid) if record.pid else _PidState.dead
+            pid_state = host._pid_state(record.pid) if record.pid else _PidState.dead
             if record.pid and pid_state == _PidState.alive:
-                ownership = self._verify_gateway_pid_ownership(
+                ownership = host._verify_gateway_pid_ownership(
                     record.profile_path, record.pid, bot_id
                 )
             elif record.pid and pid_state == _PidState.unknown:
@@ -228,6 +224,6 @@ class _SupervisorStatus(_SupervisorReconcile):
                     },
                 },
                 "recent_logs": tail_file(
-                    self.log_path(record.profile_path), max_bytes=max_log_bytes
+                    host.log_path(record.profile_path), max_bytes=max_log_bytes
                 ),
             }
