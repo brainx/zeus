@@ -1,85 +1,44 @@
 <p align="center">
-  <img src="docs/assets/zeus-hero.png" alt="Zeus: many Hermes bots, one local supervisor" width="900">
+  <img src="docs/assets/zeus-banner.jpg" alt="Zeus: many Hermes bots, one local supervisor" width="960">
 </p>
 
 # Zeus Hermes Orchestrator
 
-Many Hermes bots, one local supervisor.
+**Many Hermes bots, one local supervisor.**
 
 [![CI](https://github.com/brainx/zeus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/brainx/zeus/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/brainx/zeus?include_prereleases&sort=semver)](https://github.com/brainx/zeus/releases)
-[![Package Build](https://img.shields.io/badge/package-build%20checked-brightgreen)](.github/workflows/ci.yml)
-[![Security Policy](https://img.shields.io/badge/security-policy-informational)](SECURITY.md)
 
-Zeus is an independent orchestration layer for running many
-[Hermes Agent](https://hermes-agent.nousresearch.com/) bots from reusable
-templates. Hermes Agent is developed by
-[Nous Research](https://nousresearch.com/). Zeus renders each bot as an
-isolated Hermes profile under `.zeus/`, starts and stops gateway processes,
-tracks PID ownership, and exposes a small loopback CLI/API for operators.
+[Quick start](#quick-start) · [Documentation](#documentation) · [API](docs/API.md) · [Roadmap](docs/ROADMAP.md) · [Security Policy](SECURITY.md)
+
+Zeus is an independent orchestration layer for running multiple
+[Hermes Agent](https://hermes-agent.nousresearch.com/) bots on one machine.
+Create isolated profiles from templates, manage gateway processes, and inspect
+what happened through durable job receipts and lifecycle history.
+Hermes Agent, developed by [Nous Research](https://nousresearch.com/), runs the agents.
+Zeus manages their local operation.
+
+**Status: alpha.** Python 3.11+; no required third-party Python runtime dependencies.
+The offline demo needs no Hermes installation, Docker, or provider credentials.
+For real bots, use the tested Hermes baseline and platform guidance in the
+[compatibility policy](docs/COMPATIBILITY.md). Pin versions for automation.
 
 ## Why Zeus
 
-- Run multiple Hermes bots from one workspace without hand-copying profile directories.
-- Stamp out repeatable bot shapes from TOML templates: coding, research,
-  support, DeepSeek, Kimi K3, and custom profiles.
-- Keep secrets out of templates by rendering per-profile `.env` files that stay ignored by git.
-- Supervise gateway processes with ownership markers before stop/status actions trust a PID.
-- Account for Hermes async delegation with explicit `max_async_children` caps in every built-in template.
-- Verify locally, against a real Hermes install, or on a clean Debian/Ubuntu VPS using included scripts.
-
-## How It Works
-
-```mermaid
-flowchart LR
-  T["templates/*.toml"] --> Z["Zeus renderer"]
-  Z --> P[".zeus/hermes/profiles/<bot-id>"]
-  P --> H["hermes -p <bot-id> gateway run"]
-  Z --> S["SQLite bot registry"]
-  S --> C["CLI and loopback API"]
-  C --> H
-```
-
-Each rendered profile contains `config.yaml`, `.env`, `SOUL.md`, `mcp.json`, `cron/jobs.json`, and logs. Hermes remains the agent runtime; Zeus owns profile generation, local orchestration, lifecycle checks, and handoff verification.
-
-## Zeus and Olymp
-
-Zeus owns host-local Hermes profiles, processes, lifecycle safety, and reconciliation evidence.
-[Olymp](https://github.com/brainx/olymp) is the separate BrainX control-plane project for
-cross-host coordination, rollout policy, and approvals. Zeus deliberately does not make
-cluster-wide placement or rollout decisions; Olymp can consume Zeus' local API and persisted
-run summaries at that boundary.
-
-## Operator Evidence
-
-Explicit operator jobs are available through `zeus message send/retry/status/cancel/release/list`.
-The opt-in `message-bot` template sets finite turn and API concurrency limits;
-durable receipts support recovery from uncertain submissions. See
-[operator messaging](docs/MESSAGING.md) for setup, retries and permission boundaries.
-
-Inspect previous reconciliation work without starting another pass:
-
-```bash
-zeus reconcile list --limit 20
-zeus reconcile show <run-id> --limit 20 --json
-zeus fleet status --attention-only --json
-```
-
-The fleet view reports stored state, restart budget, pending intent, and the age
-of the latest persisted reconciliation observation. It performs no live health
-probe. Pages contain at most 100 rows; use the returned cursor for the next page.
-The matching authenticated routes are `GET /reconcile/runs`,
-`GET /reconcile/runs/<run-id>`, and `GET /fleet`. See [API](docs/API.md) and
-[reconciliation](docs/RECONCILE.md) for filters and freshness semantics.
+| What you need | What Zeus provides |
+| --- | --- |
+| Several bots with different roles | Reusable TOML templates and separate Hermes profiles for coding, research, support, and custom work. |
+| Predictable local operations | Start, stop, restart, and reconcile gateways with process-ownership checks, lifecycle locks, and bounded recovery. |
+| A record of what happened | Durable job receipts, lifecycle history, reconciliation results, and fleet views with observation age and attention reasons. |
+| Evidence for repository reviews | Opt-in audits of committed source, with stored reports and a local evidence-based release gate. |
 
 ## Quick Start
 
 ### 1. Credential-free offline demo
 
-The fastest first success needs no Hermes installation, Docker, or provider
-credentials. From a checkout:
+From a checkout, install Zeus and try its local lifecycle:
 
 ```bash
 python3 -m venv .venv
@@ -91,28 +50,27 @@ zeus demo status
 zeus demo down
 ```
 
-The demo uses Zeus' packaged fake-Hermes executable and stores its disposable
-runtime under `ZEUS_STATE_DIR` (the workspace-local `.zeus/` directory by
-default). It exercises real profile rendering and process lifecycle behavior
-without contacting a provider.
+This uses the packaged fake-Hermes executable to exercise real profile rendering
+and process management. It performs no AI tasks and contacts no provider.
+`demo down` stops the demo bot; its local state remains under `ZEUS_STATE_DIR`
+(workspace-local `.zeus/` by default).
 
 ### 2. Real Hermes setup
 
-Check the installed Hermes version, then prepare a private workspace secret
-file:
+Install the supported Hermes runtime following the
+[compatibility guide](docs/COMPATIBILITY.md), then prepare a private secret file:
 
 ```bash
 hermes --version
-cp .env.example .env
+if [ ! -e .env ] && [ ! -L .env ]; then
+  cp .env.example .env
+fi
 chmod 0600 .env
 ```
 
-`.env.example` contains empty placeholders and is not ready to import. Stop here
-until `.env` contains a real, non-empty provider key required by the selected
-template, such as `OPENROUTER_API_KEY` for `coding-bot`. As an alternative,
-provide the same named secret through a secure process-environment mechanism.
-
-Then validate Zeus and render the real Hermes profile:
+Add a real, non-empty provider key to `.env` before continuing. The `coding-bot`
+template requires `OPENROUTER_API_KEY`; `.env.example` contains empty placeholders.
+You can also supply the named secret through the process environment.
 
 ```bash
 zeus doctor
@@ -121,552 +79,208 @@ zeus bot create coder --template coding-bot --env-from OPENROUTER_API_KEY
 zeus bot doctor coder
 ```
 
-`--env-from NAME` imports a named value from the process environment first and
-then the trusted workspace `./.env`; the value never enters the Zeus argument
-list or command output. A present but empty process value is an error and does
-not fall back to `.env`. Keep the workspace `.env` private with `chmod 0600 .env`.
-The legacy `--env NAME=VALUE` form remains available
-for non-secret compatibility values, but is unsafe for secrets because command
-arguments can be retained in shell history and exposed in process listings.
+This prepares a profile. Configure a Hermes messaging platform before starting
+its gateway, or follow the opt-in [operator messaging setup](docs/MESSAGING.md)
+to submit explicit jobs. The [real Hermes verification guide](docs/REAL_HERMES_VERIFICATION.md)
+also covers an isolated loopback gateway check.
 
-Safety model: Zeus is a local process orchestrator, not a sandbox. Use Docker or
-another Hermes terminal backend for untrusted tasks. Do not expose the API
-directly to a network; keep it on loopback or behind a separately hardened
-access layer. Logs and audit events may contain sensitive operational data, so
-protect and rotate `$ZEUS_STATE_DIR`.
+`--env-from` imports the named value from the process environment, then the
+trusted workspace `.env`, without putting the secret in command arguments.
+A present but empty environment value is an error. Keep `.env` private and
+excluded from Git. Read the [operations guide](docs/OPERATIONS.md) before
+running bots unattended.
 
-Start the local API with an explicit key:
+## How It Works
 
-```bash
-ZEUS_API_KEY=change-me sh scripts/start.sh
+```mermaid
+flowchart LR
+  T["TOML templates"] --> P["Separate Hermes profiles"]
+  Z["Zeus supervisor"] --> P
+  Z --> H["Hermes gateway per bot"]
+  P --> H
+  Z --> S["SQLite lifecycle and job evidence"]
+  S --> O["Operator CLI and local API"]
 ```
 
-## 60-Second Demo
+Profiles live under `.zeus/hermes/profiles/<bot-id>/` and contain `config.yaml`,
+`.env`, `SOUL.md`, `mcp.json`, and `cron/jobs.json`, with logs alongside them.
+Hermes owns agent execution and tools. Zeus owns profile generation, gateway
+lifecycle, and local operational evidence.
 
-The pre-recorded asciinema cast in [docs/assets/demo.cast](docs/assets/demo.cast)
-illustrates the local operator flow. It is not evidence that the current Zeus
-checkout is compatible with whichever Hermes version is installed today; use
-the live verification steps below for that evidence.
+Bundled templates and workspace `templates/*.toml` are loaded together.
+Custom template IDs must be unique; exact mirrors of bundled templates are
+accepted in source checkouts. Built-ins cover OpenRouter-backed bots,
+`deepseek-coding-bot`, `kimi-k3-coding-bot`, and an opt-in `message-bot`.
+See [template authoring](docs/TEMPLATE_AUTHORING.md) for providers, secret imports,
+and bounded async delegation.
+
+## Everyday Operations
+
+For a configured bot named `coder`:
+
+| Task | Command |
+| --- | --- |
+| Check its recorded and observed state | `zeus bot status coder` |
+| Read recent logs | `zeus bot logs coder` |
+| Inspect its lifecycle history | `zeus bot history coder --limit 50` |
+| Request a live health observation | `zeus bot diagnostics coder --json` |
+| Restart the gateway | `zeus bot restart coder` |
+| Apply its configured recovery policy | `zeus bot reconcile coder` |
+| Find bots needing attention | `zeus fleet status --attention-only --json` |
+
+Live diagnostics require a launch-recorded loopback Hermes API and its private
+key. See [gateway diagnostics](docs/OPERATIONS.md#live-gateway-diagnostics).
+Bot JSON exposes `desired_state` and `converged`; a started process is not
+automatically proof that a bot task will succeed.
+
+## Operator Evidence
+
+Explicit jobs use `zeus message send/retry/status/cancel/release/list/capacity/archive`.
+The opt-in `message-bot` template sets finite turn and concurrency limits.
+Durable receipts preserve submission intent and help operators resolve uncertain
+outcomes. Follow the [messaging guide](docs/MESSAGING.md) for setup, capacity,
+retries, cancellation, and receipt retention.
+
+Read existing reconciliation evidence without starting another pass:
 
 ```bash
-zeus doctor
-zeus template list
-zeus bot create coder --template coding-bot
-zeus bot start coder
-zeus bot status coder
-zeus bot logs coder
-zeus bot stop coder
+zeus reconcile list --limit 20
+zeus reconcile show <run-id> --limit 20 --json
+zeus fleet status --attention-only --json
 ```
+
+Fleet observations describe persisted reconciliation evidence, with timestamps
+and freshness labels. They perform no live health probe. Results are paginated;
+use the returned cursor to continue. See [reconciliation](docs/RECONCILE.md).
+
+## Zeus and Olymp
+
+| Project | Responsibility |
+| --- | --- |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Agent runtime, tools, conversations, and delegation. |
+| **Zeus** | Profiles, owned gateway processes, recovery, and evidence on one host. |
+| [Olymp](https://github.com/brainx/olymp) | Separate cross-host coordination, rollout policy, and approvals. |
+
+Zeus exposes a local JSON API that dashboard backends and Olymp can consume.
+Keep credentials in the backend, and check version compatibility before enabling
+controls. See the [roadmap](docs/ROADMAP.md) for planned work and project scope;
+this repository does not ship a web dashboard.
+
+## API
+
+Provide `ZEUS_API_KEY` through your private service environment, then start:
+
+```bash
+sh scripts/start.sh
+```
+
+The default address is `127.0.0.1:4311`. All non-health endpoints require
+`x-zeus-api-key` by default. The local-development unauthenticated-read option
+does not unlock sensitive diagnostics or mutations.
+
+| Surface | Examples |
+| --- | --- |
+| Health and readiness | `GET /health`, `GET /ready` |
+| Inventory and templates | `GET /bots`, `GET /templates` |
+| Persisted monitoring | `GET /fleet`, `GET /reconcile/runs`, `GET /reconcile/runs/<run-id>` |
+| Bot evidence | `GET /bots/<bot-id>/history`, `GET /bots/<bot-id>/diagnostics` |
+| Lifecycle controls | Create, start, stop, restart, and reconcile bots. |
+
+Routes also accept `/v1`. Mutations support an optional durable `Idempotency-Key`;
+unresolved prior attempts return `idempotency_indeterminate` instead of being
+silently repeated. This guarantee is local and retention-bounded.
+Monitoring clients should use persisted evidence: the bot `status` endpoint
+can recover pending lifecycle state and is not a side-effect-free read.
+
+See the [API reference](docs/API.md) and [OpenAPI contract](docs/openapi.json)
+for authentication, pagination, timeouts, errors, and retry behavior.
 
 ## Repository Audit
 
-`zeus audit` is a report-only, host-local review of the exact committed `HEAD`.
-It never reads dirty or untracked worktree content, and it does not edit,
-remediate, commit, push, schedule, deploy, notify, or coordinate across hosts.
-Cross-host policy remains outside Zeus.
+`zeus audit` reviews the exact committed `HEAD` and stores private reports.
+It does not inspect dirty or untracked worktree content, edit source, or deploy
+changes. Cross-host scheduling and policy remain outside Zeus.
 
-All six audit commands first discover the containing Git repository and its
-Zeus state context.
+### Initialize
 
-### Initialize Kimi K3
-
-Select Kimi K3 for repository audits with an explicit initialization step:
-
-```bash
-zeus audit init
-```
-
-Initialization writes a private schema-v1 configuration containing provider
-`kimi-coding`, model `kimi-k3`, and the environment name `KIMI_API_KEY`. It
-stores no credential value, makes no provider request, creates no audit run,
-and refuses to replace an existing configuration. A missing configuration
-remains unconfigured until this command is run.
+`zeus audit init` creates the private Kimi K3 configuration without storing a
+credential or contacting a provider. An existing configuration is never replaced.
 
 ### Check readiness
-
-Run the non-mutating readiness preflight:
 
 ```bash
 zeus audit doctor
 ```
 
-`audit doctor` reports whether Docker, the exact Hermes Agent 0.21.0 executable,
-configured provider credentials, and the preloaded digest-qualified image are
-ready. It also discloses the configured provider and model, creates no run, and
-downloads nothing.
+This non-mutating preflight checks Docker, Hermes Agent 0.21.0, provider credentials,
+and a preloaded digest-qualified image. It creates no run and downloads nothing.
 
 ### Run an audit
-
-Only `audit run` requires those runtime prerequisites. Zeus never pulls the
-image. The `audit init` command creates the standard Kimi K3 selection at
-`$ZEUS_STATE_DIR/audit/config.json`. Operators can edit that private file to
-select another explicit lowercase Hermes provider and model or add permitted
-endpoint and account metadata environment names. For a compatible Kimi K3
-endpoint, add `KIMI_BASE_URL` alongside `KIMI_API_KEY` in `provider_env`.
-
-The state directory must be outside the worktree or ignored by `.gitignore`
-policy loaded from the exact committed `HEAD`; global excludes and
-`.git/info/exclude` do not qualify. Every named variable must have a non-empty
-value in the invoking
-environment.
 
 ```bash
 zeus audit run
 ```
 
-An audit sends
-the prompt, selected committed-source excerpts, and bounded terminal output to
-that provider; it does not claim provider-side retention or network isolation.
-Repository commands run only in prevalidated Docker containers with network
-disabled: a writable primary container for ordinary calls and a read-only
-trusted-snapshot container for configured coverage commands. Hermes remains a
-host process for the selected provider.
-Configured snapshot exclusions and unresolved external content are listed in
-the report; `completed` means complete within that selected scope.
-
-Schema-v2 reports add an authoritative inventory of the committed snapshot,
-explicit security-control coverage, source-blob SHA-256 digests, stable finding
-fingerprints, and terminal receipts bound to the target commit and snapshot.
-Schema-v2 metadata also declares the versioned Zeus-owned
-`isolated-read-only-snapshot-v1` execution boundary used to create trusted
-receipts.
-
-Receipts contain an opaque keyed command tag, result metadata, and byte counts;
-every tag binds the run, commit, snapshot, image, sequence, exact command
-digest, and result metadata without storing raw commands or command output.
-Isolated trusted-receipt tags additionally bind the versioned execution
-boundary. Security coverage can cite only operator-configured commands whose
-exact invocation and control mapping Zeus verifies against an isolated receipt.
-Zeus runs those commands in a separately pre-created container over a read-only,
-in-container-attested committed snapshot, force-resets the container before
-accepting the receipt, and permits writable caches/output only under `/tmp`.
-Ad-hoc model commands remain forensic evidence only. The fixed
-scanner-adapter registry is a non-executable integration seam. Zeus does not
-yet bundle or run deterministic SAST or dependency-advisory engines.
-
-`audit run` prints status, run ID, target commit, severity counts, and the
-relative Markdown-report path; completed is the only successful audit status.
+Audits require those prerequisites and may send selected committed-source excerpts
+and bounded terminal output to the configured model provider. Repository commands
+run in validated Docker containers with networking disabled; the host Hermes
+process still contacts the provider. The private configuration can select another
+explicit lowercase Hermes provider and model. Review the
+[audit configuration and trust boundaries](docs/AUDIT.md) before running.
 
 ### Read stored reports
 
 ```bash
 zeus audit list
 zeus audit show <run-id>
-```
-
-`audit list` and `audit show` read existing private reports in the discovered
-repository and state context. They do not invoke Docker, Hermes, provider
-credential, or image readiness checks. Reports are stored as `report.json` and
-`report.md` under `$ZEUS_STATE_DIR/audits/<run-id>/`. See
-[the audit contract](docs/AUDIT.md) for configuration, ceilings, cleanup, and
-compatibility constraints.
-
-### Apply the local release gate
-
-```bash
 zeus audit gate <run-id>
-zeus audit gate <run-id> --json
 ```
 
-The deterministic `release-v1` policy reads an existing report and fails closed
-unless it is a completed, complete schema-v2 report with an authoritative
-surface using the current control catalog and audit skill, a matching repository
-and current commit, the current trusted-receipt execution boundary, no skipped
-committed content, one valid trusted coverage record for every required
-control, no skipped, unsupported, or not-applicable
-required controls, and no critical or high findings. The state directory must
-also remain outside the repository or ignored and untracked. The command does
-not rerun the audit or invoke Docker, Hermes, provider credentials, or the
-configured image. It exits zero only when the policy passes. Legacy schema-v1
-reports remain readable by `audit list` and `audit show`, but cannot pass this
-gate because they do not contain the v2 evidence contract.
-
-The default `audit init` configuration authorizes no security check commands,
-so it cannot pass `release-v1` by itself. Add structured private
-`suggested_commands` entries with exact `argv` and explicit `control_ids` for
-the controls your chosen tools enforce; generic tests and ad-hoc model commands
-do not count as security coverage. Commands carrying `control_ids` run with the
-committed snapshot read-only; configure those tools to place caches and build
-output under `/tmp`.
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md)
-- [API reference](docs/API.md)
-- [Template authoring](docs/TEMPLATE_AUTHORING.md)
-- [Real Hermes verification](docs/REAL_HERMES_VERIFICATION.md)
-- [Fresh VPS test](docs/FRESH_VPS_TEST.md)
-- [Systemd deployment](docs/SYSTEMD.md)
-- [Operations](docs/OPERATIONS.md)
-- [Reconcile scheduling](docs/RECONCILE.md)
-- [Release process](docs/RELEASE.md)
-- [Compatibility policy](docs/COMPATIBILITY.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Contributing](CONTRIBUTING.md)
-- [Code of conduct](CODE_OF_CONDUCT.md)
-- [Credits](CREDITS.md)
-- [Security policy](SECURITY.md)
-
-Zeus is maintained by [BrainX](https://github.com/brainx). See
-[Credits and Acknowledgements](CREDITS.md) for project ownership, upstream
-attribution, and official Hermes Agent and Nous Research links.
-
-## Requirements
-
-- Python 3.11 or newer
-- Hermes Agent installed as `hermes` for real bot startup
-- Optional Docker or another Hermes terminal backend for stronger execution isolation
-
-Zeus has no required third-party Python runtime dependencies. Development and
-build tools are available separately through the optional `dev` dependency
-group; see [Contributing](CONTRIBUTING.md). The exact automated platform and
-Python matrix is recorded in the [compatibility policy](docs/COMPATIBILITY.md).
-
-## Install Modes
-
-Zeus can run from a git checkout or from a built wheel.
-
-- Git checkout: templates are loaded from `templates/*.toml` first.
-- Installed package: bundled templates are loaded from `zeus.bundled_templates` when no local template directory is present.
-- Custom operators can supply their own `templates/` directory in the active workspace.
-
-## Commands
-
-```bash
-zeus doctor
-zeus demo up
-zeus demo status
-zeus demo down
-zeus template list
-zeus template list --json
-zeus bot create coder --template coding-bot
-zeus bot create coder --template coding-bot --replace
-zeus bot create coder --template coding-bot --replace --stop
-zeus bot create coder-json --template coding-bot --json
-zeus bot doctor coder
-zeus bot start coder
-zeus bot status coder
-zeus bot history coder --limit 50
-zeus bot inspect coder --json
-zeus bot diagnostics coder --json
-zeus bot logs coder
-zeus bot logs coder --json
-zeus bot reconcile coder
-zeus bot reconcile --json
-zeus bot reconcile --summary --json
-zeus bot restart coder
-zeus bot stop coder
-zeus bot archive coder
-zeus bot delete coder --remove-profile
-```
-
-Live diagnostics require a launch-recorded loopback Hermes API and its private
-API key; see [live gateway diagnostics](docs/OPERATIONS.md#live-gateway-diagnostics).
-They report a fresh health observation without changing bot lifecycle state.
-
-Deleting a registry entry without `--remove-profile` intentionally leaves its profile
-on disk. Re-creating that bot ID then requires `--replace`. Replacement regenerates
-Zeus-managed files while preserving logs and other unmanaged profile content.
-
-## Verification
-
-Run the local checks:
-
-```bash
-make check
-sh scripts/wheel_smoke.sh
-```
-
-`make check` includes tests, production-source branch coverage, repository
-contracts, formatting, lint, strict typing, and Bandit.
-
-Run deployment-style diagnostics:
-
-```bash
-zeus doctor --strict
-```
-
-Strict mode requires a real `hermes` executable on `PATH`.
-
-When Hermes is installed, run the real-Hermes compatibility check:
-
-```bash
-sh scripts/verify_real_hermes.sh
-```
-
-That script creates an isolated `.zeus-real-hermes-check/` runtime, renders a bot profile, runs `hermes -p <bot> doctor`, and verifies the generated profile contains the async delegation cap. It does not start a gateway by default. To exercise `hermes gateway run`, set:
-
-```bash
-ZEUS_VERIFY_START_GATEWAY=1 sh scripts/verify_real_hermes.sh
-```
-
-The gateway check enables Hermes' local `api_server` platform on loopback,
-passes an isolated local API key, starts with readiness waiting, verifies process
-ownership, probes `/health`, and then stops the bot. Committed CI runs this flow
-without provider credentials against the fully hash-locked Hermes Agent 0.21.0
-source-release environment documented in the compatibility policy.
-
-For a clean Debian/Ubuntu host, use the fresh VPS harness:
-
-```bash
-ZEUS_VPS_HERMES_INSTALLER_SHA256='<64-hex SHA-256 of the reviewed installer>' \
-ZEUS_VPS_INSTALL_PACKAGES=1 ZEUS_VPS_INSTALL_HERMES=1 \
-bash scripts/fresh_vps_verify.sh
-```
-
-See [Fresh VPS test](docs/FRESH_VPS_TEST.md) for gateway and async-delegation probes.
-
-## API
-
-```bash
-ZEUS_API_KEY=change-me sh scripts/start.sh
-```
-
-The API binds to `127.0.0.1:4311` by default. Every endpoint except `GET /health`
-requires `x-zeus-api-key`. If `ZEUS_API_KEY` is not configured, non-health endpoints
-reject requests instead of running anonymously. For local-only development, set
-`ZEUS_ALLOW_UNAUTH_READS=1` to allow unauthenticated low-risk `GET` endpoints while
-keeping mutations locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose
-runtime state or logs, including bot logs and inspection, still require the API key.
-Non-loopback binds are rejected unless a key of at least 16 characters is configured,
-and `ZEUS_ALLOW_UNAUTH_READS` is never accepted on a non-loopback bind. Put any
-external access behind a TLS-terminating reverse proxy and firewall.
-
-The OpenAPI contract is published at [docs/openapi.json](docs/openapi.json).
-Routes accept an optional `/v1` prefix; for example, `/bots` and `/v1/bots`
-address the same endpoint.
-Recognized mutating `POST` routes accept an optional `Idempotency-Key` matching
-`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`. Repeating the same key and canonical
-request replays the stored status and JSON with `Idempotency-Replayed: true`;
-using the key for different input returns `409`. Active duplicates return
-`idempotency_in_progress`, and unresolved work from an earlier process returns
-`idempotency_indeterminate` rather than executing again. Storage or capacity
-failure before execution returns `503`. The guarantee is local and limited to
-the configured retention window (default 86400 seconds and 10000 records;
-supported ranges are 60-604800 seconds and 100-1000000 records). Requests
-without the header retain their existing behavior.
-Two process-local token buckets bound invalid authentication attempts and
-authenticated mutations. They reset when the API restarts, are shared by `/v1`
-aliases, and intentionally ignore client and forwarded addresses. Valid credentials
-always bypass exhausted invalid-auth capacity. Rate-limited requests return `429`
-with an integer `Retry-After`.
-API errors return an `error.code`, `error.message`, and `error.status` object.
-Every Zeus-generated response also includes a locally generated `X-Request-ID`
-header for correlation. Zeus does not trust a caller-supplied request ID.
-
-Useful endpoints:
-
-- `GET /health`
-- `GET /doctor`
-- `GET /templates`
-- `GET /bots`
-- `GET /bots/<bot-id>/status`
-- `GET /bots/<bot-id>/history?limit=50&before=<event-id>`
-- `GET /bots/<bot-id>/logs`
-- `GET /bots/<bot-id>/inspect`
-- `POST /bots`
-- `POST /bots?replace=1&stop=1`
-- `POST /bots/<bot-id>/start`
-- `POST /bots/<bot-id>/reconcile`
-- `POST /bots/reconcile`
-- `POST /bots/reconcile?summary=1`
-- `POST /bots/<bot-id>/restart`
-- `POST /bots/<bot-id>/stop`
-
-`POST /bots/<bot-id>/start?wait=1&timeout=30` waits for the Hermes local
-gateway `/health` endpoint when the rendered profile enables `API_SERVER_ENABLED=1`
-and provides `API_SERVER_PORT`. Without `wait=1`, Zeus reports `starting` while
-readiness is pending and `zeus bot status <bot-id>` or `GET /bots/<bot-id>/status`
-promotes the bot to `running` after one successful readiness probe.
-
-Use `zeus bot history <bot-id> [--limit 50] [--before <event-id>] [--json]`
-to inspect the authoritative lifecycle ledger. History is newest first, remains
-available after a bot is deleted or archived, and uses an exclusive event-ID
-cursor for pagination. The matching API endpoint always requires
-`x-zeus-api-key`, including when `ZEUS_ALLOW_UNAUTH_READS=1`.
-
-## Templates
-
-Templates live in `templates/*.toml`. They render Hermes `config.yaml`, `.env`, `SOUL.md`, `mcp.json`, and `cron/jobs.json` files under `.zeus/hermes/profiles/<bot-id>/`.
-Zeus loads bundled templates plus local templates, so adding a local custom
-template does not hide built-ins such as `coding-bot`. Duplicate local IDs are
-rejected unless the file is an exact mirror copy of a bundled template in the
-source tree.
-Rendered `.env` values are serialized with quoting when needed so whitespace, `#`,
-quotes, and backslashes cannot create extra assignments.
-
-Import template secrets by name instead of placing their values in argv:
-
-```bash
-zeus bot create coder \
-  --template coding-bot \
-  --env-from OPENROUTER_API_KEY
-```
-
-Zeus looks for each imported name in the process environment and then the
-trusted workspace `./.env`. Process values take precedence. Missing and empty
-values fail bot creation without printing the value. Keep `./.env` mode `0600`;
-Zeus also writes the imported values only to the selected profile's mode-`0600`
-`.env` file.
-
-Built-in templates include OpenRouter-backed bots, `deepseek-coding-bot`, and
-`kimi-k3-coding-bot`. The Kimi template uses Hermes provider `kimi-coding` and
-model `kimi-k3`:
-
-```bash
-zeus bot create kimi-coder \
-  --template kimi-k3-coding-bot \
-  --env-from KIMI_API_KEY
-```
-
-Without `KIMI_BASE_URL`, Hermes uses Moonshot's international Open Platform
-default at `https://api.moonshot.ai/v1`. A vendor exposing an
-OpenAI-compatible Kimi K3 endpoint with model ID `kimi-k3` can be selected
-explicitly:
-
-```bash
-zeus bot create kimi-coder \
-  --template kimi-k3-coding-bot \
-  --env-from KIMI_API_KEY \
-  --env-from KIMI_BASE_URL
-```
-
-The template does not use Kimi Code subscription credentials or its `k3`
-subscription alias. Example templates also cover gateway operations, log
-triage, and documentation writing.
-
-Each template should set a bounded async delegation cap:
-
-```toml
-[hermes.delegation]
-max_async_children = 3
-max_concurrent_children = 3
-child_timeout_seconds = 0
-```
-
-Hermes `delegate_task(background=true)` runs child agents in the background and reinjects results into the originating conversation. Zeus configures capacity and supervises the gateway process; it does not poll Hermes background subagents directly.
-
-## Operational Checks
-
-Run:
-
-```bash
-zeus doctor
-zeus doctor --json
-zeus doctor --strict
-```
-
-The doctor validates Python support, Hermes binary availability, template validity,
-whether the actual workspace-local `ZEUS_STATE_DIR` is ignored by git, state-directory
-permissions, script executability, API bind safety, and rendered bot profile files.
-Missing Hermes is reported as a warning in normal mode because templates and profile
-generation can still be developed without a local Hermes install. Use `--strict` for
-deployment gates where warnings should fail the command.
-
-## Process Safety
-
-When Zeus starts a gateway, it writes a PID ownership marker under the bot profile
-logs directory using an atomic write with restrictive file permissions. Lifecycle
-operations take a per-bot file lock under `ZEUS_STATE_DIR/locks/bots/`, so separate
-CLI/API processes cannot start, stop, restart, reconcile, or status-mutate the
-same bot concurrently. Tune this with `ZEUS_LOCK_TIMEOUT_SECONDS`.
-
-Before a start, stop, or restart effect, schema v5 commits the desired state and
-pending operation. A descriptor-only launcher receives the private payload,
-atomically writes a schema-v3 marker containing operation, revision, command,
-and process-start fingerprints, acknowledges publication, and only then execs
-Hermes with the same PID. Marker or acknowledgment failure exits before Hermes.
-
-The API binds its socket before atomically publishing `ZEUS_STATE_DIR/zeus.pid`,
-holds a single-instance lock for that state directory, and removes only its own PID
-marker during orderly shutdown. API connections are bounded to 32 active request workers by
-default, and incomplete clients are disconnected after 10 seconds. Tune these availability
-controls with `ZEUS_API_MAX_CONCURRENT_REQUESTS` and `ZEUS_API_REQUEST_TIMEOUT_SECONDS`.
-When capacity is exhausted, Zeus returns `503` with `error.code=server_busy` and `Retry-After: 1`.
-During orderly shutdown, Zeus stops accepting new work, returns `503` with
-`error.code=server_draining`, and gives active requests up to 20 seconds to finish. Tune the
-deadline with `ZEUS_API_SHUTDOWN_DRAIN_SECONDS`.
-`scripts/stop.sh` honors `ZEUS_STATE_DIR`.
-
-`zeus bot stop` sends SIGTERM only for an exact, single-link schema-v3 marker
-that matches the expected bot, PID, and launch command. Zeus also compares the
-live process command line before trusting the PID on supported platforms.
-Schema-v2 and legacy markers may still be recognized for compatibility
-inspection, but stop and restart effects fail closed without signaling or
-deleting them. Legacy markers are reported as deprecated by inspect and can be
-disabled with `ZEUS_ALLOW_LEGACY_PID_MARKERS=0`. After schema-v3 ownership is
-verified, Zeus waits for graceful gateway shutdown so Hermes can interrupt any
-running background delegations.
-
-Lifecycle stop and interrupted restart recovery are automatic only for
-schema-v3 markers. When a pending stop or restart has a schema-v2 or legacy
-marker, Zeus fails closed and preserves the marker, recorded PID, and pending
-intent without signaling or launching; an operator must resolve the prior
-process manually.
-
-Lifecycle states are:
-
-- `stopped`: no recorded gateway process is running.
-- `starting`: a process exists but Hermes gateway readiness has not been confirmed.
-- `running`: readiness was confirmed, or the profile has no readiness probe.
-- `failed`: startup, ownership, readiness, or shutdown failed.
-- `unknown`: reserved for future diagnostics.
-
-Bot JSON also exposes the persisted `desired_state` and a `converged` boolean.
-Convergence is true only for running/running or stopped/stopped desired and
-observed states; pending or failed transitions are not converged.
-
-Bots default to manual restart policy. Create a bot with `--restart-policy on-failure`
-plus `--restart-backoff-seconds` and `--restart-max-attempts` to let
-`zeus bot reconcile [bot-id]` restart unexpectedly stopped gateways with exponential
-backoff. Retry history resets after a gateway remains running for
-`ZEUS_RESTART_STABILITY_SECONDS` (default `30`); brief recoveries retain the
-retry budget. See [reconcile scheduling](docs/RECONCILE.md) for details.
-
-Reconcile stores a durable run and one ordered result per bot. Fleet passes hold
-one fleet lock, continue after bot-scoped errors, and preserve each earlier committed
-lifecycle change. Existing CLI/API arrays remain the default; use `--summary` or
-`?summary=1` for run ID, timestamps, aggregate counts, and ordered result evidence.
-
-Lifecycle commands return a nonzero exit code for terminal `failed` or `unknown`
-results. A non-waiting start may return `starting` successfully; `--wait` returns
-nonzero when readiness is still pending. Reconcile scheduling and backoff-pending
-results remain successful, while exhausted or unsafe recovery attempts return nonzero.
-
-For unattended recovery, install `systemd/zeus-reconcile.service` and
-`systemd/zeus-reconcile.timer`. Lifecycle mutations append structured audit
-events to `$ZEUS_STATE_DIR/logs/audit.jsonl`.
-
-The test suite includes a fake Hermes executable that exercises the real Zeus subprocess path: render profile, start gateway, verify `HERMES_HOME`, stop gateway, reap the child process, and confirm logs are captured.
-
-For an offline lifecycle smoke test without a Hermes install, run `zeus demo up`,
-`zeus demo status`, and `zeus demo down`. The demo command uses a packaged fake
-Hermes executable and keeps its runtime files under `ZEUS_STATE_DIR`.
+These commands do not invoke Docker, Hermes, provider credential, or image
+readiness checks. The local `release-v1` gate requires a complete report matching
+the current commit, trusted coverage for every required control, and no high or
+critical findings. The default configuration authorizes no coverage commands and
+cannot pass this gate by itself. A completed audit is evidence within its recorded
+scope, not proof that the repository is secure. See the [audit guide](docs/AUDIT.md).
+
+## 60-Second Demo
+
+The [recorded terminal walkthrough](docs/assets/demo.cast) illustrates the operator
+flow. It is a historical recording, not a current compatibility result. Use the
+offline quick start above for a runnable demonstration, or the
+[real Hermes verification guide](docs/REAL_HERMES_VERIFICATION.md) for live checks.
 
 ## Known Limitations
 
-- Startup verification confirms Zeus configuration, rendered profiles, and the
-  Hermes executable path; it does not prove every downstream tool, provider
-  credential, or bot task will succeed at runtime.
-- Zeus supervises the Hermes gateway PID. It does not contain arbitrary tools or
-  every child process that Hermes may start; use the Hermes terminal backend,
-  Docker, or OS policy for execution isolation.
-- PID command-line checks are strongest on Linux through `/proc`. Non-Linux
-  hosts still use Zeus ownership markers and process checks, but with less live
-  process introspection.
-- The API is local-first and binds to loopback by default. Direct network
-  exposure, shared multi-user administration, and internet-facing deployment are
-  outside the current safety model.
-- Idempotency is opt-in, local to the SQLite state, and retention-bounded. A host
-  crash can produce `idempotency_indeterminate`; Zeus does not silently re-run
-  an unresolved keyed mutation.
-- Pre-1.0 CLI, API, template, and state-schema compatibility may change between
-  releases. Pin versions for automation and read release notes before upgrades.
+- Zeus is a local process orchestrator, not a sandbox. Separate profiles isolate
+  Hermes state; use a sandboxed Hermes terminal backend for untrusted tasks.
+- Do not expose the API directly to a network. Keep it on loopback or behind a
+  separately hardened access layer. Shared multi-user administration is outside
+  the current safety model.
+- Zeus supervises the gateway PID, not every tool process an agent may start.
+  Live process introspection varies by operating system.
+- Protect the state directory, profile secrets, logs, and audit reports. Audits
+  can share source excerpts with the configured provider.
+- Pre-1.0 interfaces and state schemas may change. Pin versions and read upgrade
+  notes; a successful local check does not establish every platform or provider.
 
-## Security Notes
+## Documentation
 
-Templates must not contain real secrets. Use environment variables or rendered per-profile `.env` files excluded from git. Hermes profiles isolate Hermes state, not host filesystem access. Use a sandboxed Hermes terminal backend when a bot should not execute tools directly on the host.
+| Goal | Guide |
+| --- | --- |
+| Understand the design | [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) |
+| Configure bots | [Template authoring](docs/TEMPLATE_AUTHORING.md) · [Messaging](docs/MESSAGING.md) |
+| Operate and recover | [Operations](docs/OPERATIONS.md) · [Reconcile scheduling](docs/RECONCILE.md) |
+| Integrate a dashboard or service | [API reference](docs/API.md) · [OpenAPI](docs/openapi.json) |
+| Review committed source | [Repository audits](docs/AUDIT.md) |
+| Verify runtime compatibility | [Compatibility policy](docs/COMPATIBILITY.md) · [Real Hermes verification](docs/REAL_HERMES_VERIFICATION.md) |
+| Deploy on Linux | [Systemd deployment](docs/SYSTEMD.md) · [Fresh VPS test](docs/FRESH_VPS_TEST.md) |
+| Contribute or package | [Contributing](CONTRIBUTING.md) · [Release process](docs/RELEASE.md) · [Changelog](CHANGELOG.md) |
 
-Hermes child processes receive a minimal host environment by default plus the
-rendered profile `.env`. Set `ZEUS_ENV_PASSTHROUGH=HTTP_PROXY,HTTPS_PROXY,NO_PROXY`
-only when a bot needs selected host variables.
+For development, install the optional `dev` dependencies as described in
+[Contributing](CONTRIBUTING.md), then run `make check`. The
+`sh scripts/wheel_smoke.sh` command checks an installed package; live Hermes
+and Docker verification have separate prerequisites documented in their guides.
+
+Zeus is maintained by [BrainX](https://github.com/brainx).
+[MIT license](LICENSE) · [Credits](CREDITS.md) · [Code of conduct](CODE_OF_CONDUCT.md) · [Security policy](SECURITY.md)
