@@ -31,8 +31,13 @@
           "const": "true"
         }
       },
+      "CacheControl": {
+        "description": "JSON API responses must not be cached.",
+        "required": true,
+        "schema": {"type": "string", "const": "no-store"}
+      },
       "RetryAfter": {
-        "description": "Seconds to wait before retrying an in-progress idempotent request.",
+        "description": "Present for an in-progress idempotent request or server capacity/shutdown rejection; other 503 errors do not include this header.",
         "required": false,
         "schema": {
           "type": "string",
@@ -49,6 +54,107 @@
       }
     },
     "schemas": {
+      "CapabilityEndpoint": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "method",
+          "path",
+          "permission",
+          "mutates_state"
+        ],
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "POST"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^/",
+            "description": "Canonical unprefixed route template; the /v1 alias has identical access."
+          },
+          "permission": {
+            "type": "string",
+            "enum": [
+              "authenticated",
+              "observer",
+              "diagnostics",
+              "operator"
+            ],
+            "description": "Required permission. authenticated accepts any valid credential and is not a configurable credential scope."
+          },
+          "mutates_state": {
+            "type": "boolean",
+            "description": "Whether the operation can change lifecycle/domain state or initialize/migrate the database. False is not a promise of zero filesystem writes: access logs and runtime lock bookkeeping can still occur."
+          }
+        }
+      },
+      "Capabilities": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "capabilities_version",
+          "api_version",
+          "zeus_version",
+          "schema_version",
+          "integration_id",
+          "administrator",
+          "permissions",
+          "endpoints"
+        ],
+        "properties": {
+          "capabilities_version": {
+            "type": "integer",
+            "const": 1
+          },
+          "api_version": {
+            "type": "string",
+            "const": "v1"
+          },
+          "zeus_version": {
+            "type": "string",
+            "description": "Version of the running Zeus package. Discovery does not replace the consumer version compatibility gate."
+          },
+          "schema_version": {
+            "type": "integer",
+            "const": 10,
+            "description": "Schema supported by the running package; this does not check the actual database. Use /ready for readiness."
+          },
+          "integration_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+            "description": "Identity derived from the authenticated credential; admin denotes the legacy administrator."
+          },
+          "administrator": {
+            "type": "boolean"
+          },
+          "permissions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "observer",
+                "diagnostics",
+                "operator"
+              ]
+            },
+            "description": "Effective independent scopes, sorted by name."
+          },
+          "endpoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CapabilityEndpoint"
+            },
+            "description": "Only protected endpoints available to the authenticated caller, ordered by method then path. Public /health is omitted."
+          }
+        }
+      },
       "Error": {
         "type": "object",
         "required": ["error"],
@@ -1448,13 +1554,59 @@
     }
   ],
   "paths": {
+    "/capabilities": {
+      "get": {
+        "operationId": "getCapabilities",
+        "x-zeus-permission": "authenticated",
+        "summary": "Discover the authenticated integration capabilities",
+        "description": "Always requires a valid API credential, including when development unauthenticated reads are enabled. Uses only loaded configuration and package constants: no database read, gateway probe, execution refresh, dispatch, or recovery. No query parameters. Returns the caller identity, never other integration identities or keys.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Credential-derived permissions and available endpoints; no database or runtime probe",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Capabilities"}}}
+          },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "No API credentials are configured, or server capacity or orderly shutdown prevents handling the request",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
+        "operationId": "getHealth",
         "security": [],
         "responses": {
           "200": {
             "description": "Health check",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -1469,12 +1621,28 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "Server capacity or orderly shutdown prevents handling the request",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
       }
     },
     "/ready": {
       "get": {
+        "operationId": "getReadiness",
         "x-zeus-permission": "observer",
         "summary": "Check API state-store readiness",
         "description": "Authenticates the request, then opens the Zeus database read-only, requires the current schema version, and executes SELECT 1. The /v1/ready alias is provided by the versioned server URL.",
@@ -1487,6 +1655,7 @@
           "200": {
             "description": "The state store is readable at the current schema version",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
             },
             "content": {
@@ -1500,6 +1669,7 @@
           "400": {
             "description": "Invalid query parameters",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
             },
             "content": {
@@ -1511,6 +1681,7 @@
           "401": {
             "description": "Missing or invalid API credential",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
             },
             "content": {
@@ -1521,7 +1692,7 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -1531,6 +1702,7 @@
           "429": {
             "description": "Authentication rate limit exceeded",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Retry-After": {
                 "description": "Seconds to wait before retrying authentication.",
@@ -1546,9 +1718,16 @@
               }
             }
           },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "503": {
             "description": "No API credentials are configured or the state store is not ready",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "Retry-After": {"$ref": "#/components/headers/RetryAfter"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
             },
             "content": {
@@ -1562,11 +1741,12 @@
     },
     "/doctor": {
       "get": {
+        "operationId": "runDoctor",
         "x-zeus-permission": "operator",
         "responses": {
           "200": {
             "description": "Readiness report",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -1575,9 +1755,14 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "401": {
             "description": "Invalid API key",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -1588,23 +1773,39 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "No API credentials are configured, or server capacity or orderly shutdown prevents handling the request",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
       }
     },
     "/templates": {
       "get": {
+        "operationId": "listTemplates",
         "x-zeus-permission": "diagnostics",
         "responses": {
           "200": {
             "description": "Template list",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -1616,25 +1817,51 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "No API credentials are configured, or server capacity or orderly shutdown prevents handling the request",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
       }
     },
     "/bots": {
       "get": {
+        "operationId": "listBots",
         "x-zeus-permission": "diagnostics",
         "responses": {
           "200": {
             "description": "Bot list",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -1646,18 +1873,44 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "No API credentials are configured, or server capacity or orderly shutdown prevents handling the request",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
       },
       "post": {
+        "operationId": "createBot",
         "x-zeus-permission": "operator",
         "parameters": [
           {
@@ -1703,6 +1956,7 @@
           "200": {
             "description": "Created bot record",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -1717,6 +1971,7 @@
           "400": {
             "description": "Invalid request",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -1728,9 +1983,14 @@
               }
             }
           },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -1740,6 +2000,7 @@
           "409": {
             "description": "Bot/domain conflict or idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"},
               "Retry-After": {"$ref": "#/components/headers/RetryAfter"}
@@ -1752,9 +2013,20 @@
               }
             }
           },
+          "415": {
+            "description": "A JSON request body requires application/json (unsupported_media_type)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication or mutation rate limit exceeded",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "500": {
             "description": "Internal mutation error",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -1762,7 +2034,7 @@
           },
           "503": {
             "description": "Idempotency storage or capacity unavailable",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
@@ -1770,6 +2042,7 @@
     },
     "/bots/reconcile": {
       "post": {
+        "operationId": "reconcileFleet",
         "x-zeus-permission": "operator",
         "parameters": [
           {
@@ -1797,6 +2070,7 @@
           "200": {
             "description": "All-bot reconcile results",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -1821,14 +2095,20 @@
           "400": {
             "description": "Invalid request or idempotency key",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -1838,6 +2118,7 @@
           "409": {
             "description": "Reconciliation lock conflict, idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"},
               "Retry-After": {"$ref": "#/components/headers/RetryAfter"}
@@ -1847,13 +2128,20 @@
           "422": {
             "description": "Keyed fleet response exceeds the replay budget before claim",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
             },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication or mutation rate limit exceeded",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
           "500": {
             "description": "Internal mutation error",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -1861,7 +2149,7 @@
           },
           "503": {
             "description": "Idempotency storage or capacity unavailable",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
@@ -1869,6 +2157,7 @@
     },
     "/bots/{bot_id}/status": {
       "get": {
+        "operationId": "getBotStatus",
         "x-zeus-permission": "operator",
         "parameters": [
           {
@@ -1883,7 +2172,7 @@
         "responses": {
           "200": {
             "description": "Bot status",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -1892,20 +2181,56 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
+          },
+          "404": {
+            "description": "Unknown bot (unknown_bot)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "409": {
+            "description": "A concurrent lifecycle operation holds the bot lock (bot_locked)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "No API credentials are configured, or server capacity or orderly shutdown prevents handling the request",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
       }
     },
     "/bots/{bot_id}/logs": {
       "get": {
+        "operationId": "getBotLogs",
         "x-zeus-permission": "diagnostics",
         "parameters": [
           {
@@ -1920,7 +2245,7 @@
         "responses": {
           "200": {
             "description": "Bot logs",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -1938,20 +2263,51 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
+          },
+          "404": {
+            "description": "Unknown bot (unknown_bot)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "No API credentials are configured, or server capacity or orderly shutdown prevents handling the request",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
       }
     },
     "/bots/{bot_id}/history": {
       "get": {
+        "operationId": "listBotHistory",
         "x-zeus-permission": "diagnostics",
         "summary": "List authoritative bot lifecycle history",
         "security": [
@@ -1993,7 +2349,7 @@
         "responses": {
           "200": {
             "description": "Lifecycle history, newest first",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2004,7 +2360,7 @@
           },
           "400": {
             "description": "Invalid bot ID or query parameter",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2015,7 +2371,7 @@
           },
           "401": {
             "description": "Missing or invalid API key",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2026,7 +2382,7 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2035,7 +2391,7 @@
           },
           "404": {
             "description": "Unknown bot",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2044,9 +2400,19 @@
               }
             }
           },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "503": {
             "description": "API key is not configured",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2060,6 +2426,7 @@
     },
     "/bots/{bot_id}/diagnostics": {
       "get": {
+        "operationId": "getBotDiagnostics",
         "x-zeus-permission": "diagnostics",
         "summary": "Observe live Hermes gateway health without changing lifecycle state",
         "description": "Uses the captured launch endpoint and verifies the same gateway generation before and after a bounded authenticated probe. Always requires diagnostics permission or the administrator key. No query parameters. Readiness is a local observation, not a provider or safe-stop guarantee.",
@@ -2083,6 +2450,7 @@
           "200": {
             "description": "Live diagnostic observation; inspect status even for HTTP 200.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2098,6 +2466,7 @@
           "400": {
             "description": "Invalid bot identifier, route, or query parameters.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2113,6 +2482,7 @@
           "401": {
             "description": "Missing or invalid API key.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2127,7 +2497,7 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2137,6 +2507,7 @@
           "404": {
             "description": "Unknown bot.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2149,9 +2520,21 @@
               }
             }
           },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "503": {
             "description": "API key is unconfigured or the state store is unavailable.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "Retry-After": {"$ref": "#/components/headers/RetryAfter"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2169,6 +2552,7 @@
     },
     "/bots/{bot_id}/inspect": {
       "get": {
+        "operationId": "inspectBot",
         "x-zeus-permission": "diagnostics",
         "summary": "Inspect bot profile and runtime diagnostics",
         "parameters": [
@@ -2184,7 +2568,7 @@
         "responses": {
           "200": {
             "description": "Bot inspection payload",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2193,9 +2577,14 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid request, query parameters, path identifier, or body",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "401": {
             "description": "Invalid API key",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2206,7 +2595,7 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2215,7 +2604,7 @@
           },
           "404": {
             "description": "Unknown bot",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {
@@ -2223,12 +2612,28 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "No API credentials are configured, or server capacity or orderly shutdown prevents handling the request",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
       }
     },
     "/bots/{bot_id}/start": {
       "post": {
+        "operationId": "startBot",
         "x-zeus-permission": "operator",
         "parameters": [
           {
@@ -2273,6 +2678,7 @@
           "200": {
             "description": "Start result",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2287,14 +2693,20 @@
           "400": {
             "description": "Invalid request or idempotency key",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2304,6 +2716,7 @@
           "404": {
             "description": "Unknown bot",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2312,15 +2725,22 @@
           "409": {
             "description": "Idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"},
               "Retry-After": {"$ref": "#/components/headers/RetryAfter"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "429": {
+            "description": "Authentication or mutation rate limit exceeded",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "500": {
             "description": "Internal mutation error",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2328,7 +2748,7 @@
           },
           "503": {
             "description": "Idempotency storage or capacity unavailable",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
@@ -2336,6 +2756,7 @@
     },
     "/bots/{bot_id}/stop": {
       "post": {
+        "operationId": "stopBot",
         "x-zeus-permission": "operator",
         "description": "Stops a bot only with an exact, single-link schema-v3 marker. Schema-v2 or legacy markers fail closed before signaling and remain untouched with the recorded PID and pending stop intent.",
         "parameters": [
@@ -2370,6 +2791,7 @@
           "200": {
             "description": "Stop result",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2384,14 +2806,20 @@
           "400": {
             "description": "Invalid request or idempotency key",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2401,6 +2829,7 @@
           "404": {
             "description": "Unknown bot",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2409,15 +2838,22 @@
           "409": {
             "description": "Idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"},
               "Retry-After": {"$ref": "#/components/headers/RetryAfter"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "429": {
+            "description": "Authentication or mutation rate limit exceeded",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "500": {
             "description": "Internal mutation error",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2425,7 +2861,7 @@
           },
           "503": {
             "description": "Idempotency storage or capacity unavailable",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
@@ -2433,6 +2869,7 @@
     },
     "/bots/{bot_id}/restart": {
       "post": {
+        "operationId": "restartBot",
         "x-zeus-permission": "operator",
         "description": "Restarts a bot only when the prior process has an exact, single-link schema-v3 marker. Schema-v2 or legacy markers fail closed before signaling, preserve the marker, recorded PID, and pending intent, and require manual process resolution.",
         "parameters": [
@@ -2478,6 +2915,7 @@
           "200": {
             "description": "Restart result",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2492,14 +2930,20 @@
           "400": {
             "description": "Invalid request or idempotency key",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2509,6 +2953,7 @@
           "404": {
             "description": "Unknown bot",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2517,15 +2962,22 @@
           "409": {
             "description": "Idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"},
               "Retry-After": {"$ref": "#/components/headers/RetryAfter"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "429": {
+            "description": "Authentication or mutation rate limit exceeded",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "500": {
             "description": "Internal mutation error",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2533,7 +2985,7 @@
           },
           "503": {
             "description": "Idempotency storage or capacity unavailable",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
@@ -2541,6 +2993,7 @@
     },
     "/bots/{bot_id}/reconcile": {
       "post": {
+        "operationId": "reconcileBot",
         "x-zeus-permission": "operator",
         "description": "Recovers pending lifecycle intents and reconciles one bot. Pending restarts with schema-v2 or legacy markers fail closed without signaling, launching, or changing the recorded PID projection.",
         "parameters": [
@@ -2577,6 +3030,7 @@
           "200": {
             "description": "Single-bot reconcile result",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2601,14 +3055,20 @@
           "400": {
             "description": "Invalid request or idempotency key",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2618,6 +3078,7 @@
           "404": {
             "description": "Unknown bot",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2626,15 +3087,22 @@
           "409": {
             "description": "Reconciliation lock conflict, idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"},
               "Retry-After": {"$ref": "#/components/headers/RetryAfter"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "429": {
+            "description": "Authentication or mutation rate limit exceeded",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Retry-After": {"description": "Seconds to wait before retrying.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "500": {
             "description": "Internal mutation error",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"},
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
@@ -2642,7 +3110,7 @@
           },
           "503": {
             "description": "Idempotency storage or capacity unavailable",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           }
         }
@@ -2650,6 +3118,7 @@
     },
     "/reconcile/runs": {
       "get": {
+        "operationId": "listReconcileRuns",
         "x-zeus-permission": "observer",
         "summary": "List persisted reconciliation runs, newest first",
         "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
@@ -2710,6 +3179,7 @@
           "200": {
             "description": "List persisted reconciliation runs, newest first",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2725,6 +3195,7 @@
           "400": {
             "description": "Invalid query parameters",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2740,6 +3211,7 @@
           "401": {
             "description": "Missing or invalid API credential",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2754,7 +3226,7 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2764,6 +3236,7 @@
           "429": {
             "description": "Authentication rate limit exceeded",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               },
@@ -2783,9 +3256,16 @@
               }
             }
           },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "503": {
             "description": "API key is not configured or stored evidence is unavailable.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "Retry-After": {"$ref": "#/components/headers/RetryAfter"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2803,6 +3283,7 @@
     },
     "/reconcile/runs/{run_id}": {
       "get": {
+        "operationId": "getReconcileRun",
         "x-zeus-permission": "observer",
         "summary": "Read run metadata and results in ordinal order",
         "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
@@ -2851,6 +3332,7 @@
           "200": {
             "description": "Read run metadata and results in ordinal order",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2866,6 +3348,7 @@
           "400": {
             "description": "Invalid query parameters",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2881,6 +3364,7 @@
           "401": {
             "description": "Missing or invalid API credential",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2895,7 +3379,7 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -2905,6 +3389,7 @@
           "429": {
             "description": "Authentication rate limit exceeded",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               },
@@ -2924,9 +3409,16 @@
               }
             }
           },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "503": {
             "description": "API key is not configured or stored evidence is unavailable.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "Retry-After": {"$ref": "#/components/headers/RetryAfter"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2942,6 +3434,7 @@
           "404": {
             "description": "Unknown reconciliation run.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -2959,6 +3452,7 @@
     },
     "/fleet": {
       "get": {
+        "operationId": "getFleet",
         "x-zeus-permission": "observer",
         "summary": "Read stored fleet state with reconciliation observation freshness",
         "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
@@ -3016,6 +3510,7 @@
           "200": {
             "description": "Read stored fleet state with reconciliation observation freshness",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -3031,6 +3526,7 @@
           "400": {
             "description": "Invalid query parameters",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -3046,6 +3542,7 @@
           "401": {
             "description": "Missing or invalid API credential",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }
@@ -3060,7 +3557,7 @@
           },
           "403": {
             "description": "The authenticated integration lacks the required permission (permission_denied)",
-            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -3070,6 +3567,7 @@
           "429": {
             "description": "Authentication rate limit exceeded",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               },
@@ -3089,9 +3587,16 @@
               }
             }
           },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
           "503": {
             "description": "API key is not configured or stored evidence is unavailable.",
             "headers": {
+              "Cache-Control": {"$ref": "#/components/headers/CacheControl"},
+              "Retry-After": {"$ref": "#/components/headers/RetryAfter"},
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
               }

@@ -14,6 +14,7 @@ from zeus.request_context import RequestContext, route_template
 # Scopes describe effects and sensitivity, not HTTP verbs. In particular, status
 # can recover pending intent, doctor initializes state, and inventory exposes paths.
 ROUTE_PERMISSIONS = {
+    ("GET", "/capabilities"): "authenticated",
     ("GET", "/ready"): "observer",
     ("GET", "/fleet"): "observer",
     ("GET", "/reconcile/runs"): "observer",
@@ -95,7 +96,11 @@ class ApiAuthorizer:
                 decision.retry_after_seconds,
             )
         context.integration_id = principal.integration_id
-        if not principal.administrator and permission not in principal.permissions:
+        if (
+            not principal.administrator
+            and permission != "authenticated"
+            and permission not in principal.permissions
+        ):
             context.auth_outcome = "forbidden"
             raise AuthorizationDenied(
                 HTTPStatus.FORBIDDEN, "permission_denied", "integration permission denied"

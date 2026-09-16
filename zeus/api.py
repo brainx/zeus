@@ -27,6 +27,7 @@ from zeus.api_request import (
 from zeus.api_server import ThreadingHTTPServer
 from zeus.api_server import serve as _serve_server
 from zeus.config import Settings
+from zeus.dashboard_api import dashboard_response, is_dashboard_path
 from zeus.doctor import run_doctor
 from zeus.idempotency import IdempotencyClaim, canonical_request_hash, hash_key
 from zeus.integration_auth import ApiPrincipal
@@ -37,7 +38,6 @@ from zeus.models import (
     RestartPolicy,
     validate_id,
 )
-from zeus.operator_api import is_operator_path, operator_response
 from zeus.process_lock import LockTimeoutError
 from zeus.rate_limit import TokenBucket
 from zeus.reconciliation import (
@@ -284,9 +284,11 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
         def _dispatch_get(self) -> None:
             path = self._normalized_path()
-            if is_operator_path(path):
+            if is_dashboard_path(path):
                 self._require_key(read=False)
-                status, payload = operator_response(path, self.path, supervisor)
+                if self._principal is None:
+                    raise AssertionError("dashboard authentication is required")
+                status, payload = dashboard_response(path, self.path, self._principal, supervisor)
                 if status >= 400:
                     error = payload["error"]
                     self._json_error_response(status, error["code"], error["message"])

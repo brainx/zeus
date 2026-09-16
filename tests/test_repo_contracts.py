@@ -1782,6 +1782,10 @@ class RepoContractTests(unittest.TestCase):
                     continue
                 with self.subTest(path=path, method=method):
                     documented[(method.upper(), path)] = operation["x-zeus-permission"]
+                    if operation["x-zeus-permission"] == "authenticated":
+                        self.assertEqual("/capabilities", path)
+                        self.assertNotIn("403", operation["responses"])
+                        continue
                     response = operation["responses"]["403"]
                     self.assertIn("permission_denied", response["description"])
                     self.assertEqual(
@@ -1789,6 +1793,32 @@ class RepoContractTests(unittest.TestCase):
                         response["content"]["application/json"]["schema"]["$ref"],
                     )
         self.assertEqual(ROUTE_PERMISSIONS, documented)
+
+    def test_capabilities_contract_preserves_readiness_and_documents_effects(self) -> None:
+        spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
+        operation = spec["paths"]["/capabilities"]["get"]
+        self.assertEqual([{"ZeusApiKey": []}], operation["security"])
+        self.assertEqual("authenticated", operation["x-zeus-permission"])
+        self.assertEqual("getCapabilities", operation["operationId"])
+        self.assertEqual(
+            "#/components/schemas/Capabilities",
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        )
+        schema = spec["components"]["schemas"]["Capabilities"]
+        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(1, schema["properties"]["capabilities_version"]["const"])
+        self.assertEqual(SCHEMA_VERSION, schema["properties"]["schema_version"]["const"])
+        readiness = spec["components"]["schemas"]["ReadinessResponse"]
+        self.assertEqual({"schema_version", "status"}, set(readiness["properties"]))
+        endpoint = spec["components"]["schemas"]["CapabilityEndpoint"]
+        self.assertEqual(
+            {"method", "path", "permission", "mutates_state"}, set(endpoint["required"])
+        )
+        self.assertIn("filesystem", endpoint["properties"]["mutates_state"]["description"])
+        docs = Path("docs/API.md").read_text(encoding="utf-8")
+        self.assertIn("pinned Zeus commit", docs)
+        self.assertIn("must not bypass a consumer compatibility gate", docs)
 
     def test_readiness_openapi_and_operator_documentation_contract(self) -> None:
         spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
@@ -1800,7 +1830,9 @@ class RepoContractTests(unittest.TestCase):
         self.assertEqual([], spec["paths"]["/health"]["get"]["security"])
         readiness = spec["paths"]["/ready"]["get"]
         self.assertEqual([{"ZeusApiKey": []}], readiness["security"])
-        self.assertEqual({"200", "400", "401", "403", "429", "503"}, set(readiness["responses"]))
+        self.assertEqual(
+            {"200", "400", "401", "403", "429", "500", "503"}, set(readiness["responses"])
+        )
         self.assertEqual(
             "#/components/schemas/ReadinessResponse",
             readiness["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],

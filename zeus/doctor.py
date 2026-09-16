@@ -298,7 +298,7 @@ def _check_api_auth(settings: Settings) -> DoctorCheck:
             "fail",
             "Public API bind requires a stronger ZEUS_API_KEY",
         )
-    if settings.api_key and not settings.allow_unauth_reads:
+    if (settings.api_key or settings.api_integrations) and not settings.allow_unauth_reads:
         return DoctorCheck("api_auth", "pass", "Non-health API endpoints require x-zeus-api-key")
     if settings.allow_unauth_reads:
         return DoctorCheck(
@@ -310,7 +310,7 @@ def _check_api_auth(settings: Settings) -> DoctorCheck:
     return DoctorCheck(
         "api_auth",
         "warn",
-        "ZEUS_API_KEY is not configured; non-health API endpoints will reject requests",
+        "No API credentials are configured; non-health API endpoints will reject requests",
     )
 
 

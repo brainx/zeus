@@ -88,6 +88,52 @@ Delete and archive are intentionally CLI-only in the current alpha because they
 remove or move local profile directories. Use `zeus bot delete` or
 `zeus bot archive` from a trusted local shell.
 
+## Capability Discovery
+
+`GET /capabilities` and `/v1/capabilities` require any valid credential, even
+when `ZEUS_ALLOW_UNAUTH_READS=1`. They accept no query parameters. Discovery uses
+loaded configuration and package constants without accessing the state database
+or probing gateways, refreshing execution state, dispatching jobs, or recovering
+operations. Normal request logging still applies.
+
+The response contains:
+
+| Field | Meaning |
+| --- | --- |
+| `capabilities_version` | Discovery payload version, currently `1`. |
+| `api_version` | Route contract family, currently `v1`. |
+| `zeus_version` | Running Zeus package version. |
+| `schema_version` | Database schema supported by this package, currently `10`; this is not a database readiness result. |
+| `integration_id`, `administrator` | Credential-derived caller identity and administrator status. |
+| `permissions` | The caller's independent scopes, sorted by name. |
+| `endpoints` | Accessible protected routes, sorted by method then path. Public `/health` is omitted. |
+
+Each endpoint contains `method`, canonical unprefixed `path`, required
+`permission`, and `mutates_state`. `authenticated` denotes access for any valid
+credential; it is not a configurable permission. An observer can discover its
+own access but cannot enumerate other integrations or their keys.
+
+`mutates_state=true` identifies possible domain or lifecycle changes, including
+`GET /bots/<bot-id>/status` and the initialization/migration performed by
+`GET /doctor`. A false value does not promise zero filesystem writes: request
+logs and runtime lock bookkeeping can still occur. The endpoint list describes
+available access, not current bot health or successful execution of an operation.
+The OpenAPI contract supplies stable `operationId` values, permissions, request
+and response schemas, and authentication, validation, rate-limit, and service
+failure responses. Both advertised server URLs share those definitions.
+
+Dashboard adapters should first retain their supported Zeus version and schema
+checks through `/ready`, then use discovery to select features and hide
+unavailable controls. Treat unknown discovery versions, fields, or endpoint
+entries conservatively; discovery must not bypass a consumer compatibility gate.
+For Olymp, update its reviewed OpenAPI fixture from a pinned Zeus commit and
+record the fixture checksum before enabling new routes. Keep historical fixtures
+and the exact readiness response unchanged, and update fixture comparison tests
+to account for additive discovery and permission contracts. Zeus contains no
+copy of Olymp's contract fixtures. Olymp's adapter also needs to map
+`403 permission_denied` explicitly and keep separate server-side credentials for
+monitoring and controls when both are enabled.
+
 ## Persisted Operator Evidence
 
 The following observer endpoints always require `x-zeus-api-key`, including
