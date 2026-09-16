@@ -10,6 +10,7 @@ from zeus.api_authorization import ROUTE_PERMISSIONS
 from zeus.api_request import parse_query
 from zeus.integration_auth import ApiPrincipal
 from zeus.operator_api import is_operator_path, operator_response
+from zeus.receipt_api import is_receipt_path, receipt_response
 from zeus.schema import SCHEMA_VERSION
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ def capabilities(principal: ApiPrincipal) -> dict[str, Any]:
 
 
 def is_dashboard_path(path: str) -> bool:
-    return path == "/capabilities" or is_operator_path(path)
+    return path == "/capabilities" or is_operator_path(path) or is_receipt_path(path)
 
 
 def dashboard_response(
@@ -51,4 +52,6 @@ def dashboard_response(
     if path == "/capabilities":
         parse_query(target, frozenset())
         return HTTPStatus.OK, capabilities(principal)
+    if is_receipt_path(path):
+        return receipt_response(path, target, supervisor.store.database_path)
     return operator_response(path, target, supervisor)

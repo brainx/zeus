@@ -53,6 +53,8 @@ _STATIC_ROUTE_TEMPLATES = {
     "/health": "/health",
     "/ready": "/ready",
     "/capabilities": "/capabilities",
+    "/messages": "/messages",
+    "/messages/capacity": "/messages/capacity",
     "/doctor": "/doctor",
     "/templates": "/templates",
     "/bots": "/bots",
@@ -104,6 +106,8 @@ def route_template(path: str) -> str | None:
         return static_template
 
     parts = path.split("/")
+    if len(parts) == 3 and parts[:2] == ["", "messages"] and parts[2]:
+        return "/messages/{message_id}"
     if len(parts) == 4 and parts[:3] == ["", "reconcile", "runs"] and parts[3]:
         return "/reconcile/runs/{run_id}"
     if (

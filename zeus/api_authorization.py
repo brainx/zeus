@@ -15,6 +15,9 @@ from zeus.request_context import RequestContext, route_template
 # can recover pending intent, doctor initializes state, and inventory exposes paths.
 ROUTE_PERMISSIONS = {
     ("GET", "/capabilities"): "authenticated",
+    ("GET", "/messages"): "observer",
+    ("GET", "/messages/{message_id}"): "observer",
+    ("GET", "/messages/capacity"): "observer",
     ("GET", "/ready"): "observer",
     ("GET", "/fleet"): "observer",
     ("GET", "/reconcile/runs"): "observer",
