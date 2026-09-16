@@ -44,7 +44,8 @@
       "ZeusApiKey": {
         "type": "apiKey",
         "in": "header",
-        "name": "x-zeus-api-key"
+        "name": "x-zeus-api-key",
+        "description": "Administrator ZEUS_API_KEY or a named integration credential. Named credentials require the operation-specific x-zeus-permission; identities and permissions come from server configuration, not request headers. Keep keys server-side."
       }
     },
     "schemas": {
@@ -66,6 +67,7 @@
                   "unknown_template",
                   "missing_api_key",
                   "invalid_api_key",
+                  "permission_denied",
                   "auth_rate_limited",
                   "mutation_rate_limited",
                   "unsupported_media_type",
@@ -1473,6 +1475,7 @@
     },
     "/ready": {
       "get": {
+        "x-zeus-permission": "observer",
         "summary": "Check API state-store readiness",
         "description": "Authenticates the request, then opens the Zeus database read-only, requires the current schema version, and executes SELECT 1. The /v1/ready alias is provided by the versioned server URL.",
         "security": [
@@ -1506,10 +1509,19 @@
             }
           },
           "401": {
-            "description": "Missing API key, invalid API key, or API key not configured",
+            "description": "Missing or invalid API credential",
             "headers": {
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
             },
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
             "content": {
               "application/json": {
                 "schema": {"$ref": "#/components/schemas/Error"}
@@ -1535,7 +1547,7 @@
             }
           },
           "503": {
-            "description": "The API key is unconfigured or the state store is not ready",
+            "description": "No API credentials are configured or the state store is not ready",
             "headers": {
               "X-Request-ID": {"$ref": "#/components/headers/XRequestID"}
             },
@@ -1550,6 +1562,7 @@
     },
     "/doctor": {
       "get": {
+        "x-zeus-permission": "operator",
         "responses": {
           "200": {
             "description": "Readiness report",
@@ -1572,12 +1585,22 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           }
         }
       }
     },
     "/templates": {
       "get": {
+        "x-zeus-permission": "diagnostics",
         "responses": {
           "200": {
             "description": "Template list",
@@ -1592,12 +1615,22 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           }
         }
       }
     },
     "/bots": {
       "get": {
+        "x-zeus-permission": "diagnostics",
         "responses": {
           "200": {
             "description": "Bot list",
@@ -1612,10 +1645,20 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           }
         }
       },
       "post": {
+        "x-zeus-permission": "operator",
         "parameters": [
           {
             "name": "replace",
@@ -1639,7 +1682,7 @@
             "name": "Idempotency-Key",
             "in": "header",
             "required": false,
-            "description": "Opt-in durable replay key. The guarantee is limited to the configured retention window.",
+            "description": "Opt-in durable replay key scoped to the authenticated integration ID. Administrator retries retain the legacy namespace. The guarantee is limited to the configured retention window.",
             "schema": {
               "type": "string",
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -1685,6 +1728,15 @@
               }
             }
           },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
           "409": {
             "description": "Bot/domain conflict or idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
@@ -1718,6 +1770,7 @@
     },
     "/bots/reconcile": {
       "post": {
+        "x-zeus-permission": "operator",
         "parameters": [
           {
             "name": "summary",
@@ -1733,7 +1786,7 @@
             "name": "Idempotency-Key",
             "in": "header",
             "required": false,
-            "description": "Opt-in durable replay key. The guarantee is limited to the configured retention window.",
+            "description": "Opt-in durable replay key scoped to the authenticated integration ID. Administrator retries retain the legacy namespace. The guarantee is limited to the configured retention window.",
             "schema": {
               "type": "string",
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -1773,6 +1826,15 @@
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
           "409": {
             "description": "Reconciliation lock conflict, idempotency conflict, in-progress claim, or indeterminate execution",
             "headers": {
@@ -1807,6 +1869,7 @@
     },
     "/bots/{bot_id}/status": {
       "get": {
+        "x-zeus-permission": "operator",
         "parameters": [
           {
             "name": "bot_id",
@@ -1828,12 +1891,22 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           }
         }
       }
     },
     "/bots/{bot_id}/logs": {
       "get": {
+        "x-zeus-permission": "diagnostics",
         "parameters": [
           {
             "name": "bot_id",
@@ -1864,12 +1937,22 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           }
         }
       }
     },
     "/bots/{bot_id}/history": {
       "get": {
+        "x-zeus-permission": "diagnostics",
         "summary": "List authoritative bot lifecycle history",
         "security": [
           {
@@ -1941,6 +2024,15 @@
               }
             }
           },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
           "404": {
             "description": "Unknown bot",
             "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
@@ -1968,8 +2060,9 @@
     },
     "/bots/{bot_id}/diagnostics": {
       "get": {
+        "x-zeus-permission": "diagnostics",
         "summary": "Observe live Hermes gateway health without changing lifecycle state",
-        "description": "Uses the captured launch endpoint and verifies the same gateway generation before and after a bounded authenticated probe. Always requires the Zeus API key. No query parameters. Readiness is a local observation, not a provider or safe-stop guarantee.",
+        "description": "Uses the captured launch endpoint and verifies the same gateway generation before and after a bounded authenticated probe. Always requires diagnostics permission or the administrator key. No query parameters. Readiness is a local observation, not a provider or safe-stop guarantee.",
         "security": [
           {
             "ZeusApiKey": []
@@ -2032,6 +2125,15 @@
               }
             }
           },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
           "404": {
             "description": "Unknown bot.",
             "headers": {
@@ -2067,6 +2169,7 @@
     },
     "/bots/{bot_id}/inspect": {
       "get": {
+        "x-zeus-permission": "diagnostics",
         "summary": "Inspect bot profile and runtime diagnostics",
         "parameters": [
           {
@@ -2101,6 +2204,15 @@
               }
             }
           },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
           "404": {
             "description": "Unknown bot",
             "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
@@ -2117,6 +2229,7 @@
     },
     "/bots/{bot_id}/start": {
       "post": {
+        "x-zeus-permission": "operator",
         "parameters": [
           {
             "name": "bot_id",
@@ -2149,7 +2262,7 @@
             "name": "Idempotency-Key",
             "in": "header",
             "required": false,
-            "description": "Opt-in durable replay key. The guarantee is limited to the configured retention window.",
+            "description": "Opt-in durable replay key scoped to the authenticated integration ID. Administrator retries retain the legacy namespace. The guarantee is limited to the configured retention window.",
             "schema": {
               "type": "string",
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -2178,6 +2291,15 @@
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           },
           "404": {
             "description": "Unknown bot",
@@ -2214,6 +2336,7 @@
     },
     "/bots/{bot_id}/stop": {
       "post": {
+        "x-zeus-permission": "operator",
         "description": "Stops a bot only with an exact, single-link schema-v3 marker. Schema-v2 or legacy markers fail closed before signaling and remain untouched with the recorded PID and pending stop intent.",
         "parameters": [
           {
@@ -2236,7 +2359,7 @@
             "name": "Idempotency-Key",
             "in": "header",
             "required": false,
-            "description": "Opt-in durable replay key. The guarantee is limited to the configured retention window.",
+            "description": "Opt-in durable replay key scoped to the authenticated integration ID. Administrator retries retain the legacy namespace. The guarantee is limited to the configured retention window.",
             "schema": {
               "type": "string",
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -2265,6 +2388,15 @@
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           },
           "404": {
             "description": "Unknown bot",
@@ -2301,6 +2433,7 @@
     },
     "/bots/{bot_id}/restart": {
       "post": {
+        "x-zeus-permission": "operator",
         "description": "Restarts a bot only when the prior process has an exact, single-link schema-v3 marker. Schema-v2 or legacy markers fail closed before signaling, preserve the marker, recorded PID, and pending intent, and require manual process resolution.",
         "parameters": [
           {
@@ -2334,7 +2467,7 @@
             "name": "Idempotency-Key",
             "in": "header",
             "required": false,
-            "description": "Opt-in durable replay key. The guarantee is limited to the configured retention window.",
+            "description": "Opt-in durable replay key scoped to the authenticated integration ID. Administrator retries retain the legacy namespace. The guarantee is limited to the configured retention window.",
             "schema": {
               "type": "string",
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -2363,6 +2496,15 @@
               "Idempotency-Replayed": {"$ref": "#/components/headers/IdempotencyReplayed"}
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
           },
           "404": {
             "description": "Unknown bot",
@@ -2399,6 +2541,7 @@
     },
     "/bots/{bot_id}/reconcile": {
       "post": {
+        "x-zeus-permission": "operator",
         "description": "Recovers pending lifecycle intents and reconciles one bot. Pending restarts with schema-v2 or legacy markers fail closed without signaling, launching, or changing the recorded PID projection.",
         "parameters": [
           {
@@ -2423,7 +2566,7 @@
             "name": "Idempotency-Key",
             "in": "header",
             "required": false,
-            "description": "Opt-in durable replay key. The guarantee is limited to the configured retention window.",
+            "description": "Opt-in durable replay key scoped to the authenticated integration ID. Administrator retries retain the legacy namespace. The guarantee is limited to the configured retention window.",
             "schema": {
               "type": "string",
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -2463,6 +2606,15 @@
             },
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
           },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
+              }
+            }
+          },
           "404": {
             "description": "Unknown bot",
             "headers": {
@@ -2498,6 +2650,7 @@
     },
     "/reconcile/runs": {
       "get": {
+        "x-zeus-permission": "observer",
         "summary": "List persisted reconciliation runs, newest first",
         "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
         "security": [
@@ -2585,7 +2738,7 @@
             }
           },
           "401": {
-            "description": "Missing API key, invalid API key, or API key not configured",
+            "description": "Missing or invalid API credential",
             "headers": {
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
@@ -2596,6 +2749,15 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
           },
@@ -2641,6 +2803,7 @@
     },
     "/reconcile/runs/{run_id}": {
       "get": {
+        "x-zeus-permission": "observer",
         "summary": "Read run metadata and results in ordinal order",
         "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
         "security": [
@@ -2716,7 +2879,7 @@
             }
           },
           "401": {
-            "description": "Missing API key, invalid API key, or API key not configured",
+            "description": "Missing or invalid API credential",
             "headers": {
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
@@ -2727,6 +2890,15 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
           },
@@ -2787,6 +2959,7 @@
     },
     "/fleet": {
       "get": {
+        "x-zeus-permission": "observer",
         "summary": "Read stored fleet state with reconciliation observation freshness",
         "description": "Requires an API key even when ZEUS_ALLOW_UNAUTH_READS=1. Reads persisted evidence without starting reconciliation or probing gateways.",
         "security": [
@@ -2871,7 +3044,7 @@
             }
           },
           "401": {
-            "description": "Missing API key, invalid API key, or API key not configured",
+            "description": "Missing or invalid API credential",
             "headers": {
               "X-Request-ID": {
                 "$ref": "#/components/headers/XRequestID"
@@ -2882,6 +3055,15 @@
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 }
+              }
+            }
+          },
+          "403": {
+            "description": "The authenticated integration lacks the required permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}},
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Error"}
               }
             }
           },

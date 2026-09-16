@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hmac
 import json
 import os
 import sys
@@ -13,10 +12,11 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
-from typing import Any, NoReturn
+from typing import Any
 from urllib.parse import urlparse
 
 from zeus import api_request
+from zeus.api_authorization import ApiAuthorizer, AuthorizationDenied
 from zeus.api_errors import map_api_exception
 from zeus.api_logging import ApiLogWriter
 from zeus.api_request import (
@@ -29,6 +29,7 @@ from zeus.api_server import serve as _serve_server
 from zeus.config import Settings
 from zeus.doctor import run_doctor
 from zeus.idempotency import IdempotencyClaim, canonical_request_hash, hash_key
+from zeus.integration_auth import ApiPrincipal
 from zeus.models import (
     BotCreateRequest,
     BotStatus,
@@ -254,6 +255,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         settings.api_mutation_rate_per_minute,
         settings.api_mutation_burst,
     )
+    authorizer = ApiAuthorizer(settings, auth_failure_bucket)
 
     class ZeusHandler(BaseHTTPRequestHandler):
         server_version = "ZeusHTTP/0.1"
@@ -264,6 +266,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
         _response_status: int
         _response_error_code: str | None
         _validated_query_values: dict[str, list[str]]
+        _principal: ApiPrincipal | None
 
         def send_error(
             self,
@@ -377,7 +380,14 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
 
             if len(key_values) != 1:
                 raise ValueError("idempotency key has an invalid format")
-            key_hash = hash_key(key_values[0])
+            key_hash = hash_key(
+                key_values[0],
+                integration_id=(
+                    self._principal.integration_id
+                    if self._principal is not None and not self._principal.administrator
+                    else None
+                ),
+            )
             del key_values
             request_hash = canonical_request_hash(
                 "POST", prepared.route, prepared.query, prepared.body
@@ -847,47 +857,22 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             )
 
         def _require_key(self, *, read: bool) -> None:
-            if read and settings.allow_unauth_reads:
-                self._request_context.auth_outcome = "allowed_unauthenticated"
-                return
-            if not settings.api_key:
-                self._request_context.auth_outcome = "unconfigured"
-                self._json_error_response(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "missing_api_key",
-                    "ZEUS_API_KEY is required for non-health endpoints",
+            try:
+                self._principal = authorizer.authorize(
+                    self.headers,
+                    self._request_context,
+                    method=self.command,
+                    path=self._normalized_path(),
+                    allow_unauthenticated=read,
                 )
-                raise _ResponseSent
-            provided = self.headers.get("x-zeus-api-key")
-            if not provided:
-                self._request_context.auth_outcome = "missing"
-                self._reject_invalid_api_key()
-            # hmac.compare_digest raises TypeError for non-ASCII str input;
-            # route such keys through the normal (rate-limited) 401 path.
-            if not provided.isascii():
-                self._request_context.auth_outcome = "rejected"
-                self._reject_invalid_api_key()
-            if not hmac.compare_digest(provided, settings.api_key):
-                self._request_context.auth_outcome = "rejected"
-                self._reject_invalid_api_key()
-            self._request_context.auth_outcome = "authenticated"
-
-        def _reject_invalid_api_key(self) -> NoReturn:
-            decision = auth_failure_bucket.consume()
-            if decision.allowed:
+            except AuthorizationDenied as exc:
                 self._json_error_response(
-                    HTTPStatus.UNAUTHORIZED,
-                    "invalid_api_key",
-                    "invalid api key",
+                    exc.status,
+                    exc.code,
+                    exc.message,
+                    headers={"Retry-After": str(exc.retry_after)} if exc.retry_after else None,
                 )
-            else:
-                self._json_error_response(
-                    HTTPStatus.TOO_MANY_REQUESTS,
-                    "auth_rate_limited",
-                    "API authentication rate limit exceeded",
-                    headers={"Retry-After": str(decision.retry_after_seconds)},
-                )
-            raise _ResponseSent
+                raise _ResponseSent from None
 
         def _consume_mutation_capacity(self) -> None:
             decision = mutation_bucket.consume()
@@ -1105,6 +1090,7 @@ def make_handler(settings: Settings) -> type[BaseHTTPRequestHandler]:
             self._handle_request(self._method_not_allowed)
 
         def _handle_request(self, dispatch: Callable[[], None]) -> None:
+            self._principal = None
             self._request_context = RequestContext(
                 request_id=new_request_id(),
                 started_at=time.monotonic(),

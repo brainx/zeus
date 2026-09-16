@@ -6,11 +6,83 @@ address the same endpoint.
 
 The machine-readable OpenAPI contract is maintained in `docs/openapi.json`.
 
-All non-health endpoints require `ZEUS_API_KEY` to be configured and `x-zeus-api-key` to match it. API keys must contain ASCII characters only; Zeus rejects a non-ASCII configured key at startup. If `ZEUS_API_KEY` is not configured, non-health endpoints reject requests. For local-only development, `ZEUS_ALLOW_UNAUTH_READS=1` allows unauthenticated low-risk `GET` endpoints while mutating endpoints remain locked behind `ZEUS_API_KEY`. Diagnostic endpoints that expose runtime state or logs, including `GET /bots/<bot-id>/logs`, `GET /bots/<bot-id>/inspect`, `GET /bots/<bot-id>/diagnostics`, and `GET /bots/<bot-id>/history`, always require `x-zeus-api-key`.
+All non-health endpoints require an authenticated credential by default, sent in
+`x-zeus-api-key`. Existing `ZEUS_API_KEY` installations remain compatible: that
+key is the administrator credential and retains access to all existing routes.
+Keys must contain ASCII characters only. Without any configured credential,
+protected requests return `503 missing_api_key`; missing or invalid client keys
+return `401 invalid_api_key`. A valid named credential without the required
+permission returns `403 permission_denied` before endpoint work begins.
 
-At startup Zeus rejects a non-loopback bind without an API key of at least 16
-characters, and rejects `ZEUS_ALLOW_UNAUTH_READS=1` on every non-loopback bind.
-External access must use a separately hardened TLS reverse proxy and firewall.
+Zeus remains loopback-first. At startup it rejects a non-loopback bind without a
+`ZEUS_API_KEY` of at least 16 characters, and rejects
+`ZEUS_ALLOW_UNAUTH_READS=1` on every non-loopback bind. Named credentials do not
+relax that exposure check. External access must use a separately hardened TLS
+reverse proxy and firewall. Keep every Zeus credential in the dashboard's
+server-side adapter or secret environment; never embed it in browser code,
+client storage, URLs, or dashboard responses.
+
+## Named Integration Credentials
+
+Set `ZEUS_API_INTEGRATIONS_FILE` to a private JSON file with this shape:
+
+```json
+{
+  "version": 1,
+  "integrations": [
+    {"id": "olymp", "key_env": "OLYMP_ZEUS_API_KEY", "permissions": ["observer"]}
+  ]
+}
+```
+
+Use a directory owned by the Zeus process user with mode `0700` and a regular
+file owned by that user with mode `0600`, for example
+`.zeus/integrations/credentials.json`. Symlinks, unsafe ownership or permissions,
+invalid JSON, and files larger than 64 KiB are rejected. The file contains
+references to environment variable names, never literal credentials. Provision
+`OLYMP_ZEUS_API_KEY` with a distinct secret in the Zeus service environment and in
+Olymp's server-side credential store; configure Olymp's node `api_key_env` to
+that variable name. The existing trusted `.env` loading is also supported, with
+process environment values taking precedence. Restart Zeus after changing the
+file or secret environment; configuration is loaded once at startup.
+
+A file contains 1–32 integrations. IDs match `[a-z][a-z0-9_-]{0,63}`; `admin`
+is reserved for the legacy administrator. Environment references match
+`[A-Z_][A-Z0-9_]{0,127}`. Each named key must contain 32–512 non-space printable
+ASCII characters. IDs, environment references, and key values must be unique;
+named keys cannot equal `ZEUS_API_KEY`. Unknown fields, duplicate JSON fields,
+missing secrets, and empty, repeated, or unknown permissions fail startup.
+These stricter named-key rules do not change existing administrator-key length
+requirements for loopback use.
+
+Permissions are independent: grant only the entries an integration needs.
+`operator` does not imply `observer` or `diagnostics`, and `diagnostics` does not
+imply `observer`. Administrator access remains unrestricted.
+
+| Permission | Routes | Access |
+| --- | --- | --- |
+| `observer` | `GET /ready`, `/fleet`, `/reconcile/runs`, `/reconcile/runs/<run-id>` | Readiness and bounded persisted fleet/reconciliation evidence. |
+| `diagnostics` | `GET /templates`, `/bots`, `/bots/<bot-id>/logs`, `/bots/<bot-id>/inspect`, `/bots/<bot-id>/diagnostics`, `/bots/<bot-id>/history` | Local paths, configuration metadata, live diagnostics, and redacted logs or lifecycle details. |
+| `operator` | `GET /doctor`, `/bots/<bot-id>/status`; `POST /bots`, `/bots/reconcile`, `/bots/<bot-id>/start`, `/bots/<bot-id>/stop`, `/bots/<bot-id>/restart`, `/bots/<bot-id>/reconcile` | Lifecycle controls and status observation that can update state or recover pending intent. |
+
+The same permissions apply to `/v1` aliases. Permissions follow endpoint effects,
+not HTTP methods: `GET /bots/<bot-id>/status` can update durable lifecycle state
+and remove stale runtime markers, so dashboard observers should use `/fleet`.
+`GET /doctor` also requires `operator`: its registry check initializes state and
+can migrate an older database.
+Unknown route forms are denied to named credentials.
+
+Zeus derives the integration identity from the matching configured credential.
+Caller-supplied integration or actor headers cannot choose an identity or grant
+permissions. Use a dedicated integration ID and key for each dashboard.
+
+`ZEUS_ALLOW_UNAUTH_READS=1` remains a loopback-only development escape hatch.
+Without named credentials it preserves legacy read access, except that
+`GET /doctor` and `/bots/<bot-id>/status` now require operator authentication. With
+named credentials configured, only `/ready` can use this exception. Fleet and
+reconciliation evidence, logs, inspect, live diagnostics, and lifecycle history
+always require authentication. Supplying an invalid or restricted key never
+falls back to anonymous access. Keep the flag disabled for integrations.
 
 Delete and archive are intentionally CLI-only in the current alpha because they
 remove or move local profile directories. Use `zeus bot delete` or
@@ -18,7 +90,7 @@ remove or move local profile directories. Use `zeus bot delete` or
 
 ## Persisted Operator Evidence
 
-The following diagnostic endpoints always require `x-zeus-api-key`, including
+The following observer endpoints always require `x-zeus-api-key`, including
 when `ZEUS_ALLOW_UNAUTH_READS=1`. They accept `/v1` aliases. They read existing
 state without probing gateways or triggering a reconciliation pass.
 
@@ -57,7 +129,8 @@ reads one SQLite snapshot; pages requested later may reflect new runs or state.
 ## Live Gateway Diagnostics
 
 `GET /bots/<bot-id>/diagnostics` (also `/v1/bots/<bot-id>/diagnostics`) always
-requires `x-zeus-api-key` and accepts no query parameters. It performs one
+requires `x-zeus-api-key` with `diagnostics` permission (or the administrator
+key) and accepts no query parameters. It performs one
 bounded request to the launch-recorded Hermes 0.21 loopback API. The response
 contains `bot_id`, `observed_at`, `status`, `reason`, `process` (`pid`, `verified`),
 and `health` (a validated subset of Hermes's detailed readiness and counters,
@@ -97,6 +170,7 @@ Errors use a stable object shape:
 
 Known error codes are `invalid_request`, `invalid_bot_id`, `unknown_bot`,
 `unknown_template`, `unknown_reconcile_run`, `missing_api_key`, `invalid_api_key`,
+`permission_denied`,
 `unsupported_media_type`, `method_not_allowed`, `bot_locked`, `bot_exists`,
 `bot_running`, `bot_replace_failed`, `bot_delete_failed`, `bot_archive_failed`,
 `auth_rate_limited`, `mutation_rate_limited`, `reconcile_locked`,
@@ -150,10 +224,12 @@ IP or forwarded headers. `/v1` aliases share the same buckets as unprefixed rout
 
 Credentials are compared before failed-auth capacity is checked, so a valid key
 always bypasses an exhausted invalid-auth bucket. Invalid credentials consume that
-bucket; once exhausted they return `429 auth_rate_limited`. A missing server API key
-remains `503 missing_api_key` and consumes nothing.
+bucket; once exhausted they return `429 auth_rate_limited`. If no server credential
+is configured, requests return `503 missing_api_key` and consume nothing. Valid credentials
+with insufficient permissions return `403 permission_denied`, consume neither
+authentication nor mutation capacity, and create no idempotency record.
 
-A validly authenticated recognized mutation consumes mutation capacity before body
+An authorized recognized mutation consumes mutation capacity before body
 parsing and before an idempotency claim. Malformed mutations, domain conflicts, and
 idempotency replays therefore consume capacity; GETs, unsupported methods, and unknown
 POST routes do not. Exhaustion returns `429 mutation_rate_limited` and creates no
@@ -169,6 +245,15 @@ start, stop, and restart routes) and their `/v1` aliases accept an optional
 and body validation completes before Zeus claims the key. Canonical route
 aliases, JSON object ordering, and query ordering produce the same request
 fingerprint. Zeus stores only hashes, never raw keys or request bodies.
+
+Named integrations have separate replay namespaces derived from their stable
+configured IDs. The same `Idempotency-Key` used by two integration IDs, or by an
+integration and the administrator, cannot replay or conflict with the other's
+record. Rotating a secret while retaining its integration ID preserves its
+existing replay records and unresolved-claim guarantees. Never reuse an ID for a
+different integration: it inherits that ID's retained records. The administrator
+keeps the original key-hash namespace, so pre-existing retries remain valid.
+Caller-supplied identity headers cannot alter the namespace.
 
 A matching completed request replays its exact status and JSON and adds
 `Idempotency-Replayed: true`. Reusing a key for different input returns
@@ -209,14 +294,20 @@ When `ZEUS_API_LOG_ENABLED=1` (the default), handled application requests append
 one JSON object per line to `$ZEUS_STATE_DIR/logs/api.jsonl`. Every `api.access`
 record contains `schema_version` (currently `1`), `ts`, `level` (`info`), `event`,
 `request_id`, `method`, `route`, `status`, `error_code`, `duration_ms`,
-`auth_outcome`, and `idempotency_outcome`. Authentication outcomes are the
+`auth_outcome`, `integration_id`, and `idempotency_outcome`. Authentication outcomes are the
 bounded values `not_checked`, `not_required`, `authenticated`, `missing`,
-`rejected`, `unconfigured`, and `allowed_unauthenticated`. Idempotency outcomes
+`rejected`, `forbidden`, `unconfigured`, and `allowed_unauthenticated`. Idempotency outcomes
 are bounded to `not_applicable`, `claimed`, `replayed`, `conflict`,
 `in_progress`, `indeterminate`, and `unavailable`. An unexpected exception also emits a correlated `api.error`
 record with `schema_version` `1`, `level` `error`, a bounded generic
 `error_type`, and a generic `message`; it never includes a traceback or raw
 exception text.
+
+`integration_id` is the credential-derived ID (including `admin`) for both
+successful authentication and permission denials, or `null` when no credential
+was authenticated. Correlate lifecycle events through the same `request_id`;
+this access-log attribution is best effort, not a durable per-integration audit
+trail.
 
 The logger accepts only normalized route templates. It does not record API keys,
 authorization headers, request or response bodies, raw query strings, bot IDs,
@@ -246,7 +337,7 @@ It opens the existing SQLite database in read-only mode, requires schema version
 10, and executes `SELECT 1`; it does not inspect or start bots. A stopped bot does
 not make Zeus unready.
 
-The route uses the normal read-endpoint authentication policy. It requires
+The route requires `observer` permission or the administrator key. It requires
 `x-zeus-api-key` unless loopback-only development explicitly enables
 `ZEUS_ALLOW_UNAUTH_READS=1`. Query parameters are rejected before the database
 probe.
@@ -307,7 +398,11 @@ If the existing bot is `running` or `starting`, Zeus returns `409` with
 Returns Zeus status for a bot. If a PID is alive but the ownership marker does
 not match, Zeus reports a failed state instead of trusting the process. When a
 bot is `starting`, status performs one fast readiness probe and promotes it to
-`running` only after the Hermes `/health` response is ready.
+`running` only after the Hermes `/health` response is ready. This route requires
+`operator` permission or the administrator key, including when development
+unauthenticated reads are enabled. It can recover pending intent without
+launching, update stored lifecycle state, and remove proven stale markers.
+Use `/fleet` for read-only persisted observations.
 
 ### `GET /bots/<bot-id>/logs`
 
@@ -362,8 +457,9 @@ for manual process resolution.
 
 Checks the recorded gateway PID. If a bot with `restart_policy` set to `on-failure` is no longer running, Zeus schedules or performs a restart using exponential backoff.
 Reconcile also owns recovery of pending durable lifecycle intents. It performs
-at most one recovery effect per bot per pass; status remains observation-only
-and never launches or signals to enforce desired state. Pending restarts backed
+at most one recovery effect per bot per pass. Status never launches or signals
+to enforce desired state, but can still update records and recover pending
+intent, so it also requires operator permission. Pending restarts backed
 by schema-v2 or legacy markers fail closed and require manual process resolution.
 
 The default response remains the existing one-element status array. Add exactly

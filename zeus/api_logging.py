@@ -96,6 +96,15 @@ def _access_payload(fields: Mapping[str, object]) -> dict[str, object]:
             raise ValueError("idempotency_outcome must be an allowed value")
         payload["idempotency_outcome"] = idempotency_outcome
 
+    if "integration_id" in fields:
+        integration_id = fields["integration_id"]
+        if integration_id is not None and (
+            not isinstance(integration_id, str)
+            or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", integration_id, re.ASCII) is None
+        ):
+            raise ValueError("integration_id must be a configured identifier or null")
+        payload["integration_id"] = integration_id
+
     return payload
 
 

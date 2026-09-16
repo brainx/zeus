@@ -229,6 +229,25 @@ class IdempotencyIdentityTests(unittest.TestCase):
         self.assertRegex(digest, r"^[0-9a-f]{64}$")
         self.assertNotIn(key, digest)
 
+    def test_integration_key_hashes_have_distinct_stable_namespaces(self) -> None:
+        key = "deploy.2026:01"
+        admin = hash_key(key)
+        olymp = hash_key(key, integration_id="olymp")
+        dashboard = hash_key(key, integration_id="dashboard")
+        self.assertEqual(3, len({admin, olymp, dashboard}))
+        self.assertEqual(olymp, hash_key(key, integration_id="olymp"))
+        self.assertNotIn(key, olymp)
+        self.assertNotIn("olymp", olymp)
+        self.assertNotEqual(
+            hash_key("b:c", integration_id="a"),
+            hash_key("c", integration_id="a_b"),
+        )
+
+    def test_integration_key_hash_rejects_invalid_identity(self) -> None:
+        for identity in ("", "OLYMP", "olymp/token", "a" * 65):
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                hash_key("retry", integration_id=identity)
+
     def test_alias_json_and_query_order_canonicalize_identically(self) -> None:
         left = canonical_request_hash(
             "post",

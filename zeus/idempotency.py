@@ -26,9 +26,22 @@ def validate_idempotency_key(value: str) -> str:
     return value
 
 
-def hash_key(value: str) -> str:
+def hash_key(value: str, *, integration_id: str | None = None) -> str:
     safe_value = validate_idempotency_key(value)
-    return hashlib.sha256(safe_value.encode("ascii")).hexdigest()
+    if integration_id is None:
+        # Keep the administrator's persisted pre-integration replay namespace.
+        encoded = safe_value.encode("ascii")
+    else:
+        if (
+            not isinstance(integration_id, str)
+            or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", integration_id, re.ASCII) is None
+        ):
+            raise ValueError("invalid idempotency integration identity")
+        encoded = json.dumps(
+            ["zeus-integration-idempotency-v1", integration_id, safe_value],
+            separators=(",", ":"),
+        ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_json_value(value: object) -> None:
