@@ -74,7 +74,7 @@ class ApiAuthorizer:
             raise AuthorizationDenied(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 "missing_api_key",
-                "an API credential is required for non-health endpoints",
+                "ZEUS_API_KEY or a named integration credential is required for non-health endpoints",
             )
         principal = (
             authenticate_api_key(values[0], self.settings.api_key, self.settings.api_integrations)
