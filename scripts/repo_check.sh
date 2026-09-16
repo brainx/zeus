@@ -42,7 +42,7 @@ docs/RELEASE.md
 docs/openapi.json
 docs/ROADMAP.md
 docs/assets/demo.cast
-docs/assets/zeus-hero.png
+docs/assets/zeus-banner.jpg
 systemd/zeus-api.service
 systemd/zeus-reconcile.service
 systemd/zeus-reconcile.timer

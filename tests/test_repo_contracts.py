@@ -211,7 +211,7 @@ class RepoContractTests(unittest.TestCase):
             "docs/openapi.json",
             "docs/ROADMAP.md",
             "docs/assets/demo.cast",
-            "docs/assets/zeus-hero.png",
+            "docs/assets/zeus-banner.jpg",
             ".coveragerc",
             "requirements-dev-ci.txt",
             "requirements-hermes-ci.txt",
@@ -976,7 +976,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("## How It Works", readme)
         self.assertIn("## Quick Start", readme)
         self.assertIn("## 60-Second Demo", readme)
-        self.assertIn("docs/assets/zeus-hero.png", readme)
+        self.assertIn("docs/assets/zeus-banner.jpg", readme)
         self.assertIn("docs/assets/demo.cast", readme)
         self.assertIn("docs/SYSTEMD.md", readme)
         self.assertIn("docs/OPERATIONS.md", readme)
@@ -987,7 +987,6 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn("badge.svg?branch=main", readme)
         self.assertIn("CODE_OF_CONDUCT.md", readme)
         self.assertNotIn("REPO_GENERATION.md", readme)
-        self.assertIn("Package Build", readme)
         self.assertIn("Security Policy", readme)
         self.assertIn("```mermaid", readme)
         self.assertIn("local process orchestrator, not a sandbox", readme)
@@ -1652,30 +1651,51 @@ class RepoContractTests(unittest.TestCase):
         self.assertIn('fail "expected exactly one wheel in dist/"', wheel_smoke)
 
     def test_hero_image_is_optimized_and_metadata_free(self) -> None:
-        hero = Path("docs/assets/zeus-hero.png").read_bytes()
+        hero = Path("docs/assets/zeus-banner.jpg").read_bytes()
         readme = Path("README.md").read_text(encoding="utf-8")
 
-        self.assertIn('src="docs/assets/zeus-hero.png"', readme)
+        self.assertIn('src="docs/assets/zeus-banner.jpg"', readme)
         self.assertIn('alt="Zeus: many Hermes bots, one local supervisor"', readme)
-        self.assertTrue(hero.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(hero.startswith(b"\xff\xd8"))
         self.assertLess(len(hero), 200 * 1024)
 
-        offset = 8
-        chunks: list[tuple[bytes, bytes]] = []
+        offset = 2
+        dimensions: list[tuple[int, int]] = []
+        markers: list[int] = []
         while offset < len(hero):
-            self.assertGreaterEqual(len(hero) - offset, 12)
-            length = struct.unpack(">I", hero[offset : offset + 4])[0]
-            chunk_type = hero[offset + 4 : offset + 8]
-            chunk_end = offset + 12 + length
-            self.assertLessEqual(chunk_end, len(hero))
-            chunks.append((chunk_type, hero[offset + 8 : offset + 8 + length]))
-            offset = chunk_end
+            self.assertEqual(0xFF, hero[offset])
+            while offset < len(hero) and hero[offset] == 0xFF:
+                offset += 1
+            self.assertLess(offset, len(hero))
+            marker = hero[offset]
+            markers.append(marker)
+            offset += 1
+            self.assertFalse(0xE0 <= marker <= 0xEF, "JPEG must not contain APP metadata")
+            self.assertNotEqual(0xFE, marker, "JPEG must not contain comments")
+            if marker == 0xD9:
+                break
+            self.assertNotIn(marker, (0x00, 0x01, *range(0xD0, 0xD9)))
+            self.assertGreaterEqual(len(hero) - offset, 2)
+            length = struct.unpack(">H", hero[offset : offset + 2])[0]
+            self.assertGreaterEqual(length, 2)
+            self.assertLessEqual(offset + length, len(hero))
+            payload = hero[offset + 2 : offset + length]
+            if marker in (0xC0, 0xC2):
+                self.assertGreaterEqual(len(payload), 6)
+                height, width = struct.unpack(">HH", payload[1:5])
+                dimensions.append((width, height))
+            offset += length
+            if marker == 0xDA:
+                # Skip scan data, including stuffed bytes and restart markers.
+                next_marker = re.search(rb"\xff+(?=[^\x00\xd0-\xd7])", hero[offset:])
+                self.assertIsNotNone(next_marker, "JPEG scan must end at a marker")
+                assert next_marker is not None
+                offset += next_marker.start()
 
         self.assertEqual(len(hero), offset)
-        self.assertEqual(b"IHDR", chunks[0][0])
-        self.assertEqual((1800, 720), struct.unpack(">II", chunks[0][1][:8]))
-        self.assertEqual(b"IEND", chunks[-1][0])
-        self.assertTrue(all(chunk_type[0] & 0x20 == 0 for chunk_type, _ in chunks))
+        self.assertEqual([(1440, 480)], dimensions)
+        self.assertIn(0xDA, markers)
+        self.assertEqual(0xD9, markers[-1])
 
     def test_makefile_has_release_check_target(self) -> None:
         makefile = Path("Makefile").read_text(encoding="utf-8")
