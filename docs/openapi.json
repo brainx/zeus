@@ -54,6 +54,256 @@
       }
     },
     "schemas": {
+      "MessageReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "message_id",
+          "bot_id",
+          "dispatch_state",
+          "run_id",
+          "run_status",
+          "created_at",
+          "updated_at",
+          "retry_before",
+          "last_checked_at",
+          "cancel_requested_at",
+          "released_at",
+          "archived_at",
+          "error_code"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32
+          },
+          "bot_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{1,62}$",
+            "minLength": 2,
+            "maxLength": 63
+          },
+          "dispatch_state": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "accepted",
+              "rejected"
+            ],
+            "description": "Persisted prepared receipts are observed as unknown without updating storage."
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+            "maxLength": 128,
+            "description": "Acknowledged Hermes run identifier; null before acceptance."
+          },
+          "run_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "cancelled",
+              "completed",
+              "failed",
+              "interrupted",
+              "queued",
+              "running",
+              "stopping",
+              "waiting_for_approval",
+              null
+            ],
+            "description": "Last persisted observation, never refreshed by this API; null before acceptance."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "retry_before": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Persisted retry deadline, not permission or a guarantee that retry remains safe."
+          },
+          "last_checked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Time of the last durable execution-status observation; null when none exists."
+          },
+          "cancel_requested_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Recorded cancellation intent, not evidence that execution stopped."
+          },
+          "released_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Local release of the admission blocker, not evidence that execution stopped."
+          },
+          "archived_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Archival time. Archived receipts remain readable but no longer count against admission capacity."
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "authentication_failed",
+              "conflict",
+              "credentials_unavailable",
+              "gateway_unavailable",
+              "health_unavailable",
+              "interrupted",
+              "invalid_endpoint",
+              "invalid_health",
+              "invalid_request",
+              "invalid_response",
+              "not_found",
+              "pid_mismatch",
+              "rate_limited",
+              "response_too_large",
+              "runtime_changed",
+              "timeout",
+              "unsupported_runtime",
+              null
+            ],
+            "description": "Bounded stored error code; no free-form error details."
+          }
+        }
+      },
+      "MessageReceiptPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "next_before"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/MessageReceipt"
+            }
+          },
+          "next_before": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{32}$",
+            "minLength": 32,
+            "maxLength": 32,
+            "description": "Exclusive cursor for the next page, or null when exhausted. Preserve bot_id and pass this value unchanged."
+          }
+        }
+      },
+      "MessageCapacity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "limit",
+          "used",
+          "remaining",
+          "total",
+          "archived",
+          "blocking",
+          "status",
+          "database_bytes",
+          "wal_bytes",
+          "filesystem_free_bytes"
+        ],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "const": 10000,
+            "description": "Maximum unarchived receipts admitted by the store."
+          },
+          "used": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Unarchived receipts, including completed or rejected receipts that have not been archived."
+          },
+          "remaining": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "description": "max(0, limit - used); observation reserves no capacity."
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "All durable receipts, equal to used + archived."
+          },
+          "archived": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "blocking": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Unreleased unknown/prepared receipts and accepted runs without a terminal stored status."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "warning",
+              "critical",
+              "full"
+            ],
+            "description": "ok below 80% used, warning at 80%, critical at 95%, full at or above the limit."
+          },
+          "database_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Observed database file size, or null if unavailable."
+          },
+          "wal_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Observed WAL file size; zero if absent, null if unavailable."
+          },
+          "filesystem_free_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Observed free bytes available to the service user, or null if unavailable. Filesystem observations are not part of the SQLite snapshot."
+          }
+        }
+      },
       "CapabilityEndpoint": {
         "type": "object",
         "additionalProperties": false,
@@ -174,6 +424,10 @@
                   "missing_api_key",
                   "invalid_api_key",
                   "permission_denied",
+                  "invalid_cursor",
+                  "unknown_message",
+                  "message_store_unavailable",
+                  "message_read_budget_exceeded",
                   "auth_rate_limited",
                   "mutation_rate_limited",
                   "unsupported_media_type",
@@ -1554,6 +1808,212 @@
     }
   ],
   "paths": {
+    "/messages": {
+      "get": {
+        "operationId": "listMessageReceipts",
+        "x-zeus-permission": "observer",
+        "summary": "List persisted message receipts",
+        "description": "Newest first by created_at, then message_id descending. Archived receipts are included. One read-only SQLite snapshot per request; later pages may reflect later writes. Preserve the bot_id filter across pages. Requires observer permission or administrator authentication even when ZEUS_ALLOW_UNAUTH_READS=1. Reads existing durable evidence without dispatch, execution refresh, recovery, database initialization, or migration. Normal API logging still applies.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "bot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{1,62}$",
+              "minLength": 2,
+              "maxLength": 63
+            },
+            "description": "Optional exact bot ID filter; does not change authorization scope."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "description": "Opaque exclusive cursor from next_before. The receipt must exist and match the bot_id filter, if supplied."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List persisted message receipts",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MessageReceiptPage"}}}
+          },
+          "400": {
+            "description": "Malformed request or identifier (invalid_request); unknown cursor or cursor outside bot_id filter (invalid_cursor)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "403": {
+            "description": "The authenticated integration lacks observer permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"description": "Seconds to wait before retrying authentication.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "Receipt storage is missing, corrupt, or incompatible (message_store_unavailable); no server credential is configured, or server capacity/shutdown prevents handling. Retry-After is only present for server capacity/shutdown rejection.",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          }
+        }
+      }
+    },
+    "/messages/capacity": {
+      "get": {
+        "operationId": "getMessageCapacity",
+        "x-zeus-permission": "observer",
+        "summary": "Observe message receipt admission capacity",
+        "description": "Accepts no query parameters. Counts the entire retained receipt history, including archived rows, within a cooperative two-second budget covering SQLite work, lock waiting and validation. Returns exact counts or an error; never reserves capacity. Filesystem size/free-space observations can differ from the SQLite snapshot. Requires observer permission or administrator authentication even when ZEUS_ALLOW_UNAUTH_READS=1. Reads existing durable evidence without dispatch, execution refresh, recovery, database initialization, or migration. Normal API logging still applies.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Observe message receipt admission capacity",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MessageCapacity"}}}
+          },
+          "400": {
+            "description": "Malformed request or identifier (invalid_request)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "403": {
+            "description": "The authenticated integration lacks observer permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"description": "Seconds to wait before retrying authentication.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "Receipt storage is missing, corrupt, or incompatible (message_store_unavailable); the cooperative two-second capacity read budget expired (message_read_budget_exceeded), with no partial totals; no server credential is configured, or server capacity/shutdown prevents handling. Retry-After is only present for server capacity/shutdown rejection.",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          }
+        }
+      }
+    },
+    "/messages/{message_id}": {
+      "get": {
+        "operationId": "getMessageReceipt",
+        "x-zeus-permission": "observer",
+        "summary": "Read one persisted message receipt",
+        "description": "Accepts no query parameters. Archived receipts remain addressable. Returns only the public receipt fields: no prompts, outputs, gateway endpoints, credentials, fingerprints, idempotency keys, leases, or storage version. Requires observer permission or administrator authentication even when ZEUS_ALLOW_UNAUTH_READS=1. Reads existing durable evidence without dispatch, execution refresh, recovery, database initialization, or migration. Normal API logging still applies.",
+        "security": [
+          {
+            "ZeusApiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "message_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$",
+              "minLength": 32,
+              "maxLength": 32
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Read one persisted message receipt",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MessageReceipt"}}}
+          },
+          "400": {
+            "description": "Malformed request or identifier (invalid_request)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "401": {
+            "description": "Missing or invalid API credential (invalid_api_key)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "403": {
+            "description": "The authenticated integration lacks observer permission (permission_denied)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "404": {
+            "description": "The valid message identifier has no persisted receipt (unknown_message)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "429": {
+            "description": "Authentication rate limit exceeded (auth_rate_limited)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"description": "Seconds to wait before retrying authentication.", "required": true, "schema": {"type": "integer", "minimum": 1}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "500": {
+            "description": "Unexpected server failure (internal_error)",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          },
+          "503": {
+            "description": "Receipt storage is missing, corrupt, or incompatible (message_store_unavailable); no server credential is configured, or server capacity/shutdown prevents handling. Retry-After is only present for server capacity/shutdown rejection.",
+            "headers": {"X-Request-ID": {"$ref": "#/components/headers/XRequestID"}, "Cache-Control": {"$ref": "#/components/headers/CacheControl"}, "Retry-After": {"$ref": "#/components/headers/RetryAfter"}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+          }
+        }
+      }
+    },
     "/capabilities": {
       "get": {
         "operationId": "getCapabilities",

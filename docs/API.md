@@ -61,7 +61,7 @@ imply `observer`. Administrator access remains unrestricted.
 
 | Permission | Routes | Access |
 | --- | --- | --- |
-| `observer` | `GET /ready`, `/fleet`, `/reconcile/runs`, `/reconcile/runs/<run-id>` | Readiness and bounded persisted fleet/reconciliation evidence. |
+| `observer` | `GET /ready`, `/fleet`, `/reconcile/runs`, `/reconcile/runs/<run-id>`, `/messages`, `/messages/<message-id>`, `/messages/capacity` | Readiness and bounded persisted fleet, reconciliation, and message evidence. |
 | `diagnostics` | `GET /templates`, `/bots`, `/bots/<bot-id>/logs`, `/bots/<bot-id>/inspect`, `/bots/<bot-id>/diagnostics`, `/bots/<bot-id>/history` | Local paths, configuration metadata, live diagnostics, and redacted logs or lifecycle details. |
 | `operator` | `GET /doctor`, `/bots/<bot-id>/status`; `POST /bots`, `/bots/reconcile`, `/bots/<bot-id>/start`, `/bots/<bot-id>/stop`, `/bots/<bot-id>/restart`, `/bots/<bot-id>/reconcile` | Lifecycle controls and status observation that can update state or recover pending intent. |
 
@@ -80,9 +80,9 @@ permissions. Use a dedicated integration ID and key for each dashboard.
 Without named credentials it preserves legacy read access, except that
 `GET /doctor` and `/bots/<bot-id>/status` now require operator authentication. With
 named credentials configured, only `/ready` can use this exception. Fleet and
-reconciliation evidence, logs, inspect, live diagnostics, and lifecycle history
-always require authentication. Supplying an invalid or restricted key never
-falls back to anonymous access. Keep the flag disabled for integrations.
+reconciliation evidence, message receipts and capacity, logs, inspect, live
+diagnostics, and lifecycle history always require authentication. Supplying an
+invalid or restricted key never falls back to anonymous access. Keep the flag disabled for integrations.
 
 Delete and archive are intentionally CLI-only in the current alpha because they
 remove or move local profile directories. Use `zeus bot delete` or
@@ -172,6 +172,77 @@ All three routes return `400 invalid_request` for invalid parameters and
 `503 not_ready` for unavailable or incompatible stored evidence. Every request
 reads one SQLite snapshot; pages requested later may reflect new runs or state.
 
+## Persisted Message Receipts and Capacity
+
+These routes require `observer` permission or the administrator key, including
+when `ZEUS_ALLOW_UNAUTH_READS=1`. The `/v1` aliases have the same behavior.
+Observer access covers all stored receipts; `bot_id` is a filter, not a separate
+authorization boundary.
+
+| Route | Query parameters | Response |
+| --- | --- | --- |
+| `GET /messages` | `bot_id`, `limit`, `before` | `items`, `next_before` |
+| `GET /messages/<message-id>` | None | One public receipt |
+| `GET /messages/capacity` | None | Receipt admission capacity and storage observations |
+
+Every request opens existing schema-10 storage read-only and reads one SQLite
+snapshot. Reads do not initialize or migrate missing/incompatible storage,
+dispatch or retry jobs, refresh Hermes execution status, cancel runs, recover
+operations, or change stored receipts. Normal API access logging still applies;
+API startup retains its existing initialization behavior.
+
+`limit` defaults to 50 and accepts 1–100. Results are newest first by `created_at`,
+then `message_id` descending. Pass a non-null `next_before` unchanged as the next
+page's `before`, preserving `bot_id`; the cursor is an existing 32-character
+lowercase hexadecimal message ID and is exclusive. An unknown cursor or one
+outside the selected bot filter returns `400 invalid_cursor`. Malformed cursor
+syntax returns `400 invalid_request`. Pages use separate snapshots, so later
+pages may reflect intervening writes. Archived receipts remain listed and
+addressable by ID. A valid missing detail ID returns `404 unknown_message`.
+
+A public receipt has exactly these fields: `message_id`, `bot_id`,
+`dispatch_state`, `run_id`, `run_status`, `created_at`, `updated_at`,
+`retry_before`, `last_checked_at`, `cancel_requested_at`, `released_at`,
+`archived_at`, and `error_code`. All timestamps are ISO 8601 UTC values; optional
+observations and intents are `null` when absent. `dispatch_state` is `unknown`,
+`accepted`, or `rejected`. A stored `prepared` receipt is reported as `unknown`
+without modifying it. Run IDs and statuses are absent until acceptance, and
+accepted run status is the last persisted observation, not a live check.
+
+`retry_before` is informational; it conveys no retry authority.
+`cancel_requested_at` records intent and `released_at` records a local admission
+decision; neither proves that upstream execution stopped. Responses exclude
+prompts, outputs, gateway endpoints, credentials, fingerprints, upstream keys,
+idempotency keys, attempt leases, and storage versions. Stored error codes use
+a fixed allowlist; free-form execution errors are not exposed. The complete
+field types, nullable values, and status enums are in `docs/openapi.json`.
+
+Capacity returns `limit` (currently 10000), `used` (unarchived receipts),
+`remaining` (`max(0, limit - used)`), `total`, `archived`, `blocking`, `status`,
+`database_bytes`, `wal_bytes`, and `filesystem_free_bytes`. Completed and rejected
+receipts still count as used until archived. `blocking` counts unreleased
+unknown/prepared receipts and accepted runs whose stored status is nonterminal.
+The capacity status is `ok` below 80% used, `warning` at 80%, `critical` at 95%,
+and `full` at or above the limit. Reading capacity does not reserve it.
+
+Counts cover all retained history and are exact within the SQLite snapshot.
+Capacity uses a cooperative two-second budget for SQLite work, lock waiting,
+and receipt validation; expiration returns `503 message_read_budget_exceeded`
+without partial totals. Filesystem observations are separate from the snapshot,
+can change concurrently, and are `null` if unavailable; absent WAL files report
+zero bytes. This budget is not a hard deadline for filesystem calls.
+
+Unavailable, corrupt, or incompatible receipt storage returns
+`503 message_store_unavailable`. Invalid or repeated query parameters return
+`400 invalid_request`. Error messages never echo raw query values, database
+paths, or stored exception text. These endpoints observe the existing durable
+storage; they add no message mutation API or schema migration.
+
+Olymp's follow-up is to add these routes to its server-side allowlist and
+refresh its reviewed contract fixture, then render cached status and nullable
+capacity values explicitly. Preserve its readiness/version checks and expose
+permission denials without falling back to an administrator credential.
+
 ## Live Gateway Diagnostics
 
 `GET /bots/<bot-id>/diagnostics` (also `/v1/bots/<bot-id>/diagnostics`) always
@@ -216,7 +287,8 @@ Errors use a stable object shape:
 
 Known error codes are `invalid_request`, `invalid_bot_id`, `unknown_bot`,
 `unknown_template`, `unknown_reconcile_run`, `missing_api_key`, `invalid_api_key`,
-`permission_denied`,
+`permission_denied`, `invalid_cursor`, `unknown_message`,
+`message_store_unavailable`, `message_read_budget_exceeded`,
 `unsupported_media_type`, `method_not_allowed`, `bot_locked`, `bot_exists`,
 `bot_running`, `bot_replace_failed`, `bot_delete_failed`, `bot_archive_failed`,
 `auth_rate_limited`, `mutation_rate_limited`, `reconcile_locked`,

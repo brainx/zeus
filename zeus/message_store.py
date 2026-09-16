@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -261,6 +263,11 @@ def _filesystem_free(path: Path) -> int | None:
         return None
 
 
+def _check_read_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise MessageStoreError("read_budget_exceeded")
+
+
 class MessageStore:
     def __init__(self, database_path: Path | str) -> None:
         self.database_path = Path(database_path)
@@ -286,18 +293,25 @@ class MessageStore:
             raise MessageStoreError("state_unavailable") from None
 
     @contextmanager
-    def _read(self) -> Iterator[sqlite3.Connection]:
+    def _read(self, *, deadline: float | None = None) -> Iterator[sqlite3.Connection]:
         try:
+            _check_read_deadline(deadline)
             uri = f"{self.database_path.resolve().as_uri()}?mode=ro"
-            with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
+            timeout = 5.0 if deadline is None else max(0.0, min(5.0, deadline - time.monotonic()))
+            with closing(sqlite3.connect(uri, uri=True, timeout=timeout)) as conn:
                 conn.row_factory = sqlite3.Row
+                if deadline is not None:
+                    conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("BEGIN")
                 _assert_schema_current(conn)
+                _check_read_deadline(deadline)
                 yield conn
+                _check_read_deadline(deadline)
         except MessageStoreError:
             raise
         except (sqlite3.Error, OSError, RuntimeError, TypeError, ValueError):
+            _check_read_deadline(deadline)
             raise MessageStoreError("state_unavailable") from None
 
     def get(self, message_id: str) -> MessageReceipt | None:
@@ -308,14 +322,24 @@ class MessageStore:
             ).fetchone()
             return _receipt(row, observe=True) if row is not None else None
 
-    def capacity(self) -> dict[str, object]:
-        """Observe receipt capacity and storage without changing SQLite state."""
+    def capacity(self, *, read_timeout_seconds: float | None = None) -> dict[str, object]:
+        """Observe exact capacity; an optional read budget fails without partial counts."""
+        deadline = None
+        if read_timeout_seconds is not None:
+            if (
+                isinstance(read_timeout_seconds, bool)
+                or not math.isfinite(read_timeout_seconds)
+                or read_timeout_seconds <= 0
+            ):
+                raise ValueError("message capacity read timeout must be finite and positive")
+            deadline = time.monotonic() + read_timeout_seconds
         total = 0
         blocking = 0
         archived = 0
-        with self._read() as conn:
+        with self._read(deadline=deadline) as conn:
             cursor = conn.execute("SELECT * FROM message_receipts")
             while rows := cursor.fetchmany(256):
+                _check_read_deadline(deadline)
                 for row in rows:
                     receipt = _receipt(row, observe=True)
                     total += 1
@@ -339,7 +363,7 @@ class MessageStore:
             status = "warning"
         else:
             status = "ok"
-        return {
+        result: dict[str, object] = {
             "limit": MAX_MESSAGE_RECEIPTS,
             "used": used,
             "remaining": remaining,
@@ -351,6 +375,8 @@ class MessageStore:
             "wal_bytes": _wal_size(self.database_path),
             "filesystem_free_bytes": _filesystem_free(self.database_path.parent),
         }
+        _check_read_deadline(deadline)
+        return result
 
     def archive(
         self,
