@@ -9,6 +9,7 @@ AuthOutcome = Literal[
     "not_checked",
     "not_required",
     "authenticated",
+    "forbidden",
     "missing",
     "rejected",
     "unconfigured",
@@ -29,6 +30,7 @@ AUTH_OUTCOMES = frozenset(
         "not_checked",
         "not_required",
         "authenticated",
+        "forbidden",
         "missing",
         "rejected",
         "unconfigured",
@@ -70,6 +72,7 @@ class RequestContext:
     route: str | None = None
     auth_outcome: AuthOutcome = "not_checked"
     idempotency_outcome: IdempotencyOutcome = "not_applicable"
+    integration_id: str | None = None
 
     def finish(self, status: int, error_code: str | None) -> dict[str, object]:
         return {
@@ -81,6 +84,7 @@ class RequestContext:
             "duration_ms": max(0.0, (time.monotonic() - self.started_at) * 1000),
             "auth_outcome": self.auth_outcome,
             "idempotency_outcome": self.idempotency_outcome,
+            "integration_id": self.integration_id,
         }
 
 

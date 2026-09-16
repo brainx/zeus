@@ -141,6 +141,17 @@ class ApiLoggingTests(unittest.TestCase):
         self.assertEqual("RuntimeError", rows[1]["error_type"])
         self.assertEqual("Unexpected API error", rows[1]["message"])
 
+    def test_api_logging_rejects_unbounded_or_structured_integration_identity(self) -> None:
+        path = self.root / "identity.jsonl"
+        writer = ApiLogWriter(path, enabled=True)
+        for value in ("TOKEN=private", "a" * 65, {"key": "private"}, ["olymp"]):
+            writer.access({"integration_id": value})
+        self.assertFalse(path.exists())
+        writer.access({"integration_id": "olymp"})
+        writer.access({"integration_id": None})
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(["olymp", None], [row["integration_id"] for row in rows])
+
     def test_api_logging_rejects_secret_bearing_request_ids(self) -> None:
         access_path = self.root / "access.jsonl"
         error_path = self.root / "error.jsonl"
@@ -442,6 +453,7 @@ class ApiLoggingTests(unittest.TestCase):
                     "duration_ms",
                     "auth_outcome",
                     "idempotency_outcome",
+                    "integration_id",
                 },
                 set(row),
             )

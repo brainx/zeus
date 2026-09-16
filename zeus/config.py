@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path
 
 from zeus.envfile import parse_env_text
+from zeus.integration_auth import (
+    IntegrationCredential,
+    load_integration_credentials,
+    validate_integration_credentials,
+)
 from zeus.private_io import ensure_private_directory, nofollow_absolute_path
 
 
@@ -30,7 +35,7 @@ class Settings:
     hermes_bin: str
     host: str
     port: int
-    api_key: str | None
+    api_key: str | None = field(repr=False)
     allow_unauth_reads: bool
     api_max_concurrent_requests: int
     api_request_timeout_seconds: float
@@ -51,10 +56,12 @@ class Settings:
     sqlite_synchronous: SQLiteSynchronous = SQLiteSynchronous.NORMAL
     restart_stability_seconds: float = 30.0
     stop_grace_seconds: float = 60.0
+    api_integrations: tuple[IntegrationCredential, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         if self.api_key is not None and not self.api_key.isascii():
             raise ValueError("ZEUS_API_KEY must contain ASCII characters only")
+        validate_integration_credentials(self.api_integrations, admin_key=self.api_key)
 
     @classmethod
     def from_env(
@@ -77,6 +84,7 @@ class Settings:
             host=merged.get("ZEUS_HOST", "127.0.0.1"),
             port=port,
             api_key=api_key,
+            api_integrations=load_integration_credentials(merged, admin_key=api_key),
             allow_unauth_reads=merged.get("ZEUS_ALLOW_UNAUTH_READS") == "1",
             api_max_concurrent_requests=_int_env(
                 merged,

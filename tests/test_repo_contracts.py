@@ -1242,6 +1242,7 @@ class RepoContractTests(unittest.TestCase):
             "error_code",
             "duration_ms",
             "auth_outcome",
+            "integration_id",
             "idempotency_outcome",
         }
         for field in access_fields:
@@ -1755,6 +1756,7 @@ class RepoContractTests(unittest.TestCase):
         ]["enum"]
         self.assertIn("missing_api_key", error_codes)
         self.assertIn("invalid_api_key", error_codes)
+        self.assertIn("permission_denied", error_codes)
         self.assertIn("unsupported_media_type", error_codes)
         self.assertIn("method_not_allowed", error_codes)
         self.assertIn("internal_error", error_codes)
@@ -1769,6 +1771,25 @@ class RepoContractTests(unittest.TestCase):
             history["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
         )
 
+    def test_named_integration_permissions_match_openapi(self) -> None:
+        from zeus.api_authorization import ROUTE_PERMISSIONS
+
+        spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
+        documented = {}
+        for path, path_item in spec["paths"].items():
+            for method, operation in path_item.items():
+                if method not in {"get", "post"} or path == "/health":
+                    continue
+                with self.subTest(path=path, method=method):
+                    documented[(method.upper(), path)] = operation["x-zeus-permission"]
+                    response = operation["responses"]["403"]
+                    self.assertIn("permission_denied", response["description"])
+                    self.assertEqual(
+                        "#/components/schemas/Error",
+                        response["content"]["application/json"]["schema"]["$ref"],
+                    )
+        self.assertEqual(ROUTE_PERMISSIONS, documented)
+
     def test_readiness_openapi_and_operator_documentation_contract(self) -> None:
         spec = json.loads(Path("docs/openapi.json").read_text(encoding="utf-8"))
         api_docs = Path("docs/API.md").read_text(encoding="utf-8")
@@ -1779,7 +1800,7 @@ class RepoContractTests(unittest.TestCase):
         self.assertEqual([], spec["paths"]["/health"]["get"]["security"])
         readiness = spec["paths"]["/ready"]["get"]
         self.assertEqual([{"ZeusApiKey": []}], readiness["security"])
-        self.assertEqual({"200", "400", "401", "429", "503"}, set(readiness["responses"]))
+        self.assertEqual({"200", "400", "401", "403", "429", "503"}, set(readiness["responses"]))
         self.assertEqual(
             "#/components/schemas/ReadinessResponse",
             readiness["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
