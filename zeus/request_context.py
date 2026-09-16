@@ -52,6 +52,7 @@ IDEMPOTENCY_OUTCOMES = frozenset(
 _STATIC_ROUTE_TEMPLATES = {
     "/health": "/health",
     "/ready": "/ready",
+    "/capabilities": "/capabilities",
     "/doctor": "/doctor",
     "/templates": "/templates",
     "/bots": "/bots",
